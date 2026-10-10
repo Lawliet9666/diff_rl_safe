@@ -1,0 +1,46 @@
+type: barriernet_gnn
+robot_type: ${robot.type}
+history_len: 3
+obs_frame_dim: ${add:6,${mul:${env.humans.num_humans},6}}
+obs_dim: ${mul:${model.history_len},${model.obs_frame_dim}}
+
+actor:
+  # Policy network and exploration
+  hidden_dim: 256
+  control_hidden_dim: 256
+  scalar_hidden_dim: 256
+  act: relu
+  action_std_init: 0.5
+
+  # Learned class-K gain with fixed geometric safety radius
+  margin_base: ${env.safety_margin}
+  alpha_min: 0.1
+  alpha_max: 4.0
+  alpha_init: 2.0
+  lookahead_distance: 0.2
+
+  # Differentiable QP solver, reward, and diagnostics
+  qp_verbose: -1
+  qp_max_iter: 40
+  qp_eps: 1e-12
+  qp_not_improved_lim: 3
+  qp_check_q_spd: false
+  qp_slack_weight: 10.0
+  qp_residual_reward_weight: 0.05
+  qp_full_diagnostics: false
+  qp_obs_top_k: 5
+
+  # Sparse shared spatio-temporal graph encoder
+  graph_coordinate_frame: robot_body
+  graph_hidden_dim: 64
+  graph_latent_dim: 16
+  graph_layers: 3
+
+  # Input feature scaling
+  position_scale: ${env.farthest_dist}
+  velocity_scale: ${robot.v_max}
+
+critic:
+  hidden_dim: 256
+  hidden_dim2: 256
+  act: relu

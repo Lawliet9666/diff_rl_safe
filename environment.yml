@@ -1,0 +1,8 @@
+name: diff_rl_safe
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - -r requirements.txt
