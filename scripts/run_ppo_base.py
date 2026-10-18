@@ -19,6 +19,14 @@ def build_trainer(config):
     from trainer.jax_platform import configure_jax_platform_for_device
 
     configure_jax_platform_for_device(getattr(config, "device", "cpu"))
+    backend = config.env.get("backend", "jax")
+    if backend not in ("jax", "crax_mjx"):
+        raise ValueError(f"Unsupported environment backend {backend!r}; use jax or crax_mjx")
+    if backend == "crax_mjx":
+        from trainer.crax_ppo import CraxPPOTrainer
+        return CraxPPOTrainer(config)
+    if config.robot.get("simulator_model"):
+        raise ValueError("robot=point requires env=crax_point_crowd")
     from trainer.jax_ppo_base_trainer import JaxPPOBaseTrainer
 
     return JaxPPOBaseTrainer(config)

@@ -6,6 +6,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from trainer.jax_episode import episode_outcomes
+
 from env.jax_social_nav import (
     config_from_omegaconf,
     fixed_order_policy_obs_from_state,
@@ -163,11 +165,9 @@ def _evaluate_seed_values(
 
         active = ~done
         terminal = active & (step_done > 0.5)
-        raw_collision = metrics["collision"] > 0.5
-        raw_success = metrics["success"] > 0.5
-        terminal_collision = terminal & raw_collision
-        terminal_success = terminal & (~raw_collision) & raw_success
-        terminal_timeout = terminal & (~terminal_collision) & (~terminal_success)
+        terminal_success, terminal_collision, terminal_timeout = episode_outcomes(
+            terminal, metrics["success"], metrics["collision"]
+        )
         next_done = done | terminal
         returns = returns + jnp.where(active, reward, 0.0)
         success = success | terminal_success
@@ -272,7 +272,6 @@ def evaluate_jax_env(
     policy_action_mean_fn=None,
     safe_action_mean_fn=None,
     policy_action_to_env_action_fn=None,
-    history_len=None,
     include_paper_metrics=False,
     rollout_callback=None,
 ):

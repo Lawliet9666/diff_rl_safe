@@ -250,3 +250,17 @@ def human_step(cfg: JaxSocialNavConfig, state: JaxSocialNavState, actions):
     )
     next_positions = jnp.where((state.human_mask > 0.5)[..., None], clipped_positions, state.human_positions)
     return next_positions, clipped
+
+
+def advance_obstacles(cfg: JaxSocialNavConfig, state: JaxSocialNavState, rng):
+    """Advance the crowd after the caller has updated the robot state."""
+    gmm_rng = rng
+    if cfg.end_goal_changing or cfg.random_goal_changing:
+        goal_rng, gmm_rng = jax.random.split(rng)
+        state = update_obstacle_goals(cfg, state, goal_rng)
+
+    human_actions = social_force_actions(cfg, state)
+    if cfg.human_use_gmm:
+        human_actions = apply_gmm_noise(cfg, human_actions, state, gmm_rng)
+    next_positions, next_vels = human_step(cfg, state, human_actions)
+    return state._replace(human_positions=next_positions, human_vels=next_vels)

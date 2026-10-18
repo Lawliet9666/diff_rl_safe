@@ -12,8 +12,10 @@ actor:
   act: relu
   action_std_init: 0.5
 
-  # Learned class-K gain with fixed geometric safety radius
+  # Learned class-K gain and per-obstacle safety distance
   margin_base: ${env.safety_margin}
+  learn_r_safe: true
+  margin_extra_max: ${add:${mul:1.5,${robot.radius}},${mul:1.5,${env.humans.radius}},${mul:1.5,${env.safety_margin}}}
   alpha_min: 0.1
   alpha_max: 4.0
   alpha_init: 2.0

@@ -51,7 +51,7 @@ def test_gradient_reaches_learned_alpha(method):
     module,hp,params,obs = initialize(make_config(method,'single_integrator'))
     # Approaching obstacle activates the CBF constraint; distant slots are masked.
     frame = jnp.zeros((2,hp.obs_frame_dim),jnp.float32).at[:,5].set(0.3)
-    frame = frame.at[:,6:12].set(jnp.array([1.,0.,1.,0.,0.4,1.],jnp.float32))
+    frame = frame.at[:,6:12].set(jnp.array([1.5,0.,1.,0.,0.4,1.],jnp.float32))
     obs = jnp.repeat(frame[:,None,:],hp.history_len,axis=1).reshape(obs.shape)
     gradients = jax.jit(jax.grad(lambda p: jnp.sum(module.policy_action_mean(p,hp,obs))))(params)
     leaves = jax.tree_util.tree_leaves(gradients)

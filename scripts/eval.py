@@ -3,6 +3,7 @@
 from pathlib import Path
 import argparse
 import json
+import os
 import subprocess
 import sys
 
@@ -62,7 +63,6 @@ def _scalar(value):
 def render_jax_social_nav_frame(
     env_cfg,
     state,
-    total_return=0.0,
     status="",
     size=740,
     robot_traj=None,
@@ -192,6 +192,12 @@ class Evaluator:
         self.seeds = seeds
         self.episodes = int(episodes)
         self.config = OmegaConf.load(self.save_dir / "config.yaml")
+        backend = self.config.env.get("backend", "jax")
+        if backend not in ("jax", "crax_mjx"):
+            raise ValueError(f"Unsupported environment backend {backend!r}; use jax or crax_mjx")
+        if self.visualize and self.config.env.get("backend", "jax") == "crax_mjx":
+            # Select a renderer for this evaluation process before importing MuJoCo.
+            os.environ.setdefault("MUJOCO_GL", "osmesa")
         if device:
             self.config.device = device
         # Device and float64 QP precision must be configured before importing JAX.
@@ -209,17 +215,22 @@ class Evaluator:
         checkpoint = Path(checkpoint)
         payload = load_jax_checkpoint(checkpoint)
         params = payload["params"]
+        if self.config.env.get("backend", "jax") == "crax_mjx":
+            from trainer.crax_eval import evaluate_crax_point
+            video_dir = self.save_dir / f"visualize_{checkpoint.stem}" if self.visualize else None
+            return evaluate_crax_point(self.config, params, episodes=self.episodes,
+                                       seeds=self.seeds, video_dir=video_dir)
         module = get_jax_model_module(self.config.model)
         hparams = module.hparams_from_config(self.config.model, self.config.model.critic, act_dim=2)
         env_cfg = config_from_omegaconf(self.config)
         seed_values = _eval_seed_values(self.episodes, self.seeds)
         traces = [[] for _ in seed_values] if self.visualize else None
 
-        def capture(state, history, returns, success, collision, timeout, active):
+        def capture(state, history, _returns, success, collision, timeout, active):
             for index in np.flatnonzero(active):
                 episode_state = jax.tree_util.tree_map(lambda value: np.asarray(value[index:index+1]).copy(), state)
                 status = "collision" if collision[index] else "success" if success[index] else "timeout" if timeout[index] else "running"
-                traces[index].append((episode_state, np.asarray(history[index:index+1]).copy(), float(returns[index]), status))
+                traces[index].append((episode_state, np.asarray(history[index:index+1]).copy(), status))
 
         metrics = evaluate_jax_env(
             params, hparams, env_cfg, episodes=self.episodes, seeds=self.seeds,
@@ -236,14 +247,14 @@ class Evaluator:
             for index, trace in enumerate(traces):
                 frames = []
                 trajectory = []
-                for state, history, total, status in trace:
+                for state, history, status in trace:
                     trajectory.append(state.robot_state[0, :2].copy())
                     qp_viz = None
                     if hasattr(module, "build_qp_context"):
                         context = module.build_qp_context(jnp.asarray(history.reshape((1, -1))), hparams)
                         qp_viz = {"topk_ids": np.asarray(context["qp_topk_ids"][0]),
                                   "lookahead_distance": getattr(hparams, "lookahead_distance", 0.0)}
-                    frames.append(render_jax_social_nav_frame(env_cfg, state, total, status,
+                    frames.append(render_jax_social_nav_frame(env_cfg, state, status=status,
                                                              robot_traj=trajectory, qp_viz=qp_viz))
                 status = trace[-1][-1]
                 if status == "running":

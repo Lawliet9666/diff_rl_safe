@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from model.jax_observation import _body_to_world, _gather_topk
 from model.jax_observation import build_qp_context
-from model.jax_safety_heads import _fixed_safe_distances, _learned_alpha
+from model.jax_safety_heads import (
+    _fixed_safe_distances,
+    _learned_alpha,
+    _safe_distances_from_margin_logits,
+)
 from model.jax_mlp_encoder import _critic_value_from_latent, _init_encoder, _obs_history, _shared_latent, init_shared_mlp_critic
 
 from dataclasses import dataclass
@@ -34,6 +38,8 @@ class BarrierNetMLPHParams:
     actor_act: str
     critic_act: str
     margin_base: float
+    margin_extra_max: float
+    learn_r_safe: bool
     alpha_min: float
     alpha_max: float
     alpha_init: float
@@ -97,6 +103,14 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
     if margin_base < 0.0:
         raise ValueError("model.actor.margin_base must be >= 0")
 
+    # Old resolved configs have no distance head and retain fixed distances.
+    learn_r_safe = bool(cfg_get(actor_cfg, "learn_r_safe", False))
+    margin_extra_max = float(cfg_get(actor_cfg, "margin_extra_max", 0.0))
+    if not math.isfinite(margin_extra_max) or margin_extra_max < 0.0:
+        raise ValueError("model.actor.margin_extra_max must be finite and >= 0")
+    if learn_r_safe and margin_extra_max <= 0.0:
+        raise ValueError("learn_r_safe requires model.actor.margin_extra_max > 0")
+
     alpha_min = float(actor_cfg.alpha_min)
     alpha_max = float(actor_cfg.alpha_max)
     alpha_init = float(actor_cfg.alpha_init)
@@ -127,6 +141,8 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
         actor_act=str(cfg_get(actor_cfg, "act", "relu")),
         critic_act=str(cfg_get(critic_cfg, "act", "relu")),
         margin_base=margin_base,
+        margin_extra_max=margin_extra_max,
+        learn_r_safe=learn_r_safe,
         alpha_min=alpha_min,
         alpha_max=alpha_max,
         alpha_init=alpha_init,
@@ -237,6 +253,12 @@ def init_params_from_config(
     actor["human_alpha_head"]["bias"] = jnp.full(
         (hparams.num_humans,), alpha_bias, dtype=jnp.float32
     )
+    if hparams.learn_r_safe:
+        # Derive a new key without shifting any existing actor or critic keys.
+        actor["human_rsafe_head"] = init_linear(
+            jax.random.fold_in(key, 1), scalar_hidden_dim, hparams.num_humans,
+            sqrt2 * 0.01, use_init_weights,
+        )
     critic = init_shared_mlp_critic(keys[encoder_end + 5:encoder_end + 8],
                                     hparams, critic_hidden_dim, critic_hidden_dim2, use_init_weights)
     return {
@@ -271,7 +293,13 @@ def _actor_outputs(params, hparams, obs, qp_context=None):
         actor_params["human_alpha_head"], human_x
     )
     alpha_all = _learned_alpha(alpha_logits_all, hparams)
-    r_safe_all = _fixed_safe_distances(current_obs, hparams)
+    if hparams.learn_r_safe:
+        margin_logits = dense(actor_params["human_rsafe_head"], human_x)
+        r_safe_all = _safe_distances_from_margin_logits(
+            current_obs, margin_logits, hparams
+        )
+    else:
+        r_safe_all = _fixed_safe_distances(current_obs, hparams)
 
     if qp_context is None:
         qp_context = build_qp_context(obs, hparams)

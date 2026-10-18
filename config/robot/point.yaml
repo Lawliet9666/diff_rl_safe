@@ -1,0 +1,6 @@
+defaults:
+  - unicycle
+  - _self_
+
+# The policy uses velocity-level unicycle constraints; the simulator uses Point.
+simulator_model: Point

@@ -1,6 +1,10 @@
 total_timesteps: 20000000
-num_envs: 128
+num_envs: ${oc.select:env.num_envs,128}
 ppo_impl: brax
+
+# Bootstrap from the final observation at the episode limit; false restores
+# the legacy treatment of the limit as terminal. Both modes still reset.
+timeout_bootstrap: true
 
 gamma: 0.99
 lam: 0.98

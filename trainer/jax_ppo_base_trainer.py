@@ -35,6 +35,7 @@ from trainer.jax_ppo_core import (
 )
 from trainer.jax_ppo_eval import evaluate_jax_env
 from trainer.jax_ppo_rollout import init_gnn_obs_history, make_rollout_collector
+from trainer.jax_timeout import compute_timeout_gae, timeout_bootstrap_from_config
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -272,14 +273,18 @@ class JaxTrainerBase:
                 steps_per_env,
                 global_step=global_step,
             )
-            advantages, returns = compute_brax_gae(
-                batch["rew"],
-                batch["val"],
-                batch["done"],
-                batch["next_value"],
-                gamma=gamma,
-                lam=lam,
-            )
+            if "terminated" in batch:
+                advantages, returns = compute_timeout_gae(batch["rew"], batch["val"],
+                    batch["terminated"], batch["truncated"], batch["next_values"], gamma, lam)
+            else:
+                advantages, returns = compute_brax_gae(
+                    batch["rew"],
+                    batch["val"],
+                    batch["done"],
+                    batch["next_value"],
+                    gamma=gamma,
+                    lam=lam,
+                )
             update_batch = JaxPPOBaseTrainer._update_batch(batch, advantages, returns)
             pre_summary = JaxPPOBaseTrainer._pre_update_summary(
                 batch,
@@ -439,6 +444,7 @@ class JaxTrainerBase:
             "robot_omega_delta_max": batch["robot_omega_delta_max"],
             "robot_omega_delta_penalty_mean": batch["robot_omega_delta_penalty_mean"],
             **{key: batch[key] for key in diagnostic_keys},
+            **{key: value for key, value in batch.items() if key.startswith("control/")},
             "rollout_batch_finite": JaxPPOBaseTrainer._finite_if_enabled(run_finite_check, batch),
             "gae_finite": JaxPPOBaseTrainer._finite_if_enabled(
                 run_finite_check,
@@ -464,6 +470,7 @@ class JaxTrainerBase:
             "robot_omega_delta_max": float(summary["robot_omega_delta_max"]),
             "robot_omega_delta_penalty_mean": float(summary["robot_omega_delta_penalty_mean"]),
         }
+        metrics.update({key: float(value) for key, value in summary.items() if key.startswith("control/")})
         if "qp_slack_sum" in summary:
             metrics.update({
                 "qp_slack_mean": JaxPPOBaseTrainer._summary_mean(summary, "qp_slack"),
@@ -542,6 +549,9 @@ class JaxTrainerBase:
     def _mean_log(logs, key):
         values = logs.get(key, [])
         return float(np.mean(values)) if values else float("nan")
+
+    def _extra_log_metrics(self, eval_metrics):
+        return {}
 
     def _log_update(self, global_step, update, logs, eval_metrics, train_metrics, sps):
         wandb_interval = int(self.config.wandb_interval)
@@ -635,6 +645,8 @@ class JaxTrainerBase:
             log_dict["charts/eval_min_clearance"] = eval_metrics["mean_min_clearance"]
             log_dict["charts/eval_episode_length"] = eval_metrics["mean_episode_length"]
 
+        log_dict.update({key: value for key, value in train_metrics.items() if key.startswith("control/")})
+        log_dict.update(self._extra_log_metrics(eval_metrics))
         wandb_log = {key: value for key, value in log_dict.items() if not key.startswith("train/")}
         if completed > 0 and periodic_log:
             wandb_log.update({key: value for key, value in log_dict.items() if key.startswith("train/")})
@@ -673,12 +685,15 @@ class JaxTrainerBase:
                 f"at update={update}, global_step={global_step}, metrics={bad}"
             )
 
-    def train(self):
+    def _reset_training_env(self):
         reset_key = self._next_rng_key()
         env_state = reset_env(self.jax_env_cfg, reset_key, self.num_envs)
         env_history = init_gnn_obs_history(self.jax_env_cfg, env_state, self.history_len)
         ppo_episode_returns = jnp.zeros((self.num_envs,), dtype=jnp.float32)
-        env_state = (env_state, env_history, ppo_episode_returns)
+        return env_state, env_history, ppo_episode_returns
+
+    def train(self):
+        env_state = self._reset_training_env()
         self._replace_train_state(env_state=env_state, global_step=0)
         start_time = time.time()
         global_step = int(self.train_state.global_step)
@@ -791,9 +806,11 @@ class JaxPPOBaseTrainer(JaxTrainerBase):
 
     def __init__(self, config):
         self.model_module = get_jax_model_module(config.model)
+        self.timeout_bootstrap = timeout_bootstrap_from_config(config)
         self.rollout_collector = make_rollout_collector(
             self.model_module,
             use_qp=hasattr(self.model_module, "build_qp_context"),
+            timeout_aware=self.timeout_bootstrap,
         )
         super().__init__(config)
         self.total_updates = max(1, int(np.ceil(self.total_timesteps / max(self.timesteps_per_batch, 1))))

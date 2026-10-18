@@ -124,9 +124,9 @@ def _select_done(done_bool, reset_value, next_value):
     return jnp.where(done_bool.reshape(shape), reset_value, next_value)
 
 
-def _maybe_reset_done_envs(env_cfg, next_state, reset_key, done_bool, batch_size):
+def _maybe_reset_done_envs(env_cfg, next_state, reset_key, done_bool, batch_size, reset_fn=reset_env):
     def reset_done(_unused):
-        reset_state = reset_env(env_cfg, reset_key, batch_size)
+        reset_state = reset_fn(env_cfg, reset_key, batch_size)
         return jax.tree_util.tree_map(
             lambda reset_value, next_value: _select_done(done_bool, reset_value, next_value),
             reset_state,
@@ -157,7 +157,8 @@ def _update_ppo_episode_returns(running_returns, reward, done_bool):
     return next_returns.astype(jnp.float32), logged_returns.astype(jnp.float32)
 
 
-def make_rollout_collector(model_module, use_qp):
+def make_rollout_collector(model_module, use_qp, *, step_fn=step_env, reset_fn=reset_env,
+                           observe_fn=fixed_order_policy_obs_from_state, timeout_aware=False):
     """Create a model-specific collector; ``use_qp`` is static before JIT tracing."""
     use_qp = bool(use_qp)
 
@@ -171,7 +172,7 @@ def make_rollout_collector(model_module, use_qp):
         global_step=0,
     ):
         nav_state, obs_history, ppo_episode_returns = env_state
-        batch_size = int(nav_state.robot_state.shape[0])
+        batch_size = int(obs_history.shape[0])
         act_dim = int(hparams.act_dim)
 
         def body(carry, _unused):
@@ -201,7 +202,7 @@ def make_rollout_collector(model_module, use_qp):
                     return_policy_action=True,
                 )
 
-            next_state, reward, done, metrics = step_env(env_cfg, state, env_action, env_key)
+            next_state, reward, done, metrics = step_fn(env_cfg, state, env_action, env_key)
             if use_qp:
                 reward = reward - float(hparams.qp_residual_reward_weight) * qp_diagnostics["qp_penalty"]
             done_bool = done > 0.5
@@ -210,8 +211,12 @@ def make_rollout_collector(model_module, use_qp):
                 reward,
                 done_bool,
             )
-            next_state = _maybe_reset_done_envs(env_cfg, next_state, reset_key, done_bool, batch_size)
-            next_frame = fixed_order_policy_obs_from_state(env_cfg, next_state)
+            if timeout_aware:
+                final_frame = observe_fn(env_cfg, next_state)
+                final_history = _update_gnn_obs_history(history, final_frame, jnp.zeros_like(done_bool))
+                final_value = model_module.critic_value(params, hparams, final_history.reshape(batch_size, -1))
+            next_state = _maybe_reset_done_envs(env_cfg, next_state, reset_key, done_bool, batch_size, reset_fn)
+            next_frame = observe_fn(env_cfg, next_state)
             next_history = _update_gnn_obs_history(history, next_frame, done_bool)
 
             if use_qp:
@@ -271,6 +276,15 @@ def make_rollout_collector(model_module, use_qp):
                     "robot_omega_delta": metrics["robot_omega_delta"],
                     "robot_omega_delta_penalty": metrics["robot_omega_delta_penalty"],
                 }
+            if timeout_aware:
+                truncated = metrics.get("truncated", metrics["timeout"])
+                terminated = metrics.get("terminated", jnp.where(truncated > 0.5, 0.0, done))
+                transition.update(terminated=terminated, truncated=truncated, next_values=final_value)
+            # Physics diagnostics do not depend on how value targets treat timeouts.
+            for name in ("tracking_speed_error", "tracking_omega_error", "tracking_lateral_speed",
+                         "actuator_saturation", "physical_contact", "cost"):
+                if name in metrics:
+                    transition["control/" + name] = metrics[name]
             return (next_state, next_history, next_ppo_returns, key), transition
 
         (next_state, next_history, next_ppo_returns, next_rng), transitions = jax.lax.scan(
@@ -315,6 +329,9 @@ def make_rollout_collector(model_module, use_qp):
                 "global_step": jnp.asarray(global_step, dtype=jnp.int32) + int(steps_per_env) * batch_size,
                 **summary,
             }
+        if timeout_aware:
+            batch.update({key: transitions[key] for key in ("terminated", "truncated", "next_values")})
+        batch.update({key: jnp.mean(value) for key, value in transitions.items() if key.startswith("control/")})
         return batch, (next_state, next_history, next_ppo_returns), next_rng
 
     return collect

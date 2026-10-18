@@ -1,0 +1,11 @@
+defaults:
+  - crowd_dyn_var_num_env
+  - _self_
+
+backend: crax_mjx
+scenario: crax_point_crowd
+num_envs: 128
+simulation:
+  physics_dt: 0.002
+  tracking_time_constant: 0.1
+  render_size: 640

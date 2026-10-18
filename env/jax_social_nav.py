@@ -9,12 +9,9 @@ import jax.numpy as jnp
 import numpy as np
 
 from env.jax_obstacles import (
-    apply_gmm_noise,
+    advance_obstacles,
     ellipse_points_from_angles,
-    human_step,
     outer_motion_bounds,
-    social_force_actions,
-    update_obstacle_goals,
     workspace_center_radii,
 )
 from env.jax_robot import angle_normalize, normalize_robot_type, robot_step
@@ -104,7 +101,7 @@ def config_from_omegaconf(config) -> JaxSocialNavConfig:
     env_cfg = config.env
     robot_cfg = config.robot
     scenario = str(_cfg_get(env_cfg, "scenario"))
-    supported_scenarios = {"crowd_dyn_var_num_env", "real_world_env"}
+    supported_scenarios = {"crowd_dyn_var_num_env", "real_world_env", "crax_point_crowd"}
     if scenario not in supported_scenarios:
         raise ValueError(
             f"unsupported env.scenario={scenario!r}; expected one of {tuple(sorted(supported_scenarios))}"
@@ -510,16 +507,7 @@ def step_env(cfg: JaxSocialNavConfig, state: JaxSocialNavState, action, rng):
     next_robot_state, robot_vel, robot_action = robot_step(cfg, state.robot_state, robot_input_action)
     moved_state = state._replace(robot_state=next_robot_state, robot_vel=robot_vel, robot_action=robot_action)
 
-    gmm_rng = rng
-    if cfg.end_goal_changing or cfg.random_goal_changing:
-        goal_rng, gmm_rng = jax.random.split(rng)
-        moved_state = update_obstacle_goals(cfg, moved_state, goal_rng)
-
-    human_actions = social_force_actions(cfg, moved_state)
-    if cfg.human_use_gmm:
-        human_actions = apply_gmm_noise(cfg, human_actions, moved_state, gmm_rng)
-    next_positions, next_vels = human_step(cfg, moved_state, human_actions)
-    moved_state = moved_state._replace(human_positions=next_positions, human_vels=next_vels)
+    moved_state = advance_obstacles(cfg, moved_state, rng)
 
     bounded_state = _clip_robot_to_outer_bounds(cfg, moved_state)
     dist_to_goal, min_clearance = compute_distances(cfg, bounded_state)

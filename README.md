@@ -5,21 +5,38 @@ and PPO, each using an MLP or GNN encoder. BarrierNet-GNN is the default.
 
 This repository includes the JAX crowd environment, differentiable QP solver,
 training, W&B logging, checkpoint evaluation, and ordinary rollout videos.
-MuJoCo integration is a later milestone. Historical data and trained models are
-not included.
+CRAX/MJX provides the optional compiled Point physics backend. Both environments
+support all six policies. Historical data and trained models are not included.
 
 ## Setup
 
-The CPU dependency set is tested with Python 3.10.16. With `uv`:
+Use Micromamba for setup. The `diffrl` environment runs the original JAX crowd
+backend. Compiled CRAX/MJX physics uses the separate `diffrl_crax` environment; see
+[the CRAX setup instructions](docs/CRAX.md#isolated-installation).
+
+Create `diffrl` and install its dependencies:
 
 ```bash
-uv venv --python 3.10 .venv
-uv pip install --python .venv/bin/python -r requirements-dev.txt
-source .venv/bin/activate
+micromamba create -f environment.yml
+micromamba run -n diffrl python -m pip install -r requirements-dev.txt
+micromamba run -n diffrl python -m pip check
 ```
 
-Alternatively, use `conda env create -f environment.yml`, activate
-`diff_rl_safe`, and install `pytest` if running tests.
+For NVIDIA GPU policy/QP/PPO computation, add the matching optional CUDA
+packages to the same environment:
+
+```bash
+micromamba run -n diffrl python -m pip install -r requirements-gpu.txt
+micromamba run -n diffrl python -m pip check
+```
+
+This preserves JAX/JAXlib 0.4.35 and NumPy 1.26.4. The optional file pins the
+JAX CUDA plugin and CUDA 12.6 libraries. Choose a GPU through a command-local
+`CUDA_VISIBLE_DEVICES` and use `device=cuda` for training. Point physics and
+headless rendering use the separate CRAX installation described below.
+
+The `diffrl` Micromamba environment runs all six existing JAX methods. Its CPU
+dependency set is tested with Python 3.10.16.
 
 `requirements.txt` installs CPU JAX. For CUDA, install the matching accelerator
 dependencies for JAX 0.4.35 using the [official JAX installation instructions](https://docs.jax.dev/en/latest/installation.html),
@@ -32,8 +49,9 @@ QP solver before importing JAX.
 Log an online run to your W&B account:
 
 ```bash
-wandb login
-WANDB_PROJECT=diff_rl_safe RUN_NAME=barriernet_gnn bash scripts/run_ppo.sh
+micromamba run -n diffrl wandb login
+WANDB_PROJECT=diff_rl_safe RUN_NAME=barriernet_gnn \
+  micromamba run -n diffrl bash scripts/run_ppo.sh
 ```
 
 Set `WANDB_ENTITY` to select a user or team. `WANDB_MODE=offline` saves logs for
@@ -50,17 +68,33 @@ No account, API key, or team is embedded in this repository.
 | PPO-MLP | `model=ppo_mlp` |
 
 ```bash
-RUN_NAME=diff_cvar_gnn bash scripts/run_ppo.sh model=diff_cvar_gnn
-RUN_NAME=barriernet_si bash scripts/run_ppo.sh robot=single_integrator
+RUN_NAME=diff_cvar_gnn micromamba run -n diffrl bash scripts/run_ppo.sh model=diff_cvar_gnn
+RUN_NAME=barriernet_si micromamba run -n diffrl bash scripts/run_ppo.sh robot=single_integrator
 ```
 
 Defaults retain the source settings: unicycle, 20 moving obstacles, 0.1-second
 steps, three observation frames, top-five QP obstacles, and residual reward
 weight 0.05. Training runs for 20 million environment steps by default.
+
+New training uses `trainer.timeout_bootstrap=true` in both environments and all
+six methods. Episodes still end and reset at 400 steps. The value target uses
+the final observation before reset; GAE never carries across that reset.
+Success and collision remain terminal without bootstrap. Set
+`trainer.timeout_bootstrap=false` to restore the legacy treatment of the
+400-step limit as terminal. This changes learning targets, not rewards, actions
+or the episode limit, and is recorded in the run's resolved config and W&B.
+For old resolved configs lacking this field, JAX retains terminal timeouts and
+CRAX retains timeout bootstrap. Choose the same explicit value for comparisons.
+
+```bash
+RUN_NAME=jax_bootstrap micromamba run -n diffrl bash scripts/run_ppo.sh trainer.timeout_bootstrap=true
+RUN_NAME=jax_terminal micromamba run -n diffrl bash scripts/run_ppo.sh trainer.timeout_bootstrap=false
+```
+
 For a short local run:
 
 ```bash
-WANDB_MODE=disabled RUN_NAME=quick_check bash scripts/run_ppo.sh \
+WANDB_MODE=disabled RUN_NAME=quick_check micromamba run -n diffrl bash scripts/run_ppo.sh \
   device=cpu trainer.num_envs=8 trainer.timesteps_per_batch=256 \
   trainer.total_timesteps=512 trainer.num_minibatches=4 \
   trainer.n_updates_per_iteration=1 trainer.finite_check_interval=1 \
@@ -77,21 +111,31 @@ policies also log learned α or β and safety distances.
 Replace the paths with the run directory and checkpoint you want to test:
 
 ```bash
-python scripts/eval.py --save-dir outputs/crowd_dyn_var_num_env/runs/<run> \
+micromamba run -n diffrl python scripts/eval.py --save-dir outputs/crowd_dyn_var_num_env/runs/<run> \
   --checkpoint outputs/crowd_dyn_var_num_env/runs/<run>/ckpt_00000512.pkl \
   --device cpu --seeds 100,200 --episodes 1 --visualize
 ```
+
+For a CRAX Point checkpoint, use `diffrl_crax` with the same flags; see
+[Point evaluation and rendering](docs/CRAX.md#evaluate-and-render-the-same-episodes).
 
 Omit `--checkpoint` to evaluate all saved checkpoints, or `--visualize` to skip
 videos. Episode counts are **per base seed**. The default is 50 episodes per
 seed across ten seeds, so choose a small count when rendering videos.
 
 `eval_results.json` is saved with or without videos. Videos capture the same
-rollouts used to calculate those results: blue robot, yellow goal, gray
+rollouts used to calculate those results: blue robot, visible goal, gray
 obstacles, red selected QP obstacles, and the robot trajectory. No advanced
 diagnostic dashboard is included. The aggregate summarizes checkpoints, not
 independent training seeds; compare named checkpoint results using the same
 environment settings and test seeds.
+
+Both evaluators classify each episode once, with collision taking priority over
+success and success over timeout. Collision uses the planning-envelope geometry;
+CRAX physical contacts remain separate. This reporting rule does not change the
+reward calculation or training outcome counters. Re-evaluate old checkpoints
+with the same evaluator version for comparisons; saved historical results are
+not rewritten.
 
 Report success, collision, timeout, return, episode length, and minimum
 clearance. `traj_time` and `min_dist` preserve the source's successful-episode
@@ -102,8 +146,10 @@ log values are represented as JSON `null`.
 ## Validation
 
 ```bash
-WANDB_MODE=disabled python -m pytest tests -q
+WANDB_MODE=disabled micromamba run -n diffrl python -m pytest tests -q
 ```
+
+CRAX Point tests are skipped when the optional CRAX dependency is absent.
 
 Tests cover all six policies and both robot dynamics, masked and changing QP
 obstacles, gradients through learned α, checkpoint loading, two PPO updates
@@ -117,16 +163,46 @@ Six explicit policy modules share MLP/GNN encoders, observation geometry,
 safety-head helpers, and QP assembly. Deterministic CBF and CVaR constraints
 remain separate. `model/` and `solver/` do not import the environment or trainer.
 
-BarrierNet learns per-obstacle α and uses geometric safety distances with
-observed obstacle velocities. DiffCVaR learns risk allocation and safety
-distances using the source three-component motion predictor. The cleanup
-preserves the original numerical operations, random-key allocation, parameter
-trees, policy sampling, action transformations, and reward calculation.
+BarrierNet-MLP and BarrierNet-GNN learn per-obstacle α and safety distances,
+using observed obstacle velocities in the deterministic CBF. Their distance is
+`r_robot + r_obstacle + margin_base + margin_extra_max * sigmoid(distance_logit)`.
+With the default radii this ranges from 0.75 to 1.875 m, matching DiffCVaR's
+distance parameterization. GNN predicts from each obstacle latent; MLP predicts
+one value per persistent obstacle slot. Both heads receive gradients through
+the QP. This is a learned-distance extension of the inherited BarrierNet.
+
+Use `model.actor.learn_r_safe=false` to reproduce the fixed-distance variant.
+Old resolved configs without this setting retain fixed distances and load
+without an added parameter head; existing checkpoints do not gain learned
+distances retroactively. New training defaults to the learned-distance variant.
+The existing α, nominal-control and critic initialization keys are preserved.
+Training already records `diagnostics/r_safe_mean` in local metrics and W&B.
+
+DiffCVaR learns risk allocation and safety distances using the source
+three-component motion predictor. BarrierNet retains a deterministic CBF and
+does not gain DiffCVaR's β allocation or CVaR uncertainty terms. The original
+cleanup preserved numerical operations and parameter trees; the subsequent
+BarrierNet extension adds only the optional distance head. Policy sampling,
+action transformations and reward calculation are unchanged.
 
 The existing slack and Gaussian/tanh action path remains unchanged; a QP mean
-is transformed and sampled before execution. Checkpoints contain parameters
-and step, not optimizer/RNG state for exact training resumption. DiffCVaR
+is transformed and sampled before execution, so this experiment does not claim
+strict constraint enforcement. Checkpoints contain parameters and step, not
+optimizer/RNG state for exact training resumption. DiffCVaR
 retains `gmm_weights` for compatibility; the current constraint combines
 component risks using an unweighted smooth maximum.
 
 Source attribution and excluded components are recorded in `PROVENANCE.md`.
+
+## Optional CRAX/MJX Point crowd task
+
+Use the isolated `diffrl_crax` environment for compiled, batched MuJoCo physics:
+
+```bash
+RUN_NAME=crax_point_bnet WANDB_MODE=online micromamba run -n diffrl_crax \
+  bash scripts/run_ppo.sh env=crax_point_crowd robot=point model=barriernet_gnn device=cuda
+```
+
+All six methods are selectable in both the original JAX baseline and CRAX Point.
+`robot=point` requires `env=crax_point_crowd`. Installation, evaluation/video
+commands and synchronized benchmarking are documented in [docs/CRAX.md](docs/CRAX.md).
