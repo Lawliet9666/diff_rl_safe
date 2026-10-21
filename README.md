@@ -14,7 +14,9 @@ Use Micromamba for setup. The `diffrl` environment runs the original JAX crowd
 backend. Compiled CRAX/MJX physics uses the separate `diffrl_crax` environment; see
 [the CRAX setup instructions](docs/CRAX.md#isolated-installation).
 
-Create `diffrl` and install its dependencies:
+Create `diffrl`. For controller-only checks, install `requirements-controller.txt`
+as shown in [the controller guide](docs/CONTROLLERS.md#run-locally). For the full
+RL dependency set, use:
 
 ```bash
 micromamba create -f environment.yml
@@ -35,14 +37,26 @@ JAX CUDA plugin and CUDA 12.6 libraries. Choose a GPU through a command-local
 `CUDA_VISIBLE_DEVICES` and use `device=cuda` for training. Point physics and
 headless rendering use the separate CRAX installation described below.
 
-The `diffrl` Micromamba environment runs all six existing JAX methods. Its CPU
-dependency set is tested with Python 3.10.16.
+The full RL CPU dependency set was previously tested with Python 3.10.16.
+The current environment specification uses Python 3.11; the controller-only
+dependency set is tested with Python 3.11.17.
 
 `requirements.txt` installs CPU JAX. For CUDA, install the matching accelerator
 dependencies for JAX 0.4.35 using the [official JAX installation instructions](https://docs.jax.dev/en/latest/installation.html),
 then launch with `device=cuda`. CUDA execution has not been validated here.
 `device=auto` uses an available JAX backend. The launcher enables float64 for the
 QP solver before importing JAX.
+
+## Controller-only CBF-QP checks
+
+Unicycle and attitude-aware quadrotor filters can run in the existing crowd
+without RL training or checkpoints. See [controller setup, equations and
+validation](docs/CONTROLLERS.md).
+
+```bash
+micromamba run -n diffrl python scripts/run_controller.py \
+  robot=quadrotor scenario=crossing video=true
+```
 
 ## Train and compare methods
 
