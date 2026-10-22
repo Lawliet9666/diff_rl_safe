@@ -1,9 +1,9 @@
 """Robot-independent CBF-QP action generation."""
 from functools import partial
 
-from .cbf_qp import Obstacles, ControlResult, generate_action, UnicycleConfig, QuadrotorConfig
+from .cbf_qp import Obstacles, ControlResult, generate_action, UnicycleConfig, QuadrotorConfig, HumanoidConfig
 
-__all__ = ["Obstacles", "ControlResult", "generate_action", "UnicycleConfig", "QuadrotorConfig", "make_controller"]
+__all__ = ["Obstacles", "ControlResult", "generate_action", "UnicycleConfig", "QuadrotorConfig", "HumanoidConfig", "make_controller"]
 
 
 def make_controller(config):

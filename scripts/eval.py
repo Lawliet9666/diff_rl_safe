@@ -62,13 +62,13 @@ def save_video(path, frames, fps=30):
 
 
 def _build_controller_config(config):
-    from controller.cbf_qp import SolverConfig, UnicycleConfig, QuadrotorConfig
+    from controller.cbf_qp import SolverConfig, UnicycleConfig, QuadrotorConfig, HumanoidConfig
 
     from controller import make_controller
     make_controller(config)  # Validate controller selection and its own parameters.
     r, c, e = config.robot, config.controller, config.env
-    if r.type not in {"unicycle", "quadrotor"} or r.get("simulator_model"):
-        raise ValueError("controller robot must be unicycle or quadrotor")
+    if r.type not in {"unicycle", "quadrotor", "humanoid"} or r.get("simulator_model"):
+        raise ValueError("controller robot must be unicycle, quadrotor or humanoid")
     workspace = tuple(float(v) for v in [*e.workspace.x, *e.workspace.y])
     if (len(workspace) != 4 or not all(math.isfinite(v) for v in workspace)
             or workspace[0] >= workspace[1] or workspace[2] >= workspace[3]):
@@ -92,6 +92,14 @@ def _build_controller_config(config):
         params["weights"] = tuple(params["weights"])
         return UnicycleConfig(goal_tolerance=float(r.goal_tolerance),
                               v_max=float(r.v_max), **common, **params)
+    elif r.type == "humanoid":
+        common.pop("omega_max")  # Physical limits belong to the robot model.
+        names = {f.name for f in fields(HumanoidConfig)}-common.keys()-{"dt", "goal_tolerance"}
+        params = required_section(c.humanoid, names, "controller.humanoid")
+        for name in ("gains", "weights"):
+            params[name] = tuple(params[name])
+        return HumanoidConfig(dt=float(e.dt), goal_tolerance=float(r.goal_tolerance),
+                              **common, **params)
     else:
         physical = {name: float(r[name]) for name in
                     ["mass", "gravity", "thrust_rate_max", "thrust_min", "thrust_max",
@@ -115,7 +123,7 @@ def _validate_controller_config(config):
     if (not isinstance(config.env.max_steps, int) or isinstance(config.env.max_steps, bool)
             or config.env.max_steps <= 0):
         raise ValueError("env.max_steps must be a positive integer")
-    if config.robot.type == "quadrotor":
+    if config.robot.type in {"quadrotor", "humanoid"}:
         max_dt = config.robot.max_integration_dt
         if not math.isfinite(max_dt) or max_dt <= 0:
             raise ValueError("robot.max_integration_dt must be positive")
@@ -134,6 +142,9 @@ def _controller_failure_diagnostics(state, nominal, obs, result):
         candidate=values(result.candidate), kkt_residual=values(result.kkt_residual),
         residual=values(result.residual), centers=values(obs.centers),
         velocities=values(obs.velocities), radii=values(obs.radii), mask=values(obs.mask))
+    if result.solver_status == "invalid barrier domain":
+        diagnostic["solver"] = "not_run"
+        return "controller_failure", "parabolic barrier requires separation beyond the inflated radius", diagnostic
     if result.solver_status == "primal infeasible":
         return "infeasible", "OSQP reports incompatible hard constraints", diagnostic
     reason = ("OSQP solution failed independent residual checks"
@@ -209,6 +220,10 @@ def _run_controller_episode(config):
             failures += 1
             qp_status, qp_reason, failure = _controller_failure_diagnostics(state, nominal, obs, result)
             failure["step"] = k
+            if robot == "humanoid" and qp_status == "infeasible":
+                infeasible_steps += 1
+                status, reason = qp_status, qp_reason
+                break  # An old acceleration is not a safe fallback.
             if qp_status != "infeasible" or config.controller.type == "cbf_qp_slack":
                 status = "controller_failure" if config.controller.type == "cbf_qp_slack" else qp_status
                 reason = qp_reason
@@ -242,14 +257,16 @@ def _run_controller_episode(config):
                 solver_status=result.solver_status, slack=slack, cbf_satisfied=cbf_satisfied,
                 min_cbf_residual=float(np.min(cbf_residual)),
                 min_relaxed_cbf_residual=float(np.min(cbf_residual+slack)),
-                min_input_residual=float(np.min(applied_residual[cfg.num_humans:]))).items():
+                min_input_residual=float(np.min(applied_residual[-2*robot_model.control_dim:]))).items():
             history[name].append(np.asarray(value).copy())
         record_frame("running")
         if bool(metrics["collision"][0]):
             status, reason = "collision", "physical envelopes overlap at an environment step"
             break
         if bool(metrics["physical_state_limit"]):
-            status, reason = "state_limit", "quadrotor altitude, tilt or thrust limit exceeded during integration"
+            status = "state_limit"
+            reason = ("humanoid body velocity limit exceeded during integration" if robot == "humanoid"
+                      else "quadrotor altitude, tilt or thrust limit exceeded during integration")
             break
         if bool(done[0]):
             status = "success" if bool(metrics["success"][0]) else "timeout"
@@ -293,12 +310,16 @@ def _run_controller_episode(config):
 def _render_controller_frame(cfg, history, index, crowd, robot, robot_cfg):
     """Only adapt state; all pixels/layout come from the existing RL renderer."""
     import jax.numpy as jnp
-    from controller.env_adapter import project_quadrotor
+    from controller.env_adapter import project_quadrotor, project_humanoid
 
     from env.jax_env.jax_render import render_jax_social_nav_frame
     state = jnp.asarray(history["state"][index])
-    frame_state = (project_quadrotor(crowd, state) if robot == "quadrotor"
-                   else crowd._replace(robot_state=state[None, :]))
+    if robot == "quadrotor":
+        frame_state = project_quadrotor(crowd, state)
+    elif robot == "humanoid":
+        frame_state = project_humanoid(crowd, state)
+    else:
+        frame_state = crowd._replace(robot_state=state[None, :])
     frame_state = frame_state._replace(
         human_positions=jnp.asarray(history["centers"][index])[None, ...],
         step_count=jnp.array([round(float(history["time"][index])/cfg.dt)], jnp.int32))

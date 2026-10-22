@@ -10,7 +10,7 @@ import numpy as np
 import osqp
 from scipy import sparse
 
-from env.robots import UnicycleRobot, QuadrotorRobot
+from env.robots import UnicycleRobot, QuadrotorRobot, HumanoidRobot
 from env.robots.cbf import Obstacles, Constraints
 
 
@@ -91,6 +91,36 @@ class QuadrotorConfig:
                 or not self.altitude_min < self.altitude < self.altitude_max
                 or not self.thrust_min < self.mass*self.gravity < self.thrust_max):
             raise ValueError("invalid quadrotor gains, physical limits or hover configuration")
+
+
+@dataclass(frozen=True)
+class HumanoidConfig:
+    goal_tolerance: float
+    dt: float
+    radius: float = 0.3
+    margin: float = 0.05
+    barrier: str = "distance"
+    gains: tuple = (1.5, 1.5)
+    alpha: float = 2.0
+    parabolic_gain: float = 1.0
+    clearance_gain: float = 1.0
+    speed_epsilon: float = 0.05
+    weights: tuple = (1., 1., 1.)
+    position_gain: float = 1.0
+    velocity_gain: float = 2.0
+    heading_gain: float = 2.0
+    solver: SolverConfig = SolverConfig()
+
+    def __post_init__(self):
+        values = (self.goal_tolerance, self.dt, self.radius, *self.gains,
+                  self.alpha, self.parabolic_gain, self.clearance_gain,
+                  self.speed_epsilon, *self.weights, self.position_gain,
+                  self.velocity_gain, self.heading_gain)
+        if (self.barrier not in {"distance", "parabolic"}
+                or len(self.gains) != 2 or len(self.weights) != 3
+                or not all(math.isfinite(v) and v > 0 for v in values)
+                or not math.isfinite(self.margin) or self.margin < 0):
+            raise ValueError("invalid humanoid barrier, gains or controller limits")
 
 
 class ControlResult(NamedTuple):
@@ -214,6 +244,14 @@ def control_residual(robot, state, action, obstacles, control_config):
 
 def solve_cbf_qp(robot, state, nominal, obstacles, cbf_config):
     """Apply one shared CPU QP to the selected robot's constraints and bounds."""
+    if isinstance(robot, HumanoidRobot) and not bool(
+            robot.barrier_domain_valid(state, obstacles, cbf_config)):
+        # Do not extend the parabolic sqrt through collision or execute an old
+        # acceleration. Return an explicit failed result before calling OSQP.
+        action = jnp.full(robot.control_dim, jnp.nan)
+        residual = jnp.full(obstacles.mask.size+4+2*robot.control_dim, jnp.nan)
+        return ControlResult(action, action, residual, jnp.full(3, jnp.inf),
+                             False, False, float("nan"), "invalid barrier domain", 0)
     low, high = robot.input_bounds()
     return solve_qp(nominal, _cbf_constraints(robot, state, obstacles, cbf_config),
                         low, high, jnp.asarray(cbf_config.weights),

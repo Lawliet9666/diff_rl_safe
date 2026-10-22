@@ -1,0 +1,19 @@
+type: humanoid
+radius: 0.3
+vf_min: -1.0
+vf_max: 2.0
+vl_min: -1.0
+vl_max: 1.0
+af_max: 4.0
+al_max: 2.0
+omega_max: 1.0
+max_integration_dt: 0.01
+
+# Navigation metadata for the shared crowd adapter; no RL action mapping.
+v_max: ${robot.vf_max}
+goal_tolerance: 0.6
+goal_min_distance: 6.0
+reward:
+  potential_factor: 3.0
+  back_factor: 0.1
+  spin_factor: 4.5

@@ -5,10 +5,11 @@ from .base import Robot, RobotStep, angle_normalize
 from .single_integrator import SingleIntegratorRobot
 from .unicycle import UnicycleRobot
 from .quadrotor import QuadrotorRobot
+from .humanoid import HumanoidRobot
 
 
 _MODELS = dict(single_integrator=SingleIntegratorRobot, unicycle=UnicycleRobot,
-               quadrotor=QuadrotorRobot)
+               quadrotor=QuadrotorRobot, humanoid=HumanoidRobot)
 
 
 def make_robot(robot_type, config=None, **parameters):
@@ -40,4 +41,4 @@ def robot_step(cfg, state, action):
 
 
 __all__ = ['Robot', 'RobotStep', 'SingleIntegratorRobot', 'UnicycleRobot',
-           'QuadrotorRobot', 'make_robot', 'robot_step', 'angle_normalize']
+           'QuadrotorRobot', 'HumanoidRobot', 'make_robot', 'robot_step', 'angle_normalize']

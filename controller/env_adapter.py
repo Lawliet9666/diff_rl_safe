@@ -1,4 +1,4 @@
-"""Uniform reset/observe/step over the original JAX crowd and quadrotor adapter."""
+"""Uniform reset/observe/step over the original JAX crowd and reduced robot models."""
 from typing import NamedTuple
 import math
 
@@ -32,6 +32,32 @@ def project_quadrotor(crowd, state):
                           robot_action=jnp.zeros_like(crowd.robot_action))
 
 
+def project_humanoid(crowd, state):
+    robot = make_robot("humanoid")
+    return crowd._replace(robot_state=robot.navigation_state(state)[None, :],
+                          robot_vel=robot.world_velocity(state)[None, :],
+                          robot_action=jnp.zeros_like(crowd.robot_action))
+
+
+def _finish_navigation_step(cfg, crowd, state, rng):
+    """Original post-robot crowd update and termination; discard planar reward."""
+    moved = advance_obstacles(cfg, crowd, rng)
+    bounded = _clip_robot_to_outer_bounds(cfg, moved)
+    correction = bounded.robot_state[0, :2]-state[:2]
+    state = state.at[:2].set(bounded.robot_state[0, :2])
+    dist, clearance = compute_distances(cfg, bounded)
+    _, done, success, collision, timeout, next_step, violation = reward_done(
+        cfg, bounded, dist, clearance, jnp.zeros_like(bounded.robot_action),
+        jnp.zeros_like(bounded.episode_returns))
+    lengths = bounded.episode_lengths+1
+    bounded = bounded._replace(step_count=next_step, prev_dist_to_goal=dist.astype(jnp.float32),
+                               episode_lengths=jnp.where(done, 0, lengths))
+    metrics = dict(success=success, collision=collision, timeout=timeout,
+        min_clearance=clearance, goal_distance=dist, boundary_violation=violation,
+        episode_length=lengths, boundary_correction=correction)
+    return state, bounded, done, metrics
+
+
 def step_quadrotor(cfg, crowd, state, action, rng, robot_cfg, max_integration_dt, state_tolerance):
     """Replace robot propagation; retain robot-first crowd/boundary/terminal semantics.
 
@@ -47,25 +73,28 @@ def step_quadrotor(cfg, crowd, state, action, rng, robot_cfg, max_integration_dt
         return y, y
 
     state, substeps = jax.lax.scan(advance, state, None, length=count)
-    moved = advance_obstacles(cfg, project_quadrotor(crowd, state), rng)
-    bounded = _clip_robot_to_outer_bounds(cfg, moved)
-    correction = bounded.robot_state[0, :2]-state[:2]
-    state = state.at[:2].set(bounded.robot_state[0, :2])
-    dist, clearance = compute_distances(cfg, bounded)
-    _, done, success, collision, timeout, next_step, violation = reward_done(
-        cfg, bounded, dist, clearance, jnp.zeros_like(bounded.robot_action),
-        jnp.zeros_like(bounded.episode_returns))
-    lengths = bounded.episode_lengths+1
-    bounded = bounded._replace(step_count=next_step, prev_dist_to_goal=dist.astype(jnp.float32),
-                               episode_lengths=jnp.where(done, 0, lengths))
+    state, bounded, done, metrics = _finish_navigation_step(
+        cfg, project_quadrotor(crowd, state), state, rng)
     domain = jnp.stack([substeps[:, 2]-robot_cfg.altitude_min,
         robot_cfg.altitude_max-substeps[:, 2], substeps[:, 14]-math.cos(robot_cfg.tilt_max),
         substeps[:, 15]-robot_cfg.thrust_min, robot_cfg.thrust_max-substeps[:, 15]])
-    metrics = dict(success=success, collision=collision, timeout=timeout,
-        min_clearance=clearance, goal_distance=dist, boundary_violation=violation,
-        episode_length=lengths, boundary_correction=correction,
-        physical_state_limit=jnp.any(domain < -state_tolerance))
+    metrics["physical_state_limit"] = jnp.any(domain < -state_tolerance)
     return state, bounded, done, metrics
+
+
+def step_humanoid(cfg, crowd, state, action, rng, robot, max_integration_dt, state_tolerance):
+    count = max(1, math.ceil(cfg.dt/max_integration_dt))
+    dt = cfg.dt/count
+
+    def advance(x, _):
+        y = robot.step(x, action, dt)
+        return y, robot.velocity_margin(y)
+
+    state, margins = jax.lax.scan(advance, state, None, length=count)
+    state, crowd, done, info = _finish_navigation_step(
+        cfg, project_humanoid(crowd, state), state, rng)
+    info["physical_state_limit"] = jnp.any(margins < -state_tolerance)
+    return state, crowd, done, info
 
 
 class NavigationState(NamedTuple):
@@ -83,7 +112,7 @@ class NavigationEnv:
     """Single-episode environment interface for the supported robot models.
 
     The original planar environment handles unicycle rewards and transitions.
-    Quadrotor transitions preserve navigation flags and return reward=None.
+    Quadrotor/humanoid transitions preserve navigation flags and return reward=None.
     """
 
     def __init__(self, config, *, state_tolerance):
@@ -91,8 +120,8 @@ class NavigationEnv:
             raise ValueError("NavigationEnv requires the JAX crowd backend")
         raw = OmegaConf.to_container(config, resolve=True)
         self.robot_type = str(raw["robot"]["type"])
-        if self.robot_type not in {"unicycle", "quadrotor"}:
-            raise ValueError("NavigationEnv supports unicycle and quadrotor")
+        if self.robot_type not in {"unicycle", "quadrotor", "humanoid"}:
+            raise ValueError("NavigationEnv supports unicycle, quadrotor and humanoid")
         self.robot_config = OmegaConf.create(raw["robot"])
         self.robot = make_robot(self.robot_type, self.robot_config)
         # The shared crowd stores the planar navigation projection only.
@@ -107,7 +136,7 @@ class NavigationEnv:
         if not math.isfinite(self.state_tolerance) or self.state_tolerance <= 0:
             raise ValueError("state_tolerance must be positive")
         self.integration_dt = self.cfg.dt
-        if self.robot_type == "quadrotor":
+        if self.robot_type in {"quadrotor", "humanoid"}:
             self.max_integration_dt = float(self.robot_config.max_integration_dt)
             if not math.isfinite(self.max_integration_dt) or self.max_integration_dt <= 0:
                 raise ValueError("robot.max_integration_dt must be positive")
@@ -119,6 +148,9 @@ class NavigationEnv:
         if self.robot_type == "quadrotor":
             state = quadrotor_from_crowd(crowd, self.robot_config)
             crowd = project_quadrotor(crowd, state)
+        elif self.robot_type == "humanoid":
+            state = jnp.concatenate([crowd.robot_state[0].astype(jnp.float64), jnp.zeros(2)])
+            crowd = project_humanoid(crowd, state)
         else:
             state = crowd.robot_state[0].astype(jnp.float64)
         return NavigationState(state, crowd)
@@ -149,6 +181,12 @@ class NavigationEnv:
             robot, crowd, done, info = step_quadrotor(
                 self.cfg, state.crowd, state.robot, action, rng,
                 self.robot_config, self.max_integration_dt, self.state_tolerance)
+            reward = None
+            applied = action
+        elif self.robot_type == "humanoid":
+            robot, crowd, done, info = step_humanoid(
+                self.cfg, state.crowd, state.robot, action, rng,
+                self.robot, self.max_integration_dt, self.state_tolerance)
             reward = None
             applied = action
         else:

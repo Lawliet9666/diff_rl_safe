@@ -25,3 +25,16 @@ quadrotor:
   attitude_gain: 4.0
   thrust_tracking_gain: 4.0
   acceleration_limits: [2.0, 2.0, 2.0]
+
+# Same three physical inputs and QP objective for either humanoid barrier.
+humanoid:
+  barrier: distance  # distance (second order) or parabolic (first order).
+  gains: [1.5, 1.5]
+  alpha: 2.0
+  parabolic_gain: 1.0
+  clearance_gain: 1.0
+  speed_epsilon: 0.05  # Smooth speed regularization used in content.tex.
+  weights: [1.0, 1.0, 1.0]  # Forward/lateral acceleration, then yaw rate.
+  position_gain: 1.0
+  velocity_gain: 2.0
+  heading_gain: 2.0
