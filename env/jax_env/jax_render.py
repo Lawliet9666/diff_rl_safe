@@ -129,3 +129,30 @@ def render_jax_social_nav_frame(
     canvas.draw()
     rgba = np.asarray(canvas.buffer_rgba())
     return rgba[:, :, :3].copy()
+
+
+def save_videos(video_dir, traces, records, env_cfg, hparams, module):
+    import jax.numpy as jnp
+    from scripts.eval import save_video
+
+    for index, (trace, record) in enumerate(zip(traces, records)):
+        trajectory, frames = [], []
+        for frame_index, frame in enumerate(trace):
+            state = frame["snapshot"]
+            trajectory.append(state.robot_state[0, :2].copy())
+            qp_viz = None
+            if hasattr(module, "build_qp_context"):
+                context = module.build_qp_context(
+                    jnp.asarray(frame["history"].reshape(1, -1)), hparams)
+                qp_viz = dict(topk_ids=np.asarray(context["qp_topk_ids"][0]),
+                              lookahead_distance=getattr(hparams, "lookahead_distance", 0.))
+            status = frame["status"]
+            if frame_index == len(trace)-1 and status == "running":
+                status = "timeout"
+            frames.append(render_jax_social_nav_frame(
+                env_cfg, state, status=status, robot_traj=trajectory, qp_viz=qp_viz))
+        status = ("collision" if record["collision"] else "success" if record["success"]
+                  else "timeout")
+        filename = f"episode_{index:04d}_seed_{record['seed']}_{status}.mp4"
+        save_video(video_dir/filename, frames, fps=int(round(1./env_cfg.dt)))
+    print(f"Videos: {video_dir}")

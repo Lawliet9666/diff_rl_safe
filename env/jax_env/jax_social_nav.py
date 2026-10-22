@@ -459,3 +459,82 @@ def step_env(cfg: JaxSocialNavConfig, state: JaxSocialNavState, action, rng):
         "episode_length": completed_lengths.astype(jnp.float32),
     }
     return next_state, reward.astype(jnp.float32), done.astype(jnp.float32), metrics
+
+
+def _fixed_slot_policy_obs_from_state(env_cfg, state, model_humans):
+    batch_size = state.robot_state.shape[0]
+    model_humans = int(model_humans)
+    if model_humans <= 0:
+        raise ValueError("model_humans must be > 0")
+
+    robot = jnp.concatenate(
+        [
+            state.robot_state[:, 0:2] - state.goal_pos,
+            state.robot_vel,
+            state.robot_state[:, 2:3],
+            jnp.full((batch_size, 1), env_cfg.robot_radius, dtype=state.robot_state.dtype),
+        ],
+        axis=1,
+    )
+    rel = state.robot_state[:, None, 0:2] - state.human_positions
+    blocks = jnp.concatenate(
+        [
+            rel,
+            state.human_vels,
+            state.human_radii[..., None],
+            state.human_mask[..., None],
+        ],
+        axis=-1,
+    )
+    dists = jnp.linalg.norm(rel, axis=-1)
+    sort_key = jnp.where(state.human_mask > 0.5, dists, jnp.inf)
+    selected = jnp.argsort(sort_key, axis=1)
+    selected_blocks = jnp.take_along_axis(blocks, selected[..., None], axis=1)
+    valid = jnp.take_along_axis(state.human_mask, selected, axis=1) > 0.5
+    selected_blocks = selected_blocks.at[:, :, 5].set(valid.astype(selected_blocks.dtype))
+    selected_blocks = selected_blocks[:, :model_humans, :]
+    pad_count = model_humans - int(selected_blocks.shape[1])
+    if pad_count > 0:
+        pad = jnp.zeros((batch_size, pad_count, 6), dtype=selected_blocks.dtype)
+        selected_blocks = jnp.concatenate([selected_blocks, pad], axis=1)
+    return jnp.concatenate([robot, selected_blocks.reshape((batch_size, -1))], axis=1).astype(jnp.float32)
+
+
+def _policy_obs_frame_from_state(env_cfg, state, hparams):
+    obs_frame_dim = int(getattr(hparams, "obs_frame_dim", 0))
+    if obs_frame_dim >= 6 and (obs_frame_dim - 6) % 6 == 0:
+        model_humans = (obs_frame_dim - 6) // 6
+        if 0 < model_humans != int(env_cfg.num_humans):
+            return _fixed_slot_policy_obs_from_state(env_cfg, state, model_humans)
+    return fixed_order_policy_obs_from_state(env_cfg, state)
+
+
+class JaxSocialNav:
+    """Batched navigation interface backed by the original JAX task functions."""
+
+    @staticmethod
+    def step_fn(env_cfg, state, action, key):
+        return step_env(env_cfg, state, action, key)
+
+    @staticmethod
+    def reset_fn(env_cfg, key, num_envs):
+        if key.shape == (2,):
+            return reset_env(env_cfg, key, num_envs)
+        if key.shape != (num_envs, 2):
+            raise ValueError("reset keys must have shape (2,) or (batch_size, 2)")
+        return reset_env_with_keys(env_cfg, key)
+
+    @staticmethod
+    def observe_fn(env_cfg, state, hparams=None):
+        if hparams is None:
+            return fixed_order_policy_obs_from_state(env_cfg, state)
+        return _policy_obs_frame_from_state(env_cfg, state, hparams)
+
+    @staticmethod
+    def snapshot_fn(state):
+        return state
+
+    @staticmethod
+    def save_videos(video_dir, traces, records, env_cfg, hparams, module):
+        from env.jax_env.jax_render import save_videos
+        return save_videos(video_dir, traces, records, env_cfg, hparams, module)

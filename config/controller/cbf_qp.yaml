@@ -1,4 +1,5 @@
 type: cbf_qp
+qp_obs_top_k: null  # null: all; positive integer: nearest obstacles by robot-center distance.
 
 solver:
   eps_abs: 1.0e-9
@@ -13,7 +14,6 @@ unicycle:
   alpha: 2.0
   weights: [1.0, 1.0]  # World velocity x/y of the lookahead point.
   position_gain: 1.0
-  stop_distance: 0.1
 
 quadrotor:
   gains: [1.5, 1.5, 1.5]

@@ -85,12 +85,13 @@ def _build_controller_config(config):
     common = dict(radius=float(r.radius), margin=float(e.safety_margin),
                   omega_max=float(r.omega_max), solver=solver)
     if r.type == "unicycle":
-        names = {f.name for f in fields(UnicycleConfig)}-common.keys()-{"v_max"}
+        names = {f.name for f in fields(UnicycleConfig)}-common.keys()-{"v_max", "goal_tolerance"}
         params = required_section(c.unicycle, names, "controller.unicycle")
         # Older saved runs contain heading_gain; Cartesian tracking no longer uses it.
         params.pop("heading_gain", None)
         params["weights"] = tuple(params["weights"])
-        return UnicycleConfig(v_max=float(r.v_max), **common, **params)
+        return UnicycleConfig(goal_tolerance=float(r.goal_tolerance),
+                              v_max=float(r.v_max), **common, **params)
     else:
         physical = {name: float(r[name]) for name in
                     ["mass", "gravity", "thrust_rate_max", "thrust_min", "thrust_max",
@@ -316,7 +317,7 @@ def _controller_evaluation_metrics(result):
 
 def evaluate_controller(config, output, *, visualize=False, seeds=None, episodes=1):
     """Shared controller evaluation entry for Hydra and saved-run evaluation."""
-    from trainer.platform import configure_jax_platform_for_device, validate_jax_backend_for_device
+    from utils import configure_jax_platform_for_device, validate_jax_backend_for_device
 
     platform = configure_jax_platform_for_device(config.device)
     import jax
@@ -325,10 +326,10 @@ def evaluate_controller(config, output, *, visualize=False, seeds=None, episodes
         jax.config.update("jax_platforms", platform)
     validate_jax_backend_for_device(jax, config.device)
 
-    from trainer.jax_ppo_eval import _eval_seed_values, _safe_mean_std
+    from trainer.evaluation import eval_seed_values, safe_mean_std, paper_metric_summary
 
     _validate_controller_config(config)
-    seed_values = _eval_seed_values(episodes, [int(config.seed)] if seeds is None else seeds)
+    seed_values = eval_seed_values(episodes, [int(config.seed)] if seeds is None else seeds)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(config, output/"config.yaml", resolve=True)
@@ -338,9 +339,6 @@ def evaluate_controller(config, output, *, visualize=False, seeds=None, episodes
         episode_config = OmegaConf.merge(config, {"seed": int(seed)})
         (result, history, goal, crowd), cfg, rcfg = _run_controller_episode(episode_config)
         results.append(result)
-        trajectory = ("trajectory.npz" if len(seed_values) == 1
-                      else f"trajectory_{index:04d}_seed{int(seed)}.npz")
-        np.savez_compressed(output/trajectory, **history, goal=goal)
         if visualize:
             video_dir = output/f"visualize_{controller}"
             video_dir.mkdir(parents=True, exist_ok=True)
@@ -355,7 +353,7 @@ def evaluate_controller(config, output, *, visualize=False, seeds=None, episodes
         metrics["status"] = results[0]["status"] if len(statuses) == 1 else "mixed"
         for key in ("success_rate", "collision_rate", "timeout_rate", "failure_rate", "infeasible_rate", "mean_episode_length"):
             metrics[key] = float(np.mean([m[key] for m in episode_metrics]))
-        metrics["mean_min_clearance"], metrics["std_min_clearance"] = _safe_mean_std(
+        metrics["mean_min_clearance"], metrics["std_min_clearance"] = safe_mean_std(
             [np.nan if r["min_clearance"] is None else r["min_clearance"] for r in results])
         metrics["qp_failures"] = sum(r["qp_failures"] for r in results)
         metrics["fallback_steps"] = sum(r["fallback_steps"] for r in results)
@@ -363,6 +361,11 @@ def evaluate_controller(config, output, *, visualize=False, seeds=None, episodes
         steps = sum(r["steps"] for r in timed)
         metrics["mean_solve_ms"] = (sum(r["mean_solve_ms"]*r["steps"] for r in timed)/steps
                                     if steps else None)
+    metrics.update(paper_metric_summary(
+        [r["status"] == "success" for r in results],
+        np.asarray([r["steps"] for r in results]),
+        np.asarray([np.nan if r["min_clearance"] is None else r["min_clearance"] for r in results]),
+        float(config.env.dt)))
     aggregate = {"num_controllers": 1}
     if len(results) > 1:
         aggregate["num_episodes"] = len(results)
@@ -371,7 +374,6 @@ def evaluate_controller(config, output, *, visualize=False, seeds=None, episodes
     results_path = output/"eval_results.json"
     results_path.write_text(json.dumps({controller: metrics, "aggregate": aggregate},
         indent=2, allow_nan=False)+"\n")
-    (output/"episodes.json").write_text(json.dumps(results, indent=2, allow_nan=False)+"\n")
     print(f"{controller}: {json.dumps(metrics, allow_nan=False)}")
     print(f"Results: {results_path}")
     if any(r["status"] in {"controller_failure", "infeasible", "invalid_initial_state", "collision", "state_limit"}
@@ -397,68 +399,25 @@ class Evaluator:
         if device:
             self.config.device = device
         # Device and float64 QP precision must be configured before importing JAX.
-        from trainer.platform import configure_jax_platform_for_device
+        from utils import configure_jax_platform_for_device
         configure_jax_platform_for_device(self.config.device)
 
     def evaluate_one_ckpt(self, checkpoint):
-        import jax
-        import jax.numpy as jnp
         from env.jax_env.jax_social_nav import config_from_omegaconf
         from model import get_jax_model_module
-        from trainer.checkpoint import load_jax_checkpoint
-        from trainer.jax_ppo_eval import evaluate_jax_env, _eval_seed_values
+        from utils import load_jax_checkpoint
+        from env import make_env
+        from trainer.evaluation import evaluate_env
 
         checkpoint = Path(checkpoint)
-        payload = load_jax_checkpoint(checkpoint)
-        params = payload["params"]
-        if self.config.env.get("backend", "jax") == "crax_mjx":
-            from trainer.crax_eval import evaluate_crax_point
-            video_dir = self.save_dir / f"visualize_{checkpoint.stem}" if self.visualize else None
-            return evaluate_crax_point(self.config, params, episodes=self.episodes,
-                                       seeds=self.seeds, video_dir=video_dir)
+        params = load_jax_checkpoint(checkpoint)["params"]
         module = get_jax_model_module(self.config.model)
         hparams = module.hparams_from_config(self.config.model, self.config.model.critic, act_dim=2)
         env_cfg = config_from_omegaconf(self.config)
-        seed_values = _eval_seed_values(self.episodes, self.seeds)
-        traces = [[] for _ in seed_values] if self.visualize else None
-
-        def capture(state, history, _returns, success, collision, timeout, active):
-            for index in np.flatnonzero(active):
-                episode_state = jax.tree_util.tree_map(lambda value: np.asarray(value[index:index+1]).copy(), state)
-                status = "collision" if collision[index] else "success" if success[index] else "timeout" if timeout[index] else "running"
-                traces[index].append((episode_state, np.asarray(history[index:index+1]).copy(), status))
-
-        metrics = evaluate_jax_env(
-            params, hparams, env_cfg, episodes=self.episodes, seeds=self.seeds,
-            policy_action_mean_fn=module.policy_action_mean,
-            policy_action_to_env_action_fn=module.policy_action_to_env_action,
-            include_paper_metrics=True,
-            rollout_callback=capture if self.visualize else None,
-        )
-        if self.visualize:
-            # Wait for ordered host callbacks before reading their captured states.
-            jax.effects_barrier()
-            video_dir = self.save_dir / f"visualize_{checkpoint.stem}"
-            video_dir.mkdir(parents=True, exist_ok=True)
-            for index, trace in enumerate(traces):
-                frames = []
-                trajectory = []
-                for state, history, status in trace:
-                    trajectory.append(state.robot_state[0, :2].copy())
-                    qp_viz = None
-                    if hasattr(module, "build_qp_context"):
-                        context = module.build_qp_context(jnp.asarray(history.reshape((1, -1))), hparams)
-                        qp_viz = {"topk_ids": np.asarray(context["qp_topk_ids"][0]),
-                                  "lookahead_distance": getattr(hparams, "lookahead_distance", 0.0)}
-                    frames.append(render_jax_social_nav_frame(env_cfg, state, status=status,
-                                                             robot_traj=trajectory, qp_viz=qp_viz))
-                status = trace[-1][-1]
-                if status == "running":
-                    status = "timeout"
-                save_video(video_dir / f"episode_{index:04d}_seed_{int(seed_values[index])}_{status}.mp4",
-                           frames, fps=int(round(1.0 / env_cfg.dt)))
-            print(f"Videos: {video_dir}")
-        return metrics
+        env = make_env(self.config)
+        video_dir = self.save_dir/f"visualize_{checkpoint.stem}" if self.visualize else None
+        return evaluate_env(env, params, hparams, env_cfg, module,
+                            episodes=self.episodes, seeds=self.seeds, video_dir=video_dir)
 
     def eval_all_ckpts(self, checkpoint=None):
         if self.is_controller:

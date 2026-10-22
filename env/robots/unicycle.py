@@ -72,4 +72,4 @@ class UnicycleRobot(Robot):
         speed = jnp.linalg.norm(velocity)
         velocity *= jnp.minimum(1., self.v_max/jnp.maximum(speed, 1e-9))
         nominal = jnp.linalg.solve(self.control_output_matrix(state, control_config), velocity)
-        return jnp.where(jnp.linalg.norm(delta) < control_config.stop_distance, jnp.zeros(2), nominal)
+        return jnp.where(jnp.linalg.norm(delta) < control_config.goal_tolerance, jnp.zeros(2), nominal)

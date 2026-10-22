@@ -34,6 +34,7 @@ class SolverConfig:
 
 @dataclass(frozen=True)
 class UnicycleConfig:
+    goal_tolerance: float
     radius: float = 0.3
     margin: float = 0.05
     lookahead: float = 0.2
@@ -42,12 +43,11 @@ class UnicycleConfig:
     omega_max: float = UnicycleRobot.omega_max
     weights: tuple = (1., 1.)
     position_gain: float = 1.0
-    stop_distance: float = .1
     solver: SolverConfig = SolverConfig()
 
     def __post_init__(self):
         vals = (self.radius, self.lookahead, self.alpha, self.v_max, self.omega_max,
-                self.position_gain, self.stop_distance, *self.weights)
+                self.position_gain, self.goal_tolerance, *self.weights)
         if (not all(math.isfinite(v) and v > 0 for v in vals)
                 or not math.isfinite(self.margin) or self.margin < 0 or len(self.weights) != 2):
             raise ValueError("radii, lookahead, gains and limits must be positive")

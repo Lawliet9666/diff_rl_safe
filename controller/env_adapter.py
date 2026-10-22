@@ -98,6 +98,11 @@ class NavigationEnv:
         # The shared crowd stores the planar navigation projection only.
         raw["robot"]["type"] = "unicycle"
         self.cfg = config_from_omegaconf(OmegaConf.create(raw))
+        self.qp_obs_top_k = config.controller.get("qp_obs_top_k")
+        if self.qp_obs_top_k is not None and (
+                not isinstance(self.qp_obs_top_k, int) or isinstance(self.qp_obs_top_k, bool)
+                or self.qp_obs_top_k <= 0):
+            raise ValueError("controller.qp_obs_top_k must be null or a positive integer")
         self.state_tolerance = float(state_tolerance)
         if not math.isfinite(self.state_tolerance) or self.state_tolerance <= 0:
             raise ValueError("state_tolerance must be positive")
@@ -120,10 +125,18 @@ class NavigationEnv:
 
     def observe(self, state):
         crowd = state.crowd
+        mask = crowd.human_mask[0]
+        if self.qp_obs_top_k is not None:
+            distance = jnp.linalg.norm(crowd.human_positions[0]-state.robot[:2], axis=1)
+            _, indices = jax.lax.top_k(
+                -jnp.where(mask > .5, distance, jnp.inf),
+                min(self.qp_obs_top_k, self.cfg.num_humans))
+            # Keep scene indices and fixed shapes; only QP visibility changes.
+            mask = jnp.zeros_like(mask).at[indices].set(mask[indices])
         obstacles = Obstacles(
             crowd.human_positions[0].astype(jnp.float64),
             crowd.human_vels[0].astype(jnp.float64),
-            crowd.human_radii[0].astype(jnp.float64), crowd.human_mask[0])
+            crowd.human_radii[0].astype(jnp.float64), mask)
         return NavigationObservation(
             state.robot, crowd.goal_pos[0].astype(jnp.float64), obstacles)
 

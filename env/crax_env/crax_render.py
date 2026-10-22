@@ -77,3 +77,36 @@ class RecordedPointRenderer:
 
     def close(self):
         self.renderer.close()
+
+
+def save_videos(env, video_dir, traces, records, env_cfg, hparams, module):
+    import json
+    from scripts.eval import save_video
+
+    renderer = RecordedPointRenderer(env)
+    try:
+        for index, (trace, record) in enumerate(zip(traces, records)):
+            length = record["episode_length"]
+            arrays = {name: np.concatenate([frame["snapshot"][name] for frame in trace])
+                      for name in ("qpos", "qvel", "mocap_pos")}
+            qpos, qvel, mocap = (arrays[name] for name in ("qpos", "qvel", "mocap_pos"))
+            mask = trace[0]["snapshot"]["mask"][0]
+            ids = np.asarray([frame["qp_ids"] for frame in trace[1:]])
+            rewards = np.asarray([frame["reward"] for frame in trace[1:]], dtype=np.float32)
+            totals = np.r_[0., np.cumsum(rewards)]
+            status = ("collision" if record["collision"] else "success" if record["success"]
+                      else "timeout")
+            frames = [renderer.frame(
+                qpos[t], qvel[t], mocap[t], mask, trace[t]["qp_ids"], qpos[:t+1, :2],
+                totals[t], t, status if t == length else "running")
+                for t in range(length+1)]
+            filename = f"episode_{index:03d}_seed_{record['seed']}.mp4"
+            save_video(video_dir/filename, frames, fps=1./env_cfg.dt)
+            record["video"] = filename
+            np.savez_compressed(video_dir/filename.replace(".mp4", ".npz"),
+                qpos=qpos, qvel=qvel, mocap_pos=mocap, reward=rewards,
+                qp_ids=ids, mask=mask, seed=record["seed"])
+            print(f"Video: {video_dir/filename}", flush=True)
+    finally:
+        renderer.close()
+    (video_dir/"episodes.json").write_text(json.dumps(records, indent=2, allow_nan=False)+"\n")

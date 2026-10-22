@@ -103,6 +103,7 @@ controller/       Deterministic CBF-QP controller and rollout execution
 env/              JAX/CRAX environments and shared robot models
 model/            BarrierNet, DiffCVaR, and PPO policies with MLP/GNN encoders
 solver/jax_qpth/   Differentiable QP solver
-trainer/          Shared PPO training, environment adapters, and evaluation
+trainer/          Shared PPO training and evaluation
+utils.py          Shared device configuration and model checkpoint utilities
 scripts/          Controller, training, and evaluation entry points
 ```

@@ -132,6 +132,7 @@ class CraxSocialNav(SafeGoalPoint):
         self._ctrl_range = jnp.asarray(self.model.actuator_ctrlrange[:2], jnp.float32)
         self._gain = jnp.float32(self.model.actuator_gainprm[1, 0])
         self._bounds = jnp.asarray([cfg.robot_vmax, cfg.robot_omega_max], jnp.float32)
+        self._reset_with_keys = jax.jit(jax.vmap(self.reset), inline=True)
 
     def _mocap(self, physics, crowd, positions):
         active = crowd.human_mask[0] > .5
@@ -230,11 +231,25 @@ class CraxSocialNav(SafeGoalPoint):
             robot_omega_delta_penalty=jnp.float32(0.))
         return CrowdState(physics, crowd, key), reward[0], done, metrics
 
-    def batch_reset(self, _cfg, key, batch_size):
-        return jax.vmap(self.reset)(jax.random.split(key, batch_size))
+    def reset_fn(self, env_cfg, key, num_envs):
+        """Reset a batch from a root key or explicit per-episode keys."""
+        if key.shape == (2,):
+            key = jax.random.split(key, num_envs)
+        elif key.shape != (num_envs, 2):
+            raise ValueError("reset keys must have shape (2,) or (batch_size, 2)")
+        return self._reset_with_keys(key)
 
-    def batch_step(self, _cfg, state, command, _key):
-        return jax.vmap(self.step)(state, command)
+    def step_fn(self, env_cfg, state, action, key):
+        return jax.vmap(self.step)(state, action)
 
-    def batch_observe(self, _cfg, state):
+    def observe_fn(self, env_cfg, state, hparams=None):
         return jax.vmap(self.observe)(state)
+
+    @staticmethod
+    def snapshot_fn(state):
+        return dict(qpos=state.physics.qpos, qvel=state.physics.qvel,
+                    mocap_pos=state.physics.mocap_pos, mask=state.crowd.human_mask[:, 0])
+
+    def save_videos(self, video_dir, traces, records, env_cfg, hparams, module):
+        from env.crax_env.crax_render import save_videos
+        return save_videos(self, video_dir, traces, records, env_cfg, hparams, module)

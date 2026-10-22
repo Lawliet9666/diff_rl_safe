@@ -16,7 +16,7 @@ OmegaConf.register_new_resolver("mul", lambda *values: math.prod(values), replac
 
 
 def build_trainer(config):
-    from trainer.platform import configure_jax_platform_for_device
+    from utils import configure_jax_platform_for_device
 
     configure_jax_platform_for_device(getattr(config, "device", "cpu"))
     from trainer.ppo_trainer import PPOTrainer
