@@ -5,3 +5,11 @@ dependencies:
   - python=3.11
   - pip
   - osqp>=1.0,<2
+  - pip:
+      - jax==0.4.35
+      - numpy<2
+      - hydra-core
+      - matplotlib
+      - imageio-ffmpeg
+      - optax
+      - wandb

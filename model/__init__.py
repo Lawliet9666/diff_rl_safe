@@ -21,4 +21,18 @@ def get_jax_model_module(model_cfg):
     return import_module(module_name)
 
 
-__all__ = ["get_jax_model_module"]
+def make_action_fn(params, hparams, policy_action_mean_fn, policy_action_to_env_action_fn):
+    """Adapt deterministic inference to action_fn(observation) -> (action, info).
+
+    Action scaling and optional QP context stay in the existing model functions.
+    PPO training still uses get_action_and_value for probability/value terms.
+    """
+    def generate_action(observation, **kwargs):
+        policy_action = policy_action_mean_fn(params, hparams, observation, **kwargs)
+        action = policy_action_to_env_action_fn(params, policy_action)
+        return action, {"policy_action": policy_action}
+
+    return generate_action
+
+
+__all__ = ["get_jax_model_module", "make_action_fn"]
