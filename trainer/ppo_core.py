@@ -15,33 +15,6 @@ import jax.numpy as jnp
 from model.jax_actor_critic import actor_std as shared_actor_std
 
 
-LOG_KEYS = (
-    "policy_loss",
-    "value_loss",
-    "entropy_loss",
-    "total_loss",
-    "approx_kl",
-    "clipfrac",
-    "actor_grad_norm",
-    "critic_grad_norm",
-    "batch_finite",
-    "actor_loss_finite",
-    "actor_grads_finite",
-    "actor_step_finite",
-    "critic_loss_finite",
-    "critic_grads_finite",
-    "critic_step_finite",
-    "params_finite",
-    "opt_state_finite",
-    "update_is_finite",
-    "max_abs_policy_action",
-    "max_abs_logratio",
-    "max_ratio",
-    "std_min",
-    "std_max",
-)
-
-
 def normalize_ppo_impl(ppo_impl) -> str:
     value = str(ppo_impl or "brax").strip().lower()
     if value != "brax":
@@ -87,6 +60,38 @@ def compute_brax_gae(rewards, values, dones, next_values, gamma, lam):
     advantages = rewards + gamma * (1.0 - dones) * vs_t_plus_1 - values
     returns = advantages + values
     return jax.lax.stop_gradient(flat_time_batch(advantages)), jax.lax.stop_gradient(flat_time_batch(returns))
+
+
+def timeout_bootstrap_from_config(config):
+    """Keep historical behavior when loading configs without the new switch."""
+    legacy_default = config.env.get("backend", "jax") == "crax_mjx"
+    value = config.trainer.get("timeout_bootstrap", legacy_default)
+    if not isinstance(value, bool):
+        raise ValueError("trainer.timeout_bootstrap must be true or false")
+    return value
+
+
+def compute_timeout_gae(rewards, values, terminated, truncated, next_values, gamma, lam):
+    """Brax targets with final-observation bootstrap and separate episode ends."""
+    rewards, values, next_values = (jnp.asarray(value, jnp.float32)
+                                    for value in (rewards, values, next_values))
+    gamma, lam = jnp.asarray(gamma, jnp.float32), jnp.asarray(lam, jnp.float32)
+    terminated = jnp.asarray(terminated, jnp.float32)
+    ended = jnp.maximum(terminated, jnp.asarray(truncated, jnp.float32))
+    deltas = rewards + gamma * (1. - terminated) * next_values - values
+
+    def backward(acc, inputs):
+        delta, done = inputs
+        acc = delta + gamma * lam * (1. - done) * acc
+        return acc, acc
+
+    _, corrections = jax.lax.scan(backward, jnp.zeros_like(values[0]), (deltas, ended), reverse=True)
+    targets = values + corrections
+    shifted = jnp.concatenate([targets[1:], next_values[-1:]], axis=0)
+    next_targets = jnp.where(jnp.asarray(truncated, bool), next_values, shifted)
+    advantages = rewards + gamma * (1. - terminated) * next_targets - values
+    return (jax.lax.stop_gradient(flat_time_batch(advantages)),
+            jax.lax.stop_gradient(flat_time_batch(advantages + values)))
 
 
 def tree_all_finite(tree):
@@ -292,22 +297,11 @@ def brax_minibatch_update(
 
     # Match official Brax PPO hot-path semantics: apply the Optax update
     # directly, without per-minibatch finite tree scans or safe-update revert.
-    finite = jnp.asarray(True)
     metrics = {
         **metrics,
         "total_loss": objective,
         "actor_grad_norm": _tree_global_norm(grads["actor"]),
         "critic_grad_norm": _tree_global_norm(grads["critic"]),
-        "batch_finite": finite,
-        "actor_loss_finite": finite,
-        "actor_grads_finite": finite,
-        "actor_step_finite": finite,
-        "critic_loss_finite": finite,
-        "critic_grads_finite": finite,
-        "critic_step_finite": finite,
-        "params_finite": finite,
-        "opt_state_finite": finite,
-        "update_is_finite": finite,
     }
     return new_params, new_opt_state, metrics
 
@@ -345,41 +339,16 @@ def make_ppo_update_fn(
         minibatch_size = x.shape[0] // num_minibatches
         return jnp.reshape(x, (num_minibatches, minibatch_size) + x.shape[1:])
 
-    def _empty_epoch_metrics():
-        zeros = jnp.zeros((num_minibatches,), dtype=jnp.float32)
-        trues = jnp.ones((num_minibatches,), dtype=jnp.bool_)
-        metrics = {}
-        for key in LOG_KEYS:
-            if key.endswith("_finite") or key == "update_is_finite":
-                metrics[key] = trues
-            else:
-                metrics[key] = zeros
-        metrics["epoch_active"] = jnp.zeros((num_minibatches,), dtype=jnp.bool_)
-        metrics["kl_stop_epoch"] = jnp.zeros((num_minibatches,), dtype=jnp.bool_)
-        return metrics
-
     def _aggregate_metrics(metrics):
-        active = metrics["epoch_active"]
+        metrics = dict(metrics)
+        active = metrics.pop("epoch_active")
+        kl_stop = metrics.pop("kl_stop_epoch")
         flat_active = jnp.reshape(active, (-1,))
         active_count = jnp.maximum(jnp.sum(flat_active.astype(jnp.float32)), jnp.asarray(1.0, dtype=jnp.float32))
-        flat_update_finite = jnp.reshape(jnp.where(active, metrics["update_is_finite"], True), (-1,))
-        update_is_finite = jnp.all(flat_update_finite)
-        first_bad_flat = jnp.argmax(jnp.logical_not(flat_update_finite))
-        first_bad_flat = jnp.where(update_is_finite, jnp.asarray(-1, dtype=jnp.int32), first_bad_flat.astype(jnp.int32))
-        minibatch_count = metrics["update_is_finite"].shape[1]
-        first_bad_epoch = jnp.where(first_bad_flat < 0, jnp.asarray(-1, dtype=jnp.int32), first_bad_flat // minibatch_count)
-        first_bad_minibatch = jnp.where(first_bad_flat < 0, jnp.asarray(-1, dtype=jnp.int32), first_bad_flat % minibatch_count)
-
         summary = {}
-        for key in LOG_KEYS:
-            value = metrics[key]
-            if key.endswith("_finite") or key == "update_is_finite":
-                summary[key] = jnp.all(jnp.where(active, value, True))
-            else:
-                summary[key] = jnp.sum(jnp.where(active, value, jnp.asarray(0.0, dtype=value.dtype))) / active_count
-        summary["first_nonfinite_epoch"] = first_bad_epoch
-        summary["first_nonfinite_minibatch"] = first_bad_minibatch
-        summary["kl_early_stop"] = jnp.any(metrics["kl_stop_epoch"])
+        for key, value in metrics.items():
+            summary[key] = jnp.sum(jnp.where(active, value, jnp.asarray(0.0, dtype=value.dtype))) / active_count
+        summary["kl_early_stop"] = jnp.any(kl_stop)
         summary["epochs_completed"] = jnp.sum(jnp.any(active, axis=1).astype(jnp.float32))
         summary["target_kl"] = jnp.asarray(target_kl, dtype=jnp.float32)
         return summary
@@ -428,8 +397,12 @@ def make_ppo_update_fn(
             return (epoch_params, epoch_opt_state, epoch_rng, stopped | kl_stop), metrics
 
         def skip_epoch(carry):
-            epoch_params, epoch_opt_state, epoch_rng, stopped = carry
-            return (epoch_params, epoch_opt_state, epoch_rng, stopped), _empty_epoch_metrics()
+            # Infer the real metric structure without executing an optimizer step.
+            metric_shapes = jax.eval_shape(run_epoch, carry)[1]
+            metrics = jax.tree_util.tree_map(
+                lambda value: jnp.zeros(value.shape, value.dtype), metric_shapes
+            )
+            return carry, metrics
 
         def epoch_step(carry, _unused):
             stopped = carry[3]

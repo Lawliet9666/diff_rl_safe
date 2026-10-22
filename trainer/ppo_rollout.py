@@ -5,8 +5,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from env.jax_social_nav import fixed_order_policy_obs_from_state, reset_env, step_env
-from trainer.jax_ppo_core import flat_time_batch
+from trainer.ppo_core import flat_time_batch
 
 
 def _topk_mask(values, qp_obs):
@@ -124,7 +123,7 @@ def _select_done(done_bool, reset_value, next_value):
     return jnp.where(done_bool.reshape(shape), reset_value, next_value)
 
 
-def _maybe_reset_done_envs(env_cfg, next_state, reset_key, done_bool, batch_size, reset_fn=reset_env):
+def _maybe_reset_done_envs(env_cfg, next_state, reset_key, done_bool, batch_size, reset_fn):
     def reset_done(_unused):
         reset_state = reset_fn(env_cfg, reset_key, batch_size)
         return jax.tree_util.tree_map(
@@ -137,11 +136,6 @@ def _maybe_reset_done_envs(env_cfg, next_state, reset_key, done_bool, batch_size
         return next_state
 
     return jax.lax.cond(jnp.any(done_bool), reset_done, keep_next, operand=None)
-
-
-def init_gnn_obs_history(env_cfg, env_state, history_len):
-    frame = fixed_order_policy_obs_from_state(env_cfg, env_state)
-    return jnp.repeat(frame[:, None, :], int(history_len), axis=1)
 
 
 def _update_gnn_obs_history(history, next_frame, reset_mask):
@@ -157,8 +151,8 @@ def _update_ppo_episode_returns(running_returns, reward, done_bool):
     return next_returns.astype(jnp.float32), logged_returns.astype(jnp.float32)
 
 
-def make_rollout_collector(model_module, use_qp, *, step_fn=step_env, reset_fn=reset_env,
-                           observe_fn=fixed_order_policy_obs_from_state, timeout_aware=False):
+def make_rollout_collector(model_module, use_qp, *, step_fn, reset_fn,
+                           observe_fn, timeout_aware=False):
     """Create a model-specific collector; ``use_qp`` is static before JIT tracing."""
     use_qp = bool(use_qp)
 
@@ -280,11 +274,8 @@ def make_rollout_collector(model_module, use_qp, *, step_fn=step_env, reset_fn=r
                 truncated = metrics.get("truncated", metrics["timeout"])
                 terminated = metrics.get("terminated", jnp.where(truncated > 0.5, 0.0, done))
                 transition.update(terminated=terminated, truncated=truncated, next_values=final_value)
-            # Physics diagnostics do not depend on how value targets treat timeouts.
-            for name in ("tracking_speed_error", "tracking_omega_error", "tracking_lateral_speed",
-                         "actuator_saturation", "physical_contact", "cost"):
-                if name in metrics:
-                    transition["control/" + name] = metrics[name]
+            if "physical_contact" in metrics:
+                transition["control/physical_contact"] = metrics["physical_contact"]
             return (next_state, next_history, next_ppo_returns, key), transition
 
         (next_state, next_history, next_ppo_returns, next_rng), transitions = jax.lax.scan(

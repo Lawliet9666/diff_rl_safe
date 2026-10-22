@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 from pathlib import Path
 import random
 import json
 import shutil
 import time
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -16,26 +14,27 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 import wandb
 
-from env.jax_robot import normalize_robot_type
-from env.jax_social_nav import config_from_omegaconf, reset_env
+from model.jax_ppo_base import normalize_robot_type
+from env.jax_env.jax_social_nav import config_from_omegaconf
 from model import get_jax_model_module
-from trainer.jax_checkpoint import save_jax_checkpoint
-from trainer.jax_platform import (
+from utils import (
     format_jax_device_runtime_info,
     jax_device_runtime_info,
+    save_jax_checkpoint,
     validate_jax_backend_for_device,
 )
-from trainer.jax_ppo_core import (
-    LOG_KEYS,
+from trainer.ppo_core import (
     compute_brax_gae,
+    compute_timeout_gae,
+    timeout_bootstrap_from_config,
     init_ppo_opt_state,
     make_ppo_update_fn,
     normalize_ppo_impl,
     tree_all_finite,
 )
-from trainer.jax_ppo_eval import evaluate_jax_env
-from trainer.jax_ppo_rollout import init_gnn_obs_history, make_rollout_collector
-from trainer.jax_timeout import compute_timeout_gae, timeout_bootstrap_from_config
+from env import make_env
+from trainer.evaluation import evaluate_env
+from trainer.ppo_rollout import make_rollout_collector
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -53,21 +52,12 @@ def to_dict(cfg, name):
     return {str(key): item for key, item in value.items()}
 
 
-@dataclass
-class TrainingState:
-    """Small Brax-style state container for the active training loop."""
-
-    params: Any
-    opt_state: Any
-    rng: Any
-    env_state: Any
-    global_step: int
-
-
-class JaxTrainerBase:
-    """JAX-only trainer shell for config, W&B, and batch sizing."""
+class PPOTrainer:
+    """Shared PPO trainer with a selectable navigation environment."""
 
     def __init__(self, config: DictConfig):
+        self.model_module = get_jax_model_module(config.model)
+        self.timeout_bootstrap = timeout_bootstrap_from_config(config)
         self.config = config
         self.device = str(getattr(config, "device", "cpu"))
         if self.config.run_name is None or not str(self.config.run_name):
@@ -92,11 +82,12 @@ class JaxTrainerBase:
         self.rollout_batch_size = int(self.steps_per_env * self.num_envs)
         if self.rollout_batch_size % self.num_minibatches != 0:
             raise ValueError("ceil(timesteps_per_batch / num_envs) * num_envs must divide by trainer.num_minibatches")
-        self.minibatch_size = int(self.rollout_batch_size // self.num_minibatches)
 
         self.setup_env()
         self.setup_model_and_optimizer()
         self.setup_wandb()
+        self.total_updates = max(1, int(np.ceil(self.total_timesteps / max(self.timesteps_per_batch, 1))))
+        self.last_eval_timestep = 0
 
     def setup_wandb(self):
         self.run_name = self.build_run_name()
@@ -170,6 +161,16 @@ class JaxTrainerBase:
         if self.obs_dim != self.history_len * self.obs_frame_dim:
             raise ValueError("model.obs_dim must equal model.history_len * model.obs_frame_dim")
 
+        self.env = make_env(self.config)
+        self.rollout_collector = make_rollout_collector(
+            self.model_module,
+            use_qp=hasattr(self.model_module, "build_qp_context"),
+            step_fn=self.env.step_fn,
+            reset_fn=self.env.reset_fn,
+            observe_fn=self.env.observe_fn,
+            timeout_aware=self.timeout_bootstrap,
+        )
+
     def setup_model_and_optimizer(self):
         self.jax_backend = validate_jax_backend_for_device(jax, getattr(self.config, "device", "cpu"))
         self.jax_device_info = jax_device_runtime_info(jax)
@@ -200,15 +201,11 @@ class JaxTrainerBase:
             self.ppo_impl,
             max_grad_norm=float(self.config.trainer.max_grad_norm),
         )
-        self._set_train_state(
-            TrainingState(
-                params=params,
-                opt_state=opt_state,
-                rng=rng,
-                env_state=None,
-                global_step=0,
-            )
-        )
+        self.params = params
+        self.opt_state = opt_state
+        self.rng = rng
+        self.env_state = None
+        self.global_step = 0
         self.current_lr = float(self.config.trainer.lr)
         self.jax_env_cfg = config_from_omegaconf(self.config)
         self.jitted_train_step = self._make_jitted_train_step()
@@ -285,8 +282,8 @@ class JaxTrainerBase:
                     gamma=gamma,
                     lam=lam,
                 )
-            update_batch = JaxPPOBaseTrainer._update_batch(batch, advantages, returns)
-            pre_summary = JaxPPOBaseTrainer._pre_update_summary(
+            update_batch = PPOTrainer._update_batch(batch, advantages, returns)
+            pre_summary = PPOTrainer._pre_update_summary(
                 batch,
                 advantages,
                 returns,
@@ -305,7 +302,7 @@ class JaxTrainerBase:
                 vf_coef,
                 value_clip,
             )
-            post_summary = JaxPPOBaseTrainer._post_update_summary(
+            post_summary = PPOTrainer._post_update_summary(
                 metrics,
                 new_params,
                 new_opt_state,
@@ -322,12 +319,6 @@ class JaxTrainerBase:
             )
 
         return jax.jit(train_step, donate_argnums=(0, 1, 2, 3))
-
-    def _set_train_state(self, train_state):
-        self.train_state = train_state
-
-    def _replace_train_state(self, **updates):
-        self._set_train_state(replace(self.train_state, **updates))
 
     @staticmethod
     def _normalize_lr_schedule(schedule):
@@ -445,12 +436,12 @@ class JaxTrainerBase:
             "robot_omega_delta_penalty_mean": batch["robot_omega_delta_penalty_mean"],
             **{key: batch[key] for key in diagnostic_keys},
             **{key: value for key, value in batch.items() if key.startswith("control/")},
-            "rollout_batch_finite": JaxPPOBaseTrainer._finite_if_enabled(run_finite_check, batch),
-            "gae_finite": JaxPPOBaseTrainer._finite_if_enabled(
+            "rollout_batch_finite": PPOTrainer._finite_if_enabled(run_finite_check, batch),
+            "gae_finite": PPOTrainer._finite_if_enabled(
                 run_finite_check,
                 {"advantages": advantages, "returns": returns},
             ),
-            "update_batch_finite": JaxPPOBaseTrainer._finite_if_enabled(run_finite_check, update_batch),
+            "update_batch_finite": PPOTrainer._finite_if_enabled(run_finite_check, update_batch),
         }
 
     @staticmethod
@@ -473,103 +464,67 @@ class JaxTrainerBase:
         metrics.update({key: float(value) for key, value in summary.items() if key.startswith("control/")})
         if "qp_slack_sum" in summary:
             metrics.update({
-                "qp_slack_mean": JaxPPOBaseTrainer._summary_mean(summary, "qp_slack"),
-                "qp_slack_max": JaxPPOBaseTrainer._summary_value(summary, "qp_slack_max"),
-                "qp_correction_mean": JaxPPOBaseTrainer._summary_mean(summary, "qp_correction"),
-                "r_safe_mean": JaxPPOBaseTrainer._summary_mean(summary, "r_safe"),
+                "qp_slack_mean": PPOTrainer._summary_mean(summary, "qp_slack"),
+                "qp_slack_max": PPOTrainer._summary_value(summary, "qp_slack_max"),
+                "qp_correction_mean": PPOTrainer._summary_mean(summary, "qp_correction"),
+                "r_safe_mean": PPOTrainer._summary_mean(summary, "r_safe"),
             })
         if "beta_active_std" in summary:
             metrics.update({
-                "beta_active_min": JaxPPOBaseTrainer._summary_value(summary, "beta_active_min"),
-                "beta_active_max": JaxPPOBaseTrainer._summary_value(summary, "beta_active_max"),
-                "beta_active_std": JaxPPOBaseTrainer._summary_value(summary, "beta_active_std"),
-                "beta_budget_error_max": JaxPPOBaseTrainer._summary_value(
+                "beta_active_min": PPOTrainer._summary_value(summary, "beta_active_min"),
+                "beta_active_max": PPOTrainer._summary_value(summary, "beta_active_max"),
+                "beta_active_std": PPOTrainer._summary_value(summary, "beta_active_std"),
+                "beta_budget_error_max": PPOTrainer._summary_value(
                     summary, "beta_budget_error_max"
                 ),
             })
         if "alpha_active_std" in summary:
             metrics.update({
-                "alpha_active_min": JaxPPOBaseTrainer._summary_value(
+                "alpha_active_min": PPOTrainer._summary_value(
                     summary, "alpha_active_min"
                 ),
-                "alpha_active_max": JaxPPOBaseTrainer._summary_value(
+                "alpha_active_max": PPOTrainer._summary_value(
                     summary, "alpha_active_max"
                 ),
-                "alpha_active_std": JaxPPOBaseTrainer._summary_value(
+                "alpha_active_std": PPOTrainer._summary_value(
                     summary, "alpha_active_std"
                 ),
             })
         if "nominal_cbf_residual_sum" in summary:
             metrics.update({
-                "nominal_cbf_residual_mean": JaxPPOBaseTrainer._summary_mean(summary, "nominal_cbf_residual"),
-                "nominal_cbf_residual_max": JaxPPOBaseTrainer._summary_value(summary, "nominal_cbf_residual_max"),
-                "safe_cbf_residual_mean": JaxPPOBaseTrainer._summary_mean(summary, "safe_cbf_residual"),
-                "safe_cbf_residual_max": JaxPPOBaseTrainer._summary_value(summary, "safe_cbf_residual_max"),
+                "nominal_cbf_residual_mean": PPOTrainer._summary_mean(summary, "nominal_cbf_residual"),
+                "nominal_cbf_residual_max": PPOTrainer._summary_value(summary, "nominal_cbf_residual_max"),
+                "safe_cbf_residual_mean": PPOTrainer._summary_mean(summary, "safe_cbf_residual"),
+                "safe_cbf_residual_max": PPOTrainer._summary_value(summary, "safe_cbf_residual_max"),
             })
         return metrics
-
-    @staticmethod
-    def _empty_logs():
-        return {key: [] for key in LOG_KEYS}
 
     @staticmethod
     def _post_update_summary(metrics, params, opt_state, run_finite_check=True):
         return {
             "metrics": metrics,
-            "params_finite_after_update": JaxPPOBaseTrainer._finite_if_enabled(run_finite_check, params),
-            "opt_state_finite_after_update": JaxPPOBaseTrainer._finite_if_enabled(run_finite_check, opt_state),
+            "params_finite_after_update": PPOTrainer._finite_if_enabled(run_finite_check, params),
+            "opt_state_finite_after_update": PPOTrainer._finite_if_enabled(run_finite_check, opt_state),
         }
 
-    @staticmethod
-    def _nonfinite_update_details_from_summary(metrics, post_summary):
-        finite_keys = (
-            "batch_finite",
-            "actor_loss_finite",
-            "actor_grads_finite",
-            "actor_step_finite",
-            "critic_loss_finite",
-            "critic_grads_finite",
-            "critic_step_finite",
-            "params_finite",
-            "opt_state_finite",
-            "update_is_finite",
-        )
-        details = {key: bool(metrics[key]) for key in finite_keys if key in metrics}
-        details["params_finite_after_update"] = bool(post_summary["params_finite_after_update"])
-        details["opt_state_finite_after_update"] = bool(post_summary["opt_state_finite_after_update"])
-        return details
-
-    @staticmethod
-    def _append_host_logs(logs, summary):
-        for key in LOG_KEYS:
-            logs[key].append(float(summary[key]))
-        return summary
-
-    @staticmethod
-    def _mean_log(logs, key):
-        values = logs.get(key, [])
-        return float(np.mean(values)) if values else float("nan")
-
-    def _extra_log_metrics(self, eval_metrics):
-        return {}
-
-    def _log_update(self, global_step, update, logs, eval_metrics, train_metrics, sps):
+    def _log_update(self, global_step, update, ppo_metrics, eval_metrics, train_metrics, sps):
         wandb_interval = int(self.config.wandb_interval)
         if wandb_interval <= 0:
             raise ValueError("wandb_interval must be > 0")
         periodic_log = update % wandb_interval == 0
+        ppo_metrics = {key: float(value) for key, value in ppo_metrics.items()}
         log_dict = {
             "global_step": global_step,
             "charts/learning_rate": self.current_lr,
             "charts/ent_coef": float(self.config.trainer.ent_coef),
             "charts/sps": int(sps),
-            "loss/policy": self._mean_log(logs, "policy_loss"),
-            "loss/value": self._mean_log(logs, "value_loss"),
-            "loss/entropy": self._mean_log(logs, "entropy_loss"),
-            "loss/total": self._mean_log(logs, "total_loss"),
-            "diagnostics/approx_kl": self._mean_log(logs, "approx_kl"),
-            "diagnostics/clipfrac": self._mean_log(logs, "clipfrac"),
-            "diagnostics/max_abs_logratio": self._mean_log(logs, "max_abs_logratio"),
+            "loss/policy": ppo_metrics["policy_loss"],
+            "loss/value": ppo_metrics["value_loss"],
+            "loss/entropy": ppo_metrics["entropy_loss"],
+            "loss/total": ppo_metrics["total_loss"],
+            "diagnostics/approx_kl": ppo_metrics["approx_kl"],
+            "diagnostics/clipfrac": ppo_metrics["clipfrac"],
+            "diagnostics/max_abs_logratio": ppo_metrics["max_abs_logratio"],
             "safety/min_clearance": train_metrics["min_clearance"],
             "diagnostics/boundary_violation_mean": train_metrics["boundary_violation_mean"],
             "diagnostics/boundary_violation_max": train_metrics["boundary_violation_max"],
@@ -585,11 +540,11 @@ class JaxTrainerBase:
             })
         if periodic_log:
             log_dict.update({
-                "diagnostics/max_abs_policy_action": self._mean_log(logs, "max_abs_policy_action"),
-                "diagnostics/std_min": self._mean_log(logs, "std_min"),
-                "diagnostics/std_max": self._mean_log(logs, "std_max"),
-                "diagnostics/actor_grad_norm": self._mean_log(logs, "actor_grad_norm"),
-                "diagnostics/critic_grad_norm": self._mean_log(logs, "critic_grad_norm"),
+                "diagnostics/max_abs_policy_action": ppo_metrics["max_abs_policy_action"],
+                "diagnostics/std_min": ppo_metrics["std_min"],
+                "diagnostics/std_max": ppo_metrics["std_max"],
+                "diagnostics/actor_grad_norm": ppo_metrics["actor_grad_norm"],
+                "diagnostics/critic_grad_norm": ppo_metrics["critic_grad_norm"],
             })
             if "beta_active_std" in train_metrics:
                 log_dict.update({
@@ -623,10 +578,10 @@ class JaxTrainerBase:
                 "diagnostics/safe_cbf_residual_mean": train_metrics["safe_cbf_residual_mean"],
                 "diagnostics/safe_cbf_residual_max": train_metrics["safe_cbf_residual_max"],
             })
-        if self._mean_log(logs, "kl_early_stop") > 0.5:
+        if ppo_metrics["kl_early_stop"] > 0.5:
             log_dict.update({
                 "diagnostics/kl_early_stop": 1.0,
-                "diagnostics/epochs_completed": self._mean_log(logs, "epochs_completed"),
+                "diagnostics/epochs_completed": ppo_metrics["epochs_completed"],
             })
         completed = int(train_metrics["completed_count"])
         if completed > 0:
@@ -644,9 +599,10 @@ class JaxTrainerBase:
             log_dict["charts/eval_timeout_rate"] = eval_metrics["timeout_rate"]
             log_dict["charts/eval_min_clearance"] = eval_metrics["mean_min_clearance"]
             log_dict["charts/eval_episode_length"] = eval_metrics["mean_episode_length"]
+            if "physical_contact_rate" in eval_metrics:
+                log_dict["eval/physical_contact_rate"] = eval_metrics["physical_contact_rate"]
 
         log_dict.update({key: value for key, value in train_metrics.items() if key.startswith("control/")})
-        log_dict.update(self._extra_log_metrics(eval_metrics))
         wandb_log = {key: value for key, value in log_dict.items() if not key.startswith("train/")}
         if completed > 0 and periodic_log:
             wandb_log.update({key: value for key, value in log_dict.items() if key.startswith("train/")})
@@ -659,21 +615,9 @@ class JaxTrainerBase:
 
     def eval(self, episodes=None):
         episodes = int(self.config.trainer.eval_episodes if episodes is None else episodes)
-        return evaluate_jax_env(
-            self.train_state.params,
-            self.jax_hparams,
-            self.jax_env_cfg,
-            episodes=episodes,
-            policy_action_mean_fn=self.model_module.policy_action_mean,
-            policy_action_to_env_action_fn=self.model_module.policy_action_to_env_action,
-        )
-
-    @staticmethod
-    def _nonfinite_update_message(update, global_step, epoch, minibatch_start, details):
-        return (
-            "non-finite PPO minibatch update detected "
-            f"at update={update}, global_step={global_step}, epoch={epoch}, "
-            f"minibatch_start={minibatch_start}, finite={details}"
+        return evaluate_env(
+            self.env, self.params, self.jax_hparams,
+            self.jax_env_cfg, self.model_module, episodes=episodes,
         )
 
     def _assert_finite_eval_metrics(self, eval_metrics, update, global_step):
@@ -687,25 +631,24 @@ class JaxTrainerBase:
 
     def _reset_training_env(self):
         reset_key = self._next_rng_key()
-        env_state = reset_env(self.jax_env_cfg, reset_key, self.num_envs)
-        env_history = init_gnn_obs_history(self.jax_env_cfg, env_state, self.history_len)
-        ppo_episode_returns = jnp.zeros((self.num_envs,), dtype=jnp.float32)
-        return env_state, env_history, ppo_episode_returns
+        state = self.env.reset_fn(self.jax_env_cfg, reset_key, self.num_envs)
+        frame = self.env.observe_fn(self.jax_env_cfg, state)
+        history = jnp.repeat(frame[:, None, :], self.history_len, axis=1)
+        return state, history, jnp.zeros((self.num_envs,), dtype=jnp.float32)
 
     def train(self):
         env_state = self._reset_training_env()
-        self._replace_train_state(env_state=env_state, global_step=0)
+        self.env_state = env_state
+        self.global_step = 0
         start_time = time.time()
-        global_step = int(self.train_state.global_step)
+        global_step = int(self.global_step)
         update = 0
 
         try:
             while global_step < self.total_timesteps:
                 update += 1
-                state = self.train_state
-                expected_global_step = int(state.global_step) + int(self.rollout_batch_size)
+                expected_global_step = int(self.global_step) + int(self.rollout_batch_size)
                 self.current_lr = self._lr_for_update(expected_global_step)
-                logs = self._empty_logs()
                 (
                     new_params,
                     new_opt_state,
@@ -715,11 +658,11 @@ class JaxTrainerBase:
                     pre_summary,
                     post_summary,
                 ) = self.jitted_train_step(
-                    state.params,
-                    state.opt_state,
-                    state.env_state,
-                    state.rng,
-                    jnp.asarray(state.global_step, dtype=jnp.int32),
+                    self.params,
+                    self.opt_state,
+                    self.env_state,
+                    self.rng,
+                    jnp.asarray(self.global_step, dtype=jnp.int32),
                     jnp.asarray(self.current_lr, dtype=jnp.float32),
                     jnp.asarray(float(self.config.trainer.clip), dtype=jnp.float32),
                     jnp.asarray(float(self.config.trainer.ent_coef), dtype=jnp.float32),
@@ -745,20 +688,11 @@ class JaxTrainerBase:
                 if run_finite_check and not bool(pre_summary["update_batch_finite"]):
                     raise RuntimeError(f"non-finite JAX value detected in PPO update batch at update={update}, global_step={global_step}")
                 metric_values = post_summary["metrics"]
-                if run_finite_check and (
-                    not bool(metric_values["update_is_finite"])
-                    or not bool(post_summary["params_finite_after_update"])
-                    or not bool(post_summary["opt_state_finite_after_update"])
-                ):
-                    details = self._nonfinite_update_details_from_summary(metric_values, post_summary)
-                    bad_epoch = int(metric_values.get("first_nonfinite_epoch", -1))
-                    bad_minibatch = int(metric_values.get("first_nonfinite_minibatch", -1))
-                    bad_start = bad_minibatch * int(self.minibatch_size) if bad_minibatch >= 0 else -1
-                    raise RuntimeError(self._nonfinite_update_message(update, global_step, bad_epoch, bad_start, details))
+                if run_finite_check and not bool(post_summary["params_finite_after_update"]):
+                    raise RuntimeError(f"non-finite PPO parameters detected at update={update}, global_step={global_step}")
+                if run_finite_check and not bool(post_summary["opt_state_finite_after_update"]):
+                    raise RuntimeError(f"non-finite PPO optimizer state detected at update={update}, global_step={global_step}")
 
-                metric_values = self._append_host_logs(logs, metric_values)
-                for extra_key in ("target_kl", "kl_early_stop", "epochs_completed"):
-                    logs.setdefault(extra_key, []).append(float(metric_values[extra_key]))
                 approx_kl = metric_values.get("approx_kl", float("nan"))
                 if not np.isfinite(approx_kl):
                     raise FloatingPointError(
@@ -766,14 +700,18 @@ class JaxTrainerBase:
                     )
 
                 lr_used = float(self.current_lr)
-                self._replace_train_state(params=new_params, opt_state=new_opt_state, rng=new_rng, env_state=env_state, global_step=global_step)
+                self.params = new_params
+                self.opt_state = new_opt_state
+                self.rng = new_rng
+                self.env_state = env_state
+                self.global_step = global_step
 
                 if self._should_eval(update, global_step):
                     eval_metrics = self.eval()
                     self._assert_finite_eval_metrics(eval_metrics, update, global_step)
                     save_jax_checkpoint(
                         self.save_dir,
-                        self.train_state.params,
+                        self.params,
                         step=global_step,
                         performance=eval_metrics["mean_return"],
                         max_keep=int(self.config.trainer.max_checkpoints),
@@ -783,7 +721,7 @@ class JaxTrainerBase:
 
                 sps = int(global_step / max(time.time() - start_time, 1e-6))
                 self.current_lr = lr_used
-                self._log_update(global_step, update, logs, eval_metrics, train_metrics, sps)
+                self._log_update(global_step, update, metric_values, eval_metrics, train_metrics, sps)
                 self._update_adaptive_kl_lr(approx_kl)
                 eval_return = eval_metrics["mean_return"] if eval_metrics is not None else float("nan")
                 eval_success = eval_metrics["success_rate"] if eval_metrics is not None else float("nan")
@@ -797,21 +735,5 @@ class JaxTrainerBase:
                 wandb.finish()
 
     def _next_rng_key(self):
-        rng, key = jax.random.split(self.train_state.rng)
-        self._replace_train_state(rng=rng)
+        self.rng, key = jax.random.split(self.rng)
         return key
-
-class JaxPPOBaseTrainer(JaxTrainerBase):
-    """JAX trainer entrypoint for supported PPO-style robot dynamics."""
-
-    def __init__(self, config):
-        self.model_module = get_jax_model_module(config.model)
-        self.timeout_bootstrap = timeout_bootstrap_from_config(config)
-        self.rollout_collector = make_rollout_collector(
-            self.model_module,
-            use_qp=hasattr(self.model_module, "build_qp_context"),
-            timeout_aware=self.timeout_bootstrap,
-        )
-        super().__init__(config)
-        self.total_updates = max(1, int(np.ceil(self.total_timesteps / max(self.timesteps_per_batch, 1))))
-        self.last_eval_timestep = 0
