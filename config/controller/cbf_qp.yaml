@@ -11,16 +11,15 @@ solver:
 unicycle:
   lookahead: 0.2
   alpha: 2.0
-  weights: [1.0, 1.0]
+  weights: [1.0, 1.0]  # World velocity x/y of the lookahead point.
   position_gain: 1.0
-  heading_gain: 2.0
   stop_distance: 0.1
 
 quadrotor:
   gains: [1.5, 1.5, 1.5]
   thrust_gain: 4.0
   tilt_gain: 4.0
-  weights: [1.0, 1.0, 1.0, 1.0]
+  weights: [1.0, 1.0, 1.0, 1.0e-6]  # World jerk x/y/z, then yaw-rate tie-breaker.
   position_gain: 1.0
   velocity_gain: 1.8
   attitude_gain: 4.0
