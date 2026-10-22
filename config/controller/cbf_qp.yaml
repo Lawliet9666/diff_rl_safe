@@ -1,0 +1,28 @@
+type: cbf_qp
+
+solver:
+  eps_abs: 1.0e-9
+  eps_rel: 1.0e-9
+  max_iter: 10000
+  feasibility_tolerance: 1.0e-6
+  polishing: false
+  verbose: false
+
+unicycle:
+  lookahead: 0.2
+  alpha: 2.0
+  weights: [1.0, 1.0]
+  position_gain: 1.0
+  heading_gain: 2.0
+  stop_distance: 0.1
+
+quadrotor:
+  gains: [1.5, 1.5, 1.5]
+  thrust_gain: 4.0
+  tilt_gain: 4.0
+  weights: [1.0, 1.0, 1.0, 1.0]
+  position_gain: 1.0
+  velocity_gain: 1.8
+  attitude_gain: 4.0
+  thrust_tracking_gain: 4.0
+  acceleration_limits: [2.0, 2.0, 2.0]

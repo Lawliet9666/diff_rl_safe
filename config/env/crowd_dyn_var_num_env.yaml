@@ -5,12 +5,6 @@ workspace:
   x: [-6.0, 6.0]
   y: [-6.0, 6.0]
 
-robot_delay:
-  enabled: false
-  omega_delay_min_steps: 2
-  omega_delay_max_steps: 3
-  omega_lag_tau: 0.2
-
 scenario: crowd_dyn_var_num_env
 max_steps: 400
 safety_margin: 0.05
@@ -29,7 +23,7 @@ humans:
   radius: 0.4
   max_tries: 100
   human_policy: social_force
-  use_gmm: true
+  use_gmm: false
   gmm:
     weights: [0.6, 0.2, 0.2]
     stds: [0.1, 0.2, 0.2]

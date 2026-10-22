@@ -55,8 +55,12 @@ validation](docs/CONTROLLERS.md).
 
 ```bash
 micromamba run -n diffrl python scripts/run_controller.py \
-  robot=quadrotor scenario=crossing video=true
+  robot=quadrotor --visualize
 ```
+
+Optional diagnostics select `simulation.scenario` (`empty`, `static`, `crossing`)
+and require explicit `simulation` settings; normal runs use the selected environment
+and its original reset. Omit `--visualize` to skip video recording.
 
 ## Train and compare methods
 
@@ -214,9 +218,9 @@ Use the isolated `diffrl_crax` environment for compiled, batched MuJoCo physics:
 
 ```bash
 RUN_NAME=crax_point_bnet WANDB_MODE=online micromamba run -n diffrl_crax \
-  bash scripts/run_ppo.sh env=crax_point_crowd robot=point model=barriernet_gnn device=cuda
+  bash scripts/run_ppo.sh env=crax_social_nav robot=point model=barriernet_gnn device=cuda
 ```
 
 All six methods are selectable in both the original JAX baseline and CRAX Point.
-`robot=point` requires `env=crax_point_crowd`. Installation, evaluation/video
+`robot=point` requires `env=crax_social_nav`. Installation, evaluation/video
 commands and synchronized benchmarking are documented in [docs/CRAX.md](docs/CRAX.md).

@@ -1,0 +1,24 @@
+type: quadrotor
+mass: 1.0
+gravity: 9.81
+radius: 0.3
+omega_max: 2.0
+thrust_rate_max: 20.0
+thrust_min: 2.0
+thrust_max: 20.0
+tilt_max: 0.7853981633974483  # radians (45 degrees)
+altitude: 1.2
+altitude_min: 0.8
+altitude_max: 1.6
+max_integration_dt: 0.005
+
+# Navigation metadata used only by the shared crowd adapter.
+# These fields do not impose a quadrotor velocity constraint or invoke RL.
+v_max: 1.5
+goal_tolerance: 0.6
+goal_min_distance: 6.0
+
+reward:
+  potential_factor: 3.0
+  back_factor: 0.1
+  spin_factor: 4.5

@@ -1,0 +1,15 @@
+defaults:
+  - base
+  - robot: unicycle
+  - env: crowd_dyn_var_num_env
+  - controller: cbf_qp
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: outputs/controllers/${robot.type}_${env.scenario}_seed${seed}/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: outputs/controllers/multirun/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}
