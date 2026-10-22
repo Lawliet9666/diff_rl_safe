@@ -64,8 +64,8 @@ def save_video(path, frames, fps=30):
 def _build_controller_config(config):
     from controller.cbf_qp import SolverConfig, UnicycleConfig, QuadrotorConfig
 
-    if config.controller.type != "cbf_qp":
-        raise ValueError("controller-only runner requires controller=cbf_qp")
+    from controller import make_controller
+    make_controller(config)  # Validate controller selection and its own parameters.
     r, c, e = config.robot, config.controller, config.env
     if r.type not in {"unicycle", "quadrotor"} or r.get("simulator_model"):
         raise ValueError("controller robot must be unicycle or quadrotor")
@@ -151,7 +151,8 @@ def _run_controller_episode(config):
     """Return episode data and its existing renderer/controller configurations."""
     import jax
     import jax.numpy as jnp
-    from controller.cbf_qp import generate_action, control_residual
+    from controller import make_controller
+    from controller.cbf_qp import control_residual
     from env.jax_env.jax_social_nav import compute_distances
     from controller.env_adapter import NavigationEnv
 
@@ -163,6 +164,7 @@ def _run_controller_episode(config):
     state, crowd = navigation_state
     goal = env.observe(navigation_state).goal
     robot_model = env.robot
+    generate_action = make_controller(config)
 
     def action_fn(observation):
         return generate_action(robot_model, observation.robot, observation.goal,
@@ -171,7 +173,8 @@ def _run_controller_episode(config):
     action_fn(env.observe(navigation_state))[0].block_until_ready()
     history = {k: [] for k in ["time", "state", "centers", "status", "active_obstacles",
         "nominal", "action", "requested_action", "min_residual", "initial_safe", "kkt_residual", "solve_ms",
-        "qp_valid", "fallback", "solver_status"]}
+        "qp_valid", "fallback", "solver_status", "slack", "cbf_satisfied",
+        "min_cbf_residual", "min_relaxed_cbf_residual", "min_input_residual"]}
     status, reason = "timeout", "environment step limit"
     worst_clearance, min_residual = float("inf"), float("inf")
     violations, failures, path_length = 0, 0, 0.
@@ -206,8 +209,9 @@ def _run_controller_episode(config):
             failures += 1
             qp_status, qp_reason, failure = _controller_failure_diagnostics(state, nominal, obs, result)
             failure["step"] = k
-            if qp_status != "infeasible":
-                status, reason = qp_status, qp_reason
+            if qp_status != "infeasible" or config.controller.type == "cbf_qp_slack":
+                status = "controller_failure" if config.controller.type == "cbf_qp_slack" else qp_status
+                reason = qp_reason
                 break
             infeasible_steps += 1
             action = previous_action
@@ -225,14 +229,20 @@ def _run_controller_episode(config):
         applied_residual = np.asarray(control_residual(robot_model, previous, executed, obs, rcfg))
         residual = float(np.min(applied_residual))
         min_residual = min(min_residual, residual)
-        history["active_obstacles"][-1] = (np.abs(applied_residual[:cfg.num_humans])
+        slack = np.asarray(diagnostics["slack"])
+        cbf_residual = applied_residual[:cfg.num_humans]
+        cbf_satisfied = bool(np.all(cbf_residual >= -rcfg.solver.feasibility_tolerance))
+        history["active_obstacles"][-1] = (np.abs(cbf_residual+slack)
             <= rcfg.solver.feasibility_tolerance) & (np.asarray(obs.mask) > .5)
         path_length += float(np.linalg.norm(np.asarray(state[:2])-np.asarray(previous[:2])))
         for name, value in dict(nominal=nominal, action=executed, requested_action=requested,
                 min_residual=residual, initial_safe=bool(result.initial_safe),
                 kkt_residual=result.kkt_residual,
                 solve_ms=solve_ms, qp_valid=bool(result.valid), fallback=used_fallback,
-                solver_status=result.solver_status).items():
+                solver_status=result.solver_status, slack=slack, cbf_satisfied=cbf_satisfied,
+                min_cbf_residual=float(np.min(cbf_residual)),
+                min_relaxed_cbf_residual=float(np.min(cbf_residual+slack)),
+                min_input_residual=float(np.min(applied_residual[cfg.num_humans:]))).items():
             history[name].append(np.asarray(value).copy())
         record_frame("running")
         if bool(metrics["collision"][0]):
@@ -251,6 +261,7 @@ def _run_controller_episode(config):
     for name in ["nominal", "action", "requested_action"]:
         history[name] = history[name].reshape((-1, width))
     history["kkt_residual"] = history["kkt_residual"].reshape((-1, 3))
+    history["slack"] = history["slack"].reshape((-1, cfg.num_humans))
     finite = lambda value: float(value) if np.isfinite(value) else None
     dist, _ = compute_distances(cfg, crowd)
     integration_dt = env.integration_dt
@@ -266,6 +277,16 @@ def _run_controller_episode(config):
         clearance_sampling="environment_step",
         config={**asdict(rcfg), "workspace": tuple(float(v) for v in
             [*config.env.workspace.x, *config.env.workspace.y])})
+    summary.update(
+        controller=str(config.controller.type),
+        slack_weight=config.controller.get("slack_weight"),
+        slack_steps=int(np.count_nonzero(np.any(
+            history["slack"] > rcfg.solver.feasibility_tolerance, axis=1))),
+        slack_sum=finite(np.sum(history["slack"])),
+        max_slack=finite(np.max(history["slack"])) if history["slack"].size else 0.,
+        cbf_violation_steps=int(np.count_nonzero(~history["cbf_satisfied"].astype(bool))),
+        **{name: finite(np.min(history[name])) if history[name].size else None for name in
+           ("min_cbf_residual", "min_relaxed_cbf_residual", "min_input_residual")})
     return (summary, history, np.asarray(goal), crowd), cfg, rcfg
 
 
@@ -335,10 +356,16 @@ def evaluate_controller(config, output, *, visualize=False, seeds=None, episodes
     OmegaConf.save(config, output/"config.yaml", resolve=True)
     controller = str(config.controller.type)
     results = []
+    episode_path = output/"episodes.jsonl"
+    episode_path.write_text("")
     for index, seed in enumerate(seed_values):
         episode_config = OmegaConf.merge(config, {"seed": int(seed)})
         (result, history, goal, crowd), cfg, rcfg = _run_controller_episode(episode_config)
         results.append(result)
+        with episode_path.open("a") as episode_log:
+            episode_log.write(json.dumps(result, allow_nan=False)+"\n")
+        if (index+1) % 10 == 0:
+            print(f"{controller}: completed {index+1}/{len(seed_values)} episodes", flush=True)
         if visualize:
             video_dir = output/f"visualize_{controller}"
             video_dir.mkdir(parents=True, exist_ok=True)
@@ -366,6 +393,17 @@ def evaluate_controller(config, output, *, visualize=False, seeds=None, episodes
         np.asarray([r["steps"] for r in results]),
         np.asarray([np.nan if r["min_clearance"] is None else r["min_clearance"] for r in results]),
         float(config.env.dt)))
+    steps = sum(r["steps"] for r in results)
+    metrics.update(
+        slack_steps=sum(r["slack_steps"] for r in results),
+        cbf_violation_steps=sum(r["cbf_violation_steps"] for r in results),
+        mean_slack=sum(r["slack_sum"] for r in results)/steps if steps else None,
+        max_slack=max(r["max_slack"] for r in results))
+    for name in ("min_cbf_residual", "min_relaxed_cbf_residual", "min_input_residual"):
+        values = [r[name] for r in results if r[name] is not None]
+        metrics[name] = min(values) if values else None
+    metrics["slack_step_rate"] = metrics["slack_steps"]/steps if steps else None
+    metrics["cbf_violation_rate"] = metrics["cbf_violation_steps"]/steps if steps else None
     aggregate = {"num_controllers": 1}
     if len(results) > 1:
         aggregate["num_episodes"] = len(results)

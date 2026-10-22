@@ -96,29 +96,19 @@ class QuadrotorConfig:
 class ControlResult(NamedTuple):
     action: jax.Array          # NaN when the candidate is invalid; never executed.
     candidate: jax.Array
-    residual: jax.Array        # Original, unscaled A @ candidate + b.
+    residual: jax.Array        # Original CBF/input residuals, without relaxation.
     kkt_residual: jax.Array    # Scaled primal, dual and complementarity residuals.
-    valid: bool
+    valid: bool               # Solved QP satisfies its own constraints and KKT checks.
     initial_safe: bool         # All h/psi initial conditions hold.
     correction_norm: float
     solver_status: str
     iterations: int
 
 
-def solve_qp(nominal, constraints, low, high, weights, tolerance=None, *,
-             solver=SolverConfig(), output_matrix=None):
-    """Solve the existing normalized hard QP on the CPU using OSQP.
-
-    This host function is neither JIT-compatible nor differentiable. JIT the
-    robot's CBF matrix calculation separately. With output_matrix=M, minimize
-    0.5*||M@(u-nominal)||_W^2. Without M, preserve normalized input tracking.
-    No slack or post-solve clipping is introduced. Numerical checks do not
-    certify continuous-time safety.
-    """
+def _tracking_qp_data(nominal, constraints, low, high, weights, output_matrix):
+    """Validate physical data and build the scaled nominal-tracking objective."""
     if not jax.config.x64_enabled:
         raise ValueError("CBF-QP requires JAX_ENABLE_X64=true before importing JAX")
-    if tolerance is None:
-        tolerance = solver.feasibility_tolerance
     nominal, low, high, weights = [np.asarray(x, dtype=np.float64)
                                    for x in (nominal, low, high, weights)]
     if nominal.ndim != 1:
@@ -137,11 +127,14 @@ def solve_qp(nominal, constraints, low, high, weights, tolerance=None, *,
     if (not all(np.isfinite(x).all() for x in (nominal, low, high, weights, M, cbf_A, cbf_b))
             or np.any(weights <= 0) or np.any(low > high)):
         raise ValueError("QP data must be finite, with positive weights and ordered bounds")
-    A = np.concatenate([cbf_A, np.eye(d), -np.eye(d)])
-    b = np.concatenate([cbf_b, -low, high])
-    # Normalize only the decision coordinates, preserving the output objective.
     MS = M*scale[None, :]
     P = MS.T @ (weights[:, None]*MS)
+    return nominal, low, high, cbf_A, cbf_b, P, scale
+
+
+def _solve_qp_data(nominal, A, b, P, scale, domain, solver, tolerance):
+    """Solve and independently check a scaled QP; all physical rows use A z+b>=0."""
+    d = nominal.size
     try:
         np.linalg.cholesky(P)
     except np.linalg.LinAlgError as error:
@@ -172,12 +165,29 @@ def solve_qp(nominal, constraints, low, high, weights, tolerance=None, *,
     valid = bool(status == "solved" and np.isfinite(candidate).all()
                  and np.all(residual >= -tolerance)
                  and np.isfinite(kkt).all() and np.all(kkt <= tolerance))
-    domain = np.asarray(constraints.domain)
+    domain = np.asarray(domain)
     initial_safe = bool(np.isfinite(domain).all() and np.all(domain >= -tolerance))
     return ControlResult(jnp.asarray(candidate if valid else np.full(d, np.nan)),
                         jnp.asarray(candidate), jnp.asarray(residual), jnp.asarray(kkt),
                         valid, initial_safe, float(np.linalg.norm(candidate-nominal)),
                         status, int(result.info.iter))
+
+
+def solve_qp(nominal, constraints, low, high, weights, tolerance=None, *,
+             solver=SolverConfig(), output_matrix=None):
+    """Hard CPU QP with the original physical input limits and tracking cost.
+
+    Neither JIT-compatible nor differentiable. With output_matrix=M, minimize
+    0.5*||M@(u-nominal)||_W^2; otherwise use normalized input tracking.
+    """
+    if tolerance is None:
+        tolerance = solver.feasibility_tolerance
+    nominal, low, high, cbf_A, cbf_b, P, scale = _tracking_qp_data(
+        nominal, constraints, low, high, weights, output_matrix)
+    d = nominal.size
+    A = np.concatenate([cbf_A, np.eye(d), -np.eye(d)])
+    b = np.concatenate([cbf_b, -low, high])
+    return _solve_qp_data(nominal, A, b, P, scale, constraints.domain, solver, tolerance)
 
 
 @partial(jax.jit, static_argnames=("robot", "control_config"))
@@ -220,4 +230,5 @@ def generate_action(robot, state, goal, obstacles, control_config):
     """
     nominal = _nominal_control(robot, state, goal, control_config)
     result = solve_cbf_qp(robot, state, nominal, obstacles, control_config)
-    return result.action, {"nominal": nominal, "qp": result}
+    return result.action, {"nominal": nominal, "qp": result,
+                           "slack": jnp.zeros_like(obstacles.mask)}
