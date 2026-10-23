@@ -463,14 +463,14 @@ class Evaluator:
 
     def evaluate_one_ckpt(self, checkpoint):
         from env.jax_env.jax_social_nav import config_from_omegaconf
-        from model import get_jax_model_module
+        from model import get_model_module
         from utils import load_jax_checkpoint
         from env import make_env
         from trainer.evaluation import evaluate_env
 
         checkpoint = Path(checkpoint)
         params = load_jax_checkpoint(checkpoint)["params"]
-        module = get_jax_model_module(self.config.model)
+        module = get_model_module(self.config.model)
         hparams = module.hparams_from_config(self.config.model, self.config.model.critic, act_dim=2)
         env_cfg = config_from_omegaconf(self.config)
         env = make_env(self.config)

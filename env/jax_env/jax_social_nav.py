@@ -15,7 +15,7 @@ from env.obstacle.obstacle import (
     workspace_center_radii,
 )
 from env.robots import angle_normalize, robot_step
-from model.jax_ppo_base import normalize_robot_type
+from model.ppo_base import normalize_robot_type
 
 
 class JaxSocialNavConfig(NamedTuple):

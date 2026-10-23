@@ -12,7 +12,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from model.jax_actor_critic import actor_std as shared_actor_std
+from model.actor_critic import actor_std as shared_actor_std
 
 
 def normalize_ppo_impl(ppo_impl) -> str:
@@ -327,7 +327,7 @@ def make_ppo_update_fn(
     target_kl = float(target_kl)
     use_target_kl_early_stop = bool(use_target_kl_early_stop) and target_kl > 0.0
     if get_action_and_value_fn is None:
-        from model.jax_diff_cvar_gnn import get_action_and_value as get_action_and_value_fn
+        from model.diff_cvar_gnn import get_action_and_value as get_action_and_value_fn
     if num_epochs <= 0:
         raise ValueError("num_epochs must be > 0")
     if num_minibatches <= 0:

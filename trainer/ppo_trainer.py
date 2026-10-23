@@ -14,9 +14,9 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 import wandb
 
-from model.jax_ppo_base import normalize_robot_type
+from model.ppo_base import normalize_robot_type
 from env.jax_env.jax_social_nav import config_from_omegaconf
-from model import get_jax_model_module
+from model import get_model_module
 from utils import (
     format_jax_device_runtime_info,
     jax_device_runtime_info,
@@ -56,7 +56,7 @@ class PPOTrainer:
     """Shared PPO trainer with a selectable navigation environment."""
 
     def __init__(self, config: DictConfig):
-        self.model_module = get_jax_model_module(config.model)
+        self.model_module = get_model_module(config.model)
         self.timeout_bootstrap = timeout_bootstrap_from_config(config)
         self.config = config
         self.device = str(getattr(config, "device", "cpu"))
