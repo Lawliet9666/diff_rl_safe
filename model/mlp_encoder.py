@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import math
 import jax.numpy as jnp
-from model.jax_observation import _world_to_body
-from model.jax_ppo_base import activation, dense, init_linear, mlp
+from model.observation import _world_to_body
+from model.ppo_base import activation, dense, init_linear, mlp
 
 
 def _init_encoder(keys, hparams, use_init_weights):

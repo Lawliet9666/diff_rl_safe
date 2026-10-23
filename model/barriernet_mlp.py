@@ -1,11 +1,15 @@
-"""JAX diff-CVaR actor with a shared MLP encoder and no graph network."""
+"""JAX deterministic CBF actor with a shared MLP encoder and no graph network."""
 
 from __future__ import annotations
 
-from model.jax_observation import _body_to_world, _gather_topk
-from model.jax_observation import build_qp_context
-from model.jax_safety_heads import _allocate_beta_budget, _fixed_safe_distances, _safe_distances_from_margin_logits, _uniform_beta_budget
-from model.jax_mlp_encoder import _critic_value_from_latent, _init_encoder, _obs_history, _shared_latent, init_shared_mlp_critic
+from model.observation import _body_to_world, _gather_topk
+from model.observation import build_qp_context
+from model.safety_heads import (
+    _fixed_safe_distances,
+    _learned_alpha,
+    _safe_distances_from_margin_logits,
+)
+from model.mlp_encoder import _critic_value_from_latent, _init_encoder, _obs_history, _shared_latent, init_shared_mlp_critic
 
 from dataclasses import dataclass
 import math
@@ -13,10 +17,10 @@ import math
 import jax
 import jax.numpy as jnp
 
-from model.jax_ppo_base import normalize_robot_type
-from model import jax_actor_critic as actor_critic
-from model import jax_cvar_qp
-from model.jax_ppo_base import (
+from model.ppo_base import normalize_robot_type
+from model import actor_critic
+from model import cbf_qp
+from model.ppo_base import (
     activation,
     cfg_get,
     dense,
@@ -28,20 +32,18 @@ from model.jax_ppo_base import (
 
 
 @dataclass(frozen=True)
-class DiffCVaRMLPHParams:
+class BarrierNetMLPHParams:
     act_dim: int
     robot_type: str
     actor_act: str
     critic_act: str
     margin_base: float
     margin_extra_max: float
-    alpha: float
-    beta_min: float
-    beta_max: float
-    learn_beta: bool
     learn_r_safe: bool
+    alpha_min: float
+    alpha_max: float
+    alpha_init: float
     lookahead_distance: float
-    gmm_lateral_ratio: float
     qp_max_iter: int
     qp_eps: float
     qp_not_improved_lim: int
@@ -69,7 +71,7 @@ class DiffCVaRMLPHParams:
 
 def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
     actor_cfg = model_cfg.actor
-    require_config_value(model_cfg, "type", "diff_cvar_mlp", "model")
+    require_config_value(model_cfg, "type", "barriernet_mlp", "model")
     require_config_value(
         actor_cfg, "coordinate_frame", "robot_body", "model.actor"
     )
@@ -78,40 +80,44 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
     obs_frame_dim = int(model_cfg.obs_frame_dim)
     obs_dim = int(model_cfg.obs_dim)
     if history_len <= 0:
-        raise ValueError("diff_cvar_mlp requires history_len > 0")
+        raise ValueError("barriernet_mlp requires history_len > 0")
     if obs_frame_dim < 6 or (obs_frame_dim - 6) % 6 != 0:
         raise ValueError(
-            "diff_cvar_mlp requires obs_frame_dim = 6 + num_humans * 6"
+            "barriernet_mlp requires obs_frame_dim = 6 + num_humans * 6"
         )
     if obs_dim != history_len * obs_frame_dim:
         raise ValueError(
-            "diff_cvar_mlp requires obs_dim = history_len * obs_frame_dim"
+            "barriernet_mlp requires obs_dim = history_len * obs_frame_dim"
         )
     if int(act_dim) != 2:
-        raise ValueError("diff_cvar_mlp requires act_dim=2")
+        raise ValueError("barriernet_mlp requires act_dim=2")
 
     num_humans = (obs_frame_dim - 6) // 6
     qp_obs_top_k = min(
         int(cfg_get(actor_cfg, "qp_obs_top_k", 5)), num_humans
     )
     if qp_obs_top_k <= 0:
-        raise ValueError("diff_cvar_mlp requires qp_obs_top_k > 0")
-
-    beta_min = float(cfg_get(actor_cfg, "beta_min", 0.05))
-    beta_max = float(actor_cfg.beta)
-    if not (0.0 < beta_min < beta_max < 1.0):
-        raise ValueError("diff_cvar_mlp requires 0 < beta_min < beta < 1")
-    if qp_obs_top_k * beta_min > beta_max:
-        raise ValueError(
-            "diff_cvar_mlp requires qp_obs_top_k * beta_min <= beta"
-        )
+        raise ValueError("barriernet_mlp requires qp_obs_top_k > 0")
 
     margin_base = float(actor_cfg.margin_base)
-    margin_extra_max = float(actor_cfg.margin_extra_max)
     if margin_base < 0.0:
         raise ValueError("model.actor.margin_base must be >= 0")
-    if margin_extra_max < 0.0:
-        raise ValueError("model.actor.margin_extra_max must be >= 0")
+
+    # Old resolved configs have no distance head and retain fixed distances.
+    learn_r_safe = bool(cfg_get(actor_cfg, "learn_r_safe", False))
+    margin_extra_max = float(cfg_get(actor_cfg, "margin_extra_max", 0.0))
+    if not math.isfinite(margin_extra_max) or margin_extra_max < 0.0:
+        raise ValueError("model.actor.margin_extra_max must be finite and >= 0")
+    if learn_r_safe and margin_extra_max <= 0.0:
+        raise ValueError("learn_r_safe requires model.actor.margin_extra_max > 0")
+
+    alpha_min = float(actor_cfg.alpha_min)
+    alpha_max = float(actor_cfg.alpha_max)
+    alpha_init = float(actor_cfg.alpha_init)
+    if not (0.0 < alpha_min < alpha_init < alpha_max):
+        raise ValueError(
+            "barriernet_mlp requires 0 < alpha_min < alpha_init < alpha_max"
+        )
 
     encoder_hidden_dim = int(cfg_get(actor_cfg, "encoder_hidden_dim", 64))
     encoder_latent_dim = int(cfg_get(actor_cfg, "encoder_latent_dim", 16))
@@ -120,14 +126,14 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
     velocity_scale = float(cfg_get(actor_cfg, "velocity_scale", 1.0))
     if encoder_hidden_dim <= 0 or encoder_latent_dim <= 0 or encoder_layers <= 0:
         raise ValueError(
-            "diff_cvar_mlp encoder dimensions and layer count must be > 0"
+            "barriernet_mlp encoder dimensions and layer count must be > 0"
         )
     if position_scale <= 0.0 or velocity_scale <= 0.0:
         raise ValueError(
-            "diff_cvar_mlp position_scale and velocity_scale must be > 0"
+            "barriernet_mlp position_scale and velocity_scale must be > 0"
         )
 
-    return DiffCVaRMLPHParams(
+    return BarrierNetMLPHParams(
         act_dim=int(act_dim),
         robot_type=normalize_robot_type(
             cfg_get(model_cfg, "robot_type", "unicycle")
@@ -136,15 +142,13 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
         critic_act=str(cfg_get(critic_cfg, "act", "relu")),
         margin_base=margin_base,
         margin_extra_max=margin_extra_max,
-        alpha=float(actor_cfg.alpha),
-        beta_min=beta_min,
-        beta_max=beta_max,
-        learn_beta=bool(cfg_get(actor_cfg, "learn_beta", True)),
-        learn_r_safe=bool(cfg_get(actor_cfg, "learn_r_safe", True)),
+        learn_r_safe=learn_r_safe,
+        alpha_min=alpha_min,
+        alpha_max=alpha_max,
+        alpha_init=alpha_init,
         lookahead_distance=float(
             cfg_get(actor_cfg, "lookahead_distance", 0.2)
         ),
-        gmm_lateral_ratio=float(actor_cfg.gmm_lateral_ratio),
         qp_max_iter=int(cfg_get(actor_cfg, "qp_max_iter", 40)),
         qp_eps=float(cfg_get(actor_cfg, "qp_eps", 1e-12)),
         qp_not_improved_lim=int(
@@ -198,10 +202,10 @@ def init_params_from_config(
         critic_hidden_dim2,
     ) <= 0:
         raise ValueError(
-            "diff_cvar_mlp actor and critic hidden dimensions must be > 0"
+            "barriernet_mlp actor and critic hidden dimensions must be > 0"
         )
 
-    keys = jax.random.split(key, hparams.encoder_layers + 9)
+    keys = jax.random.split(key, hparams.encoder_layers + 8)
     encoder_end = hparams.encoder_layers
     sqrt2 = math.sqrt(2.0)
     actor = {
@@ -227,41 +231,35 @@ def init_params_from_config(
             act_dim,
             use_init_weights,
         ),
-    }
-    if hparams.learn_beta or hparams.learn_r_safe:
-        actor["human_fc1"] = init_linear(
+        "human_fc1": init_linear(
             keys[encoder_end + 3],
             hparams.encoder_latent_dim,
             scalar_hidden_dim,
             sqrt2,
             use_init_weights,
-        )
-    if hparams.learn_beta:
-        actor["human_beta_head"] = init_linear(
+        ),
+        "human_alpha_head": init_linear(
             keys[encoder_end + 4],
             scalar_hidden_dim,
             hparams.num_humans,
             sqrt2 * 0.01,
             use_init_weights,
-        )
+        ),
+    }
+    alpha_fraction = (hparams.alpha_init - hparams.alpha_min) / (
+        hparams.alpha_max - hparams.alpha_min
+    )
+    alpha_bias = math.log(alpha_fraction / (1.0 - alpha_fraction))
+    actor["human_alpha_head"]["bias"] = jnp.full(
+        (hparams.num_humans,), alpha_bias, dtype=jnp.float32
+    )
     if hparams.learn_r_safe:
+        # Derive a new key without shifting any existing actor or critic keys.
         actor["human_rsafe_head"] = init_linear(
-            keys[encoder_end + 5],
-            scalar_hidden_dim,
-            hparams.num_humans,
-            sqrt2 * 0.01,
-            use_init_weights,
+            jax.random.fold_in(key, 1), scalar_hidden_dim, hparams.num_humans,
+            sqrt2 * 0.01, use_init_weights,
         )
-    actor.update({
-        "gmm_weights": jnp.asarray(
-            actor_cfg.gmm_weights, dtype=jnp.float32
-        ),
-        "gmm_variances": jnp.square(
-            jnp.asarray(actor_cfg.gmm_stds, dtype=jnp.float32)
-        ),
-    })
-
-    critic = init_shared_mlp_critic(keys[encoder_end + 6:encoder_end + 9],
+    critic = init_shared_mlp_critic(keys[encoder_end + 5:encoder_end + 8],
                                     hparams, critic_hidden_dim, critic_hidden_dim2, use_init_weights)
     return {
         "actor": actor,
@@ -272,33 +270,33 @@ def init_params_from_config(
 
 
 def _current_obs(obs, hparams):
-    history = _obs_history(obs, hparams)
-    return history, history[:, -1, :]
+    obs_history = _obs_history(obs, hparams)
+    return obs_history, obs_history[:, -1, :]
 
 
 def _actor_outputs(params, hparams, obs, qp_context=None):
     latent = _shared_latent(params, hparams, obs)
     _history, current_obs = _current_obs(obs, hparams)
     actor_params = params["actor"]
-    hidden = activation(
+
+    robot_x = activation(
         dense(actor_params["fc1"], latent), hparams.actor_act
     )
     nominal_xy = mlp(
-        actor_params["nominal_head"], hidden, hparams.actor_act
+        actor_params["nominal_head"], robot_x, hparams.actor_act
     )
 
-    if hparams.learn_beta or hparams.learn_r_safe:
-        human_x = activation(
-            dense(actor_params["human_fc1"], latent), hparams.actor_act
-        )
-    if hparams.learn_beta:
-        beta_logits_all = dense(actor_params["human_beta_head"], human_x)
+    human_x = activation(
+        dense(actor_params["human_fc1"], latent), hparams.actor_act
+    )
+    alpha_logits_all = dense(
+        actor_params["human_alpha_head"], human_x
+    )
+    alpha_all = _learned_alpha(alpha_logits_all, hparams)
     if hparams.learn_r_safe:
-        margin_logits_all = dense(
-            actor_params["human_rsafe_head"], human_x
-        )
+        margin_logits = dense(actor_params["human_rsafe_head"], human_x)
         r_safe_all = _safe_distances_from_margin_logits(
-            current_obs, margin_logits_all, hparams
+            current_obs, margin_logits, hparams
         )
     else:
         r_safe_all = _fixed_safe_distances(current_obs, hparams)
@@ -307,35 +305,22 @@ def _actor_outputs(params, hparams, obs, qp_context=None):
         qp_context = build_qp_context(obs, hparams)
     qp_obs = qp_context["qp_obs"]
     qp_topk_ids = qp_context["qp_topk_ids"]
-    qp_blocks = qp_obs[:, 6:].reshape(
-        (qp_obs.shape[0], hparams.qp_obs_top_k, 6)
-    )
-    if hparams.learn_beta:
-        beta_logits_topk = _gather_topk(
-            beta_logits_all, qp_topk_ids
-        )
-        beta_topk = _allocate_beta_budget(
-            beta_logits_topk, qp_blocks[:, :, 5], hparams
-        )
-    else:
-        beta_topk = _uniform_beta_budget(
-            qp_blocks[:, :, 5], hparams
-        )
+    alpha_topk = _gather_topk(alpha_all, qp_topk_ids)
     r_safe_topk = _gather_topk(r_safe_all, qp_topk_ids)
     nominal_xy = _body_to_world(nominal_xy, qp_obs[:, 4])
-    safe_xy, slack = jax_cvar_qp.solve_slack_qp(
+    safe_xy, slack = cbf_qp.solve_slack_qp(
         params,
         hparams,
         qp_obs,
         nominal_xy,
-        beta_topk,
+        alpha_topk,
         r_safe_topk,
     )
     return (
         latent,
         qp_obs,
         nominal_xy,
-        beta_topk,
+        alpha_topk,
         r_safe_topk,
         safe_xy,
         slack,
@@ -373,11 +358,12 @@ def get_action_and_value(
         latent,
         qp_obs,
         nominal_xy,
-        beta,
+        alpha,
         r_safe,
         safe_xy,
         slack,
     ) = _actor_outputs(params, hparams, obs, qp_context=qp_context)
+
     action, logprob, entropy, sampled_policy_action = (
         actor_critic.action_logprob_entropy(
             params,
@@ -393,23 +379,21 @@ def get_action_and_value(
         outputs = outputs + (sampled_policy_action,)
     if return_diagnostics:
         if hparams.qp_full_diagnostics:
-            diagnostics = jax_cvar_qp.full_diagnostics(
-                params,
+            diagnostics = cbf_qp.full_diagnostics(
                 hparams,
                 qp_obs,
                 nominal_xy,
-                beta,
+                alpha,
                 r_safe,
                 safe_xy,
                 slack,
             )
         else:
-            diagnostics = jax_cvar_qp.lightweight_diagnostics(
-                params,
+            diagnostics = cbf_qp.lightweight_diagnostics(
                 hparams,
                 qp_obs,
                 nominal_xy,
-                beta,
+                alpha,
                 r_safe,
                 safe_xy,
                 slack,

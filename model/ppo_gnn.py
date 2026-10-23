@@ -8,17 +8,17 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 
-from model.jax_ppo_base import normalize_robot_type
+from model.ppo_base import normalize_robot_type
 
-from model import jax_actor_critic as actor_critic
-from model.jax_gnn_encoder import (
+from model import actor_critic
+from model.gnn_encoder import (
     actor_latent_and_mean,
     critic_value_from_latent,
     init_shared_gnn_actor,
     init_shared_gnn_critic,
     shared_critic_value,
 )
-from model.jax_ppo_base import cfg_get, require_config_value
+from model.ppo_base import cfg_get, require_config_value
 
 
 @dataclass(frozen=True)

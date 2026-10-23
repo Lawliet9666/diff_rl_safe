@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from model.jax_observation import _world_to_body
+from model.observation import _world_to_body
 
 import math
 
 import jax
 import jax.numpy as jnp
 
-from model.jax_ppo_base import activation, dense, init_head, init_linear, mlp
+from model.ppo_base import activation, dense, init_head, init_linear, mlp
 
 
 def _init_mlp(keys, dims, gains, use_init_weights=True):

@@ -3,21 +3,21 @@
 from importlib import import_module
 
 
-_JAX_MODEL_MODULES = {
-    "barriernet_gnn": "model.jax_barriernet_gnn",
-    "barriernet_mlp": "model.jax_barriernet_mlp",
-    "diff_cvar_gnn": "model.jax_diff_cvar_gnn",
-    "diff_cvar_mlp": "model.jax_diff_cvar_mlp",
-    "ppo_gnn": "model.jax_ppo_gnn",
-    "ppo_mlp": "model.jax_ppo_mlp",
+_MODEL_MODULES = {
+    "barriernet_gnn": "model.barriernet_gnn",
+    "barriernet_mlp": "model.barriernet_mlp",
+    "diff_cvar_gnn": "model.diff_cvar_gnn",
+    "diff_cvar_mlp": "model.diff_cvar_mlp",
+    "ppo_gnn": "model.ppo_gnn",
+    "ppo_mlp": "model.ppo_mlp",
 }
 
 
-def get_jax_model_module(model_cfg):
+def get_model_module(model_cfg):
     model_type = str(model_cfg.get("type") if isinstance(model_cfg, dict) else model_cfg.type)
-    module_name = _JAX_MODEL_MODULES.get(model_type)
+    module_name = _MODEL_MODULES.get(model_type)
     if module_name is None:
-        raise ValueError(f"unsupported model.type={model_type!r}; expected one of {tuple(_JAX_MODEL_MODULES)}")
+        raise ValueError(f"unsupported model.type={model_type!r}; expected one of {tuple(_MODEL_MODULES)}")
     return import_module(module_name)
 
 
@@ -35,4 +35,4 @@ def make_action_fn(params, hparams, policy_action_mean_fn, policy_action_to_env_
     return generate_action
 
 
-__all__ = ["get_jax_model_module", "make_action_fn"]
+__all__ = ["get_model_module", "make_action_fn"]

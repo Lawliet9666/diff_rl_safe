@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from model.jax_observation import _body_to_world, _gather_topk
-from model.jax_observation import build_qp_context
-from model.jax_safety_heads import _allocate_beta_budget, _fixed_safe_distances, _safe_distances_from_margin_logits, _uniform_beta_budget
+from model.observation import _body_to_world, _gather_topk
+from model.observation import build_qp_context
+from model.safety_heads import _allocate_beta_budget, _fixed_safe_distances, _safe_distances_from_margin_logits, _uniform_beta_budget
 
 from dataclasses import dataclass
 import math
@@ -12,11 +12,11 @@ import math
 import jax
 import jax.numpy as jnp
 
-from model.jax_ppo_base import normalize_robot_type
+from model.ppo_base import normalize_robot_type
 
-from model import jax_actor_critic as actor_critic
-from model import jax_cvar_qp
-from model.jax_gnn_encoder import (
+from model import actor_critic
+from model import cvar_qp
+from model.gnn_encoder import (
     critic_value_from_latent as _critic_value_from_latent,
     current_obs_history,
     init_shared_gnn_actor,
@@ -24,7 +24,7 @@ from model.jax_gnn_encoder import (
     shared_critic_value,
     spatio_temporal_graph_encode,
 )
-from model.jax_ppo_base import activation, cfg_get, dense, init_linear, mlp, require_config_value
+from model.ppo_base import activation, cfg_get, dense, init_linear, mlp, require_config_value
 
 
 @dataclass(frozen=True)
@@ -221,7 +221,7 @@ def _actor_outputs(params, hparams, obs, qp_context=None):
         beta_topk = _uniform_beta_budget(qp_blocks[:, :, 5], hparams)
     r_safe_topk = _gather_topk(r_safe_all, qp_topk_ids)
     nominal_xy = _body_to_world(nominal_xy, qp_obs[:, 4])
-    safe_xy, slack = jax_cvar_qp.solve_slack_qp(
+    safe_xy, slack = cvar_qp.solve_slack_qp(
         params, hparams, qp_obs, nominal_xy, beta_topk, r_safe_topk
     )
     return robot_latent, qp_obs, nominal_xy, beta_topk, r_safe_topk, safe_xy, slack
@@ -280,8 +280,8 @@ def get_action_and_value(
         outputs = outputs + (sampled_policy_action,)
     if return_diagnostics:
         if hparams.qp_full_diagnostics:
-            diagnostics = jax_cvar_qp.full_diagnostics(params, hparams, qp_obs, nominal_xy, beta, r_safe, safe_xy, slack)
+            diagnostics = cvar_qp.full_diagnostics(params, hparams, qp_obs, nominal_xy, beta, r_safe, safe_xy, slack)
         else:
-            diagnostics = jax_cvar_qp.lightweight_diagnostics(params, hparams, qp_obs, nominal_xy, beta, r_safe, safe_xy, slack)
+            diagnostics = cvar_qp.lightweight_diagnostics(params, hparams, qp_obs, nominal_xy, beta, r_safe, safe_xy, slack)
         outputs = outputs + (diagnostics,)
     return outputs

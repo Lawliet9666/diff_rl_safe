@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from model.jax_mlp_encoder import _critic_value_from_latent, _init_encoder, _shared_latent, init_shared_mlp_critic
+from model.mlp_encoder import _critic_value_from_latent, _init_encoder, _shared_latent, init_shared_mlp_critic
 
 from dataclasses import dataclass
 import math
@@ -10,9 +10,9 @@ import math
 import jax
 import jax.numpy as jnp
 
-from model.jax_ppo_base import normalize_robot_type
-from model import jax_actor_critic as actor_critic
-from model.jax_ppo_base import (
+from model.ppo_base import normalize_robot_type
+from model import actor_critic
+from model.ppo_base import (
     activation,
     cfg_get,
     dense,

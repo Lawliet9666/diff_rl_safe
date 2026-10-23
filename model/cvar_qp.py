@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from model.jax_qp_common import (_single_integrator_qp_objective, _unicycle_qp_objective, _solve_slack_qp, _masked_positive_stats, _masked_raw_stats)
+from model.qp_common import (_single_integrator_qp_objective, _unicycle_qp_objective, _solve_slack_qp, _masked_positive_stats, _masked_raw_stats)
 
 import math
 
