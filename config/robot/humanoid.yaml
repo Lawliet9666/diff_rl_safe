@@ -1,7 +1,7 @@
 type: humanoid
 radius: 0.3
 vf_min: -1.0
-vf_max: 2.0
+vf_max: 1.5
 vl_min: -1.0
 vl_max: 1.0
 af_max: 4.0
