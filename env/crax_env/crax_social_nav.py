@@ -104,12 +104,6 @@ class CraxSocialNavConfig(NamedTuple):
     constant_penalty: float
     boundary_penalty_factor: float
     boundary_buffer: float
-    integration_steps: int
-    state_tolerance: float
-
-    @property
-    def integration_dt(self):
-        return self.dt / self.integration_steps
 
 
 class CraxNavigationState(NamedTuple):
@@ -187,18 +181,10 @@ class CraxSocialNav(SafeGoalPoint):
         if omega_delta_factor > 0.0 and robot_type != "unicycle":
             raise ValueError("env.reward.omega_delta_factor requires robot.type=unicycle")
         dt = float(env_cfg.dt)
-        max_dt = float(get(robot_cfg, "max_integration_dt", dt))
-        state_tolerance = float(get(env_cfg, "state_tolerance", 1e-6))
         if not math.isfinite(dt) or dt <= 0:
             raise ValueError("env.dt must be positive")
-        if not math.isfinite(max_dt) or max_dt <= 0:
-            raise ValueError("robot.max_integration_dt must be positive")
-        if not math.isfinite(state_tolerance) or state_tolerance <= 0:
-            raise ValueError("env.state_tolerance must be positive")
         return CraxSocialNavConfig(
             dt=dt,
-            integration_steps=max(1, math.ceil(dt/max_dt)),
-            state_tolerance=state_tolerance,
             max_steps=int(env_cfg.max_steps),
             workspace_low=jnp.asarray(workspace_low, dtype=jnp.float32),
             workspace_high=jnp.asarray(workspace_high, dtype=jnp.float32),

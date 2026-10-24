@@ -15,13 +15,6 @@ import jax.numpy as jnp
 from model.actor_critic import actor_std as shared_actor_std
 
 
-def normalize_ppo_impl(ppo_impl) -> str:
-    value = str(ppo_impl or "brax").strip().lower()
-    if value != "brax":
-        raise ValueError(f"trainer.ppo_impl must be 'brax', got {ppo_impl!r}")
-    return value
-
-
 def flat_time_batch(array):
     array = jnp.asarray(array)
     return array.reshape((-1,) + array.shape[2:]) if array.ndim > 2 else array.reshape(-1)
@@ -156,8 +149,7 @@ def _with_trainable(params, trainable_params):
 
 
 
-def init_ppo_opt_state(params, ppo_impl="brax", max_grad_norm=1.0):
-    normalize_ppo_impl(ppo_impl)
+def init_ppo_opt_state(params, max_grad_norm=1.0):
     return {"brax": init_optax_adam_state(_trainable_params(params), max_grad_norm=max_grad_norm)}
 
 
@@ -310,7 +302,6 @@ def brax_minibatch_update(
 # while preserving this repo's native batch/model/optimizer interfaces.
 def make_ppo_update_fn(
     hparams,
-    ppo_impl="brax",
     normalize_advantage=True,
     num_epochs=1,
     num_minibatches=1,
@@ -319,7 +310,6 @@ def make_ppo_update_fn(
     use_target_kl_early_stop=True,
     get_action_and_value_fn=None,
 ):
-    normalize_ppo_impl(ppo_impl)
     normalize_advantage = bool(normalize_advantage)
     num_epochs = int(num_epochs)
     num_minibatches = int(num_minibatches)

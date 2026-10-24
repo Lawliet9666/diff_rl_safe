@@ -198,7 +198,7 @@ def make_rollout_collector(model_module, use_qp, *, step_fn, reset_fn,
 
             next_state, reward, done, metrics = step_fn(env_cfg, state, env_action, env_key)
             if use_qp:
-                reward = reward - float(hparams.qp_residual_reward_weight) * qp_diagnostics["qp_penalty"]
+                reward = reward - float(hparams.qp_residual_reward_weight) * qp_diagnostics["qp_slack"]
             done_bool = done > 0.5
             next_ppo_returns, completed_ppo_return = _update_ppo_episode_returns(
                 running_ppo_returns,

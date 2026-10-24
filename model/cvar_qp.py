@@ -163,22 +163,13 @@ def lightweight_diagnostics(params, hparams, obs, nominal_xy, beta, r_safe, safe
     del params, hparams
     _rel, _human_vel, _obstacle_radius, mask = _extract_blocks(obs)
     slack_mean, slack_max = _masked_raw_stats(jnp.maximum(slack, 0.0), mask)
-    zero = jnp.zeros((obs.shape[0],), dtype=obs.dtype)
     correction = jnp.linalg.norm(safe_xy - nominal_xy, axis=1)
     return {
-        "qp_penalty": slack_mean.astype(jnp.float32),
-        "qp_penalty_max": slack_max.astype(jnp.float32),
         "qp_slack": slack_mean.astype(jnp.float32),
         "qp_slack_max": slack_max.astype(jnp.float32),
         "qp_correction": correction.astype(jnp.float32),
-        "nominal_cbf_residual": zero.astype(jnp.float32),
-        "nominal_cbf_residual_max": zero.astype(jnp.float32),
-        "safe_cbf_residual": zero.astype(jnp.float32),
-        "safe_cbf_residual_max": zero.astype(jnp.float32),
         "beta": beta.astype(jnp.float32),
         "r_safe": r_safe.astype(jnp.float32),
-        "nominal_action_norm": jnp.linalg.norm(nominal_xy, axis=1).astype(jnp.float32),
-        "safe_action_norm": jnp.linalg.norm(safe_xy, axis=1).astype(jnp.float32),
     }
 
 
@@ -188,20 +179,11 @@ def full_diagnostics(params, hparams, obs, nominal_xy, beta, r_safe, safe_xy, sl
     safe_raw = jnp.sum(g * safe_xy[:, None, :], axis=2) - h_qp
     nominal_mean, nominal_max = _masked_positive_stats(nominal_raw, mask)
     safe_mean, safe_max = _masked_positive_stats(safe_raw, mask)
-    slack_mean, slack_max = _masked_raw_stats(jnp.maximum(slack, 0.0), mask)
-    correction = jnp.linalg.norm(safe_xy - nominal_xy, axis=1)
-    return {
-        "qp_penalty": slack_mean.astype(jnp.float32),
-        "qp_penalty_max": slack_max.astype(jnp.float32),
-        "qp_slack": slack_mean.astype(jnp.float32),
-        "qp_slack_max": slack_max.astype(jnp.float32),
-        "qp_correction": correction.astype(jnp.float32),
+    diagnostics = lightweight_diagnostics(params, hparams, obs, nominal_xy, beta, r_safe, safe_xy, slack)
+    diagnostics.update({
         "nominal_cbf_residual": nominal_mean.astype(jnp.float32),
         "nominal_cbf_residual_max": nominal_max.astype(jnp.float32),
         "safe_cbf_residual": safe_mean.astype(jnp.float32),
         "safe_cbf_residual_max": safe_max.astype(jnp.float32),
-        "beta": beta.astype(jnp.float32),
-        "r_safe": r_safe.astype(jnp.float32),
-        "nominal_action_norm": jnp.linalg.norm(nominal_xy, axis=1).astype(jnp.float32),
-        "safe_action_norm": jnp.linalg.norm(safe_xy, axis=1).astype(jnp.float32),
-    }
+    })
+    return diagnostics

@@ -10,13 +10,13 @@ a_max: 2.0  # m/s^2; |a_x| and |a_y| <= a_max
 # State limits.
 # No velocity bound; state checks require finite values only.
 
-# Navigation metadata, matching single_integrator for controlled comparisons.
-goal_tolerance: 0.3  # m; goal arrival distance
-goal_min_distance: 8.0  # m; minimum sampled start-to-goal distance
+# Navigation settings.
+goal_tolerance: 0.6  # m; goal arrival distance
+goal_min_distance: 6.0  # m; minimum sampled start-to-goal distance
 
-# Reward metadata; the model addition does not introduce an RL action mapping.
+# Reward settings (not dynamics or control input limits).
 reward:
   progress_speed_scale: 1.5  # Reward normalization only; not a speed limit.
-  potential_factor: 2.0
-  back_factor: 0.0
-  spin_factor: 0.0
+  potential_factor: 3.0  # Goal-progress reward weight.
+  back_factor: 0.1  # Backward-motion penalty weight.
+  spin_factor: 4.5  # Turning penalty weight.

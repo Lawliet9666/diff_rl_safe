@@ -28,7 +28,6 @@ from trainer.ppo_core import (
     timeout_bootstrap_from_config,
     init_ppo_opt_state,
     make_ppo_update_fn,
-    normalize_ppo_impl,
     tree_all_finite,
 )
 from env import make_env
@@ -121,7 +120,6 @@ class PPOTrainer:
         )
         if float(trainer.ent_coef) > 0.0:
             run_name += f"-ent{trainer.ent_coef}"
-        normalize_ppo_impl(getattr(trainer, "ppo_impl", "brax"))
         run_name += "-braxppo"
         lr_schedule = str(getattr(trainer, "learning_rate_schedule", "linear")).strip().lower()
         if lr_schedule == "adaptive_kl":
@@ -176,7 +174,6 @@ class PPOTrainer:
         device_suffix = format_jax_device_runtime_info(self.jax_device_info)
         devices = ", ".join(str(device) for device in jax.devices())
         print(f"JAX backend: {self.jax_backend}; devices: {devices}{device_suffix}", flush=True)
-        self.ppo_impl = normalize_ppo_impl(getattr(self.config.trainer, "ppo_impl", "brax"))
         self.policy_action_dim = self.env_act_dim
 
         self.jax_hparams = self.model_module.hparams_from_config(
@@ -197,7 +194,6 @@ class PPOTrainer:
         )
         opt_state = init_ppo_opt_state(
             params,
-            self.ppo_impl,
             max_grad_norm=float(self.config.trainer.max_grad_norm),
         )
         self.params = params
@@ -231,7 +227,6 @@ class PPOTrainer:
     def _make_jitted_train_step(self):
         ppo_update_fn = make_ppo_update_fn(
             self.jax_hparams,
-            ppo_impl=self.ppo_impl,
             normalize_advantage=bool(getattr(self.config.trainer, "normalize_advantages", True)),
             num_epochs=int(self.config.trainer.n_updates_per_iteration),
             num_minibatches=int(self.num_minibatches),
