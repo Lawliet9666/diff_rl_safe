@@ -32,6 +32,7 @@ class SolverConfig:
     eps_abs: float = 1e-9
     eps_rel: float = 1e-9
     max_iter: int = 10000
+    adaptive_rho_interval: int = 25  # Fixed iterations between rho updates.
     feasibility_tolerance: float = 1e-6
     polishing: bool = False
     verbose: bool = False
@@ -41,6 +42,8 @@ class SolverConfig:
                     [self.eps_abs, self.eps_rel, self.feasibility_tolerance])
                 or not isinstance(self.max_iter, int) or isinstance(self.max_iter, bool)
                 or self.max_iter <= 0
+                or not isinstance(self.adaptive_rho_interval, int)
+                or isinstance(self.adaptive_rho_interval, bool) or self.adaptive_rho_interval <= 0
                 or not isinstance(self.polishing, bool) or not isinstance(self.verbose, bool)):
             raise ValueError("invalid OSQP tolerances, iteration limit or logging settings")
 
@@ -102,7 +105,9 @@ def _solve_qp_data(nominal, A, b, P, scale, domain, solver):
         problem.setup(P=sparse.csc_matrix(np.triu(P)), q=q,
                       A=sparse.csc_matrix(C), l=lower, u=np.full(len(b), np.inf),
                       eps_abs=solver.eps_abs, eps_rel=solver.eps_rel,
-                      max_iter=solver.max_iter, polishing=solver.polishing,
+                      max_iter=solver.max_iter,
+                      adaptive_rho_interval=solver.adaptive_rho_interval,
+                      polishing=solver.polishing,
                       verbose=solver.verbose)
         result = problem.solve(raise_error=False)
     except osqp.OSQPException as error:
@@ -260,6 +265,16 @@ def solve_cbf_qp(robot, state, nominal, obstacles, dt, *, solver=SolverConfig())
     result, _ = _solve_controller_qp(robot, state, nominal, obstacles, dt,
                                      solver=solver, slack_weight=0.0)
     return result
+
+
+def warmup_controller(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None):
+    """Warm JAX CBF/output computations without creating or solving an OSQP problem."""
+    _validate_controller_inputs(robot, state, nominal, obstacles, dt)
+    obstacles = select_obstacles(state[:2], obstacles, qp_obs_top_k)
+    if isinstance(robot, HumanoidRobot) and not bool(robot.barrier_domain_valid(state, obstacles)):
+        raise ValueError("parabolic CBF requires strict separation from inflated obstacles")
+    jax.block_until_ready((robot.cbf_constraints(state, obstacles, dt),
+                           _control_output_matrix(robot, state)))
 
 
 def generate_action(robot, state, nominal, obstacles, dt, *, solver=SolverConfig(),

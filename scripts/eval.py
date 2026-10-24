@@ -59,7 +59,7 @@ def save_video(path, frames, fps=30):
 
 
 def _prepare_controller(config):
-    """Validate run settings and return the robot, solver and action function."""
+    """Prepare reusable controller, environment configuration and JIT functions."""
     from controller import make_controller
 
     if not isinstance(config.seed, int) or isinstance(config.seed, bool):
@@ -85,7 +85,17 @@ def _prepare_controller(config):
     if (len(workspace) != 4 or not all(math.isfinite(v) for v in workspace)
             or workspace[0] >= workspace[1] or workspace[2] >= workspace[3]):
         raise ValueError("env.workspace requires finite increasing x/y bounds")
-    return make_controller(config)
+    import jax
+    from env import make_env
+
+    robot, solver, controller = make_controller(config)
+    env = make_env(config)
+    cfg = env.config_from_omegaconf(config, robot=robot)._replace(
+        state_tolerance=solver.feasibility_tolerance)
+    return dict(robot=robot, solver=solver, controller=controller, env=env, cfg=cfg,
+                step_fn=jax.jit(lambda state, action, key: env.step_fn(cfg, state, action, key)),
+                nominal_fn=jax.jit(type(robot).nominal_control, static_argnames=("self",)),
+                warmed=False)
 
 
 def _controller_failure_diagnostics(state, nominal, obs, result):
@@ -101,29 +111,23 @@ def _controller_failure_diagnostics(state, nominal, obs, result):
     return "infeasible", "OSQP reports incompatible hard constraints", diagnostic
 
 
-def _run_controller_episode(config, *, controller_setup=None):
-    """Run a fresh episode with an optional (robot, solver, action_fn) setup."""
+def _run_controller_episode(config, *, setup=None):
+    """Reset episode state while reusing prepared environment and control functions."""
     import jax
     import jax.numpy as jnp
-    from controller.cbf_qp import control_residual
+    from controller.cbf_qp import control_residual, warmup_controller
     from controller import Obstacles
-    from env import make_env
-    from env.jax_env.jax_social_nav import compute_distances, config_from_omegaconf
 
-    robot_model, solver, controller = (
-        _prepare_controller(config) if controller_setup is None else controller_setup)
+    setup = _prepare_controller(config) if setup is None else setup
+    robot_model, solver, controller = setup["robot"], setup["solver"], setup["controller"]
     robot, scenario, seed = str(config.robot.type), str(config.env.scenario), int(config.seed)
     use_slack = config.controller.slack_weight > 0
-    env = make_env(config)
-    cfg = config_from_omegaconf(config)._replace(
-        robot=robot_model, state_tolerance=solver.feasibility_tolerance)
+    env, cfg = setup["env"], setup["cfg"]
     navigation_state = env.reset_fn(cfg, jax.random.PRNGKey(seed), 1)
     crowd = navigation_state
     state = crowd.robot_state[0].astype(jnp.float64)
     goal = crowd.goal_pos[0].astype(jnp.float64)
-    advance_env = jax.jit(lambda current, action, key: env.step_fn(cfg, current, action, key))
-    nominal_control = jax.jit(
-        type(robot_model).nominal_control, static_argnames=("self",))
+    advance_env, nominal_control = setup["step_fn"], setup["nominal_fn"]
 
     def observe_state(current):
         x = current.robot_state[0].astype(jnp.float64)
@@ -137,7 +141,16 @@ def _run_controller_episode(config, *, controller_setup=None):
         nominal = nominal_control(robot_model, x, target)
         return controller(x, nominal, obstacles)
 
-    action_fn(observe_state(navigation_state))[0].block_until_ready()
+    if not setup["warmed"]:
+        x, target, obstacles = observe_state(navigation_state)
+        nominal = nominal_control(robot_model, x, target)
+        nominal.block_until_ready()
+        warmup_controller(robot_model, x, nominal, obstacles, cfg.dt,
+                          qp_obs_top_k=config.controller.qp_obs_top_k)
+        # Compile the environment step without executing it or advancing its RNG.
+        advance_env.lower(navigation_state, jnp.zeros((1, robot_model.control_dim), dtype=state.dtype),
+                          jax.random.PRNGKey(seed)).compile()
+        setup["warmed"] = True
     history = {k: [] for k in ["time", "state", "centers", "status", "active_obstacles",
         "nominal", "action", "requested_action", "min_residual", "initial_safe", "kkt_residual", "solve_ms",
         "qp_valid", "fallback", "solver_status", "slack", "cbf_satisfied",
@@ -152,7 +165,7 @@ def _run_controller_episode(config, *, controller_setup=None):
 
     def record_frame(label):
         nonlocal worst_clearance
-        _, clearance = compute_distances(cfg, crowd)
+        _, clearance = env.compute_distances(cfg, crowd)
         worst_clearance = min(worst_clearance, float(clearance[0]))
         history["time"].append(float(crowd.step_count[0])*cfg.dt)
         history["state"].append(np.asarray(state).copy())
@@ -165,7 +178,12 @@ def _run_controller_episode(config, *, controller_setup=None):
         observation = observe_state(navigation_state)
         obs = observation[2]
         start = time.perf_counter()
-        action, diagnostics = action_fn(observation)
+        try:
+            action, diagnostics = action_fn(observation)
+        except RuntimeError as error:
+            error.add_note(f"Controller failure: robot={robot}, seed={seed}, "
+                           f"step={k} (zero-based), state={np.asarray(state).tolist()}")
+            raise
         action.block_until_ready()
         # Includes nominal generation, obstacle selection and the QP solve.
         solve_ms = (time.perf_counter()-start)*1000
@@ -242,7 +260,7 @@ def _run_controller_episode(config, *, controller_setup=None):
     history["kkt_residual"] = history["kkt_residual"].reshape((-1, 3))
     history["slack"] = history["slack"].reshape((-1, cfg.num_humans))
     finite = lambda value: float(value) if np.isfinite(value) else None
-    dist, _ = compute_distances(cfg, crowd)
+    dist, _ = env.compute_distances(cfg, crowd)
     integration_dt = cfg.integration_dt
     summary = dict(robot=robot, scenario=scenario, seed=seed, status=status, reason=reason,
         steps=len(history["action"]), min_clearance=finite(worst_clearance),
@@ -272,11 +290,11 @@ def _run_controller_episode(config, *, controller_setup=None):
 def _render_controller_frame(cfg, history, index, crowd, robot, robot_model):
     """Only adapt state; all pixels/layout come from the existing RL renderer."""
     import jax.numpy as jnp
-    from env.jax_env.jax_social_nav import planar_state
+    from env.jax_env.jax_social_nav import JaxSocialNav
 
     from env.jax_env.jax_render import render_jax_social_nav_frame
     state = jnp.asarray(history["state"][index])
-    frame_state = planar_state(cfg, crowd._replace(robot_state=state[None, :]))
+    frame_state = JaxSocialNav.planar_state(cfg, crowd._replace(robot_state=state[None, :]))
     frame_state = frame_state._replace(
         human_positions=jnp.asarray(history["centers"][index])[None, ...],
         step_count=jnp.array([round(float(history["time"][index])/cfg.dt)], jnp.int32))
@@ -327,7 +345,7 @@ def evaluate_controller(config, output, *, visualize=False, seeds=None, episodes
 
     from trainer.evaluation import eval_seed_values, safe_mean_std, paper_metric_summary
 
-    controller_setup = _prepare_controller(config)
+    setup = _prepare_controller(config)
     seed_values = eval_seed_values(episodes, [int(config.seed)] if seeds is None else seeds)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -339,7 +357,7 @@ def evaluate_controller(config, output, *, visualize=False, seeds=None, episodes
     for index, seed in enumerate(seed_values):
         episode_config = OmegaConf.merge(config, {"seed": int(seed)})
         (result, history, goal, crowd), cfg, robot_model = _run_controller_episode(
-            episode_config, controller_setup=controller_setup)
+            episode_config, setup=setup)
         results.append(result)
         with episode_path.open("a") as episode_log:
             episode_log.write(json.dumps(result, allow_nan=False)+"\n")
@@ -420,7 +438,6 @@ class Evaluator:
         configure_jax_platform_for_device(self.config.device)
 
     def evaluate_one_ckpt(self, checkpoint):
-        from env.jax_env.jax_social_nav import config_from_omegaconf
         from model import get_model_module
         from utils import load_jax_checkpoint
         from env import make_env
@@ -430,8 +447,8 @@ class Evaluator:
         params = load_jax_checkpoint(checkpoint)["params"]
         module = get_model_module(self.config.model)
         hparams = module.hparams_from_config(self.config.model, self.config.model.critic, act_dim=2)
-        env_cfg = config_from_omegaconf(self.config)
         env = make_env(self.config)
+        env_cfg = env.config_from_omegaconf(self.config)
         video_dir = self.save_dir/f"visualize_{checkpoint.stem}" if self.visualize else None
         return evaluate_env(env, params, hparams, env_cfg, module,
                             episodes=self.episodes, seeds=self.seeds, video_dir=video_dir)

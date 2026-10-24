@@ -15,7 +15,6 @@ from omegaconf import DictConfig, OmegaConf
 import wandb
 
 from model.ppo_base import normalize_robot_type
-from env.jax_env.jax_social_nav import config_from_omegaconf
 from model import get_model_module
 from utils import (
     format_jax_device_runtime_info,
@@ -207,7 +206,7 @@ class PPOTrainer:
         self.env_state = None
         self.global_step = 0
         self.current_lr = float(self.config.trainer.lr)
-        self.jax_env_cfg = config_from_omegaconf(self.config)
+        self.jax_env_cfg = self.env.config_from_omegaconf(self.config)
         self.jitted_train_step = self._make_jitted_train_step()
         self.lr_schedule = self._normalize_lr_schedule(getattr(self.config.trainer, "learning_rate_schedule", "linear"))
         self.lr_min = float(getattr(self.config.trainer, "learning_rate_schedule_min_lr", 0.0))

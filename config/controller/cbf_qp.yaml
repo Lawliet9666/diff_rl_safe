@@ -6,6 +6,7 @@ solver:
   eps_abs: 1.0e-9
   eps_rel: 1.0e-9
   max_iter: 10000
+  adaptive_rho_interval: 25  # Fixed update period; avoids timing-dependent rho adaptation.
   feasibility_tolerance: 1.0e-6
   polishing: false
   verbose: false
