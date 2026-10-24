@@ -14,8 +14,7 @@ from env.obstacle.obstacle import (
     outer_motion_bounds,
     workspace_center_radii,
 )
-from env.robots import angle_normalize, robot_step
-from model.ppo_base import normalize_robot_type
+from env.robots import Robot, angle_normalize, make_robot, robot_step
 
 
 class JaxSocialNavConfig(NamedTuple):
@@ -26,8 +25,7 @@ class JaxSocialNavConfig(NamedTuple):
     robot_type: str
     goal_tolerance: float
     robot_radius: float
-    robot_vmax: float
-    robot_omega_max: float
+    robot: Robot
     robot_goal_min_distance: float
     robot_goal_max_tries: int
     num_humans: int
@@ -56,6 +54,7 @@ class JaxSocialNavConfig(NamedTuple):
     discomfort_dist: float
     discomfort_penalty_factor: float
     potential_factor: float
+    progress_speed_scale: float
     back_factor: float
     spin_factor: float
     omega_delta_factor: float
@@ -122,7 +121,11 @@ def config_from_omegaconf(config) -> JaxSocialNavConfig:
     avoid_robot_ratio = float(_cfg_get(social_force, "avoid_robot_ratio", 1.0))
     if avoid_robot_ratio < 0.0 or avoid_robot_ratio > 1.0:
         raise ValueError("env.social_force.avoid_robot_ratio must satisfy 0 <= ratio <= 1")
-    robot_type = normalize_robot_type(_cfg_get(robot_cfg, "type", "unicycle"))
+    robot_type = str(robot_cfg.type).strip().lower()
+    robot = make_robot(robot_type, robot_cfg)
+    progress_speed_scale = float(reward.progress_speed_scale)
+    if not np.isfinite(progress_speed_scale) or progress_speed_scale <= 0:
+        raise ValueError("env.reward.progress_speed_scale must be finite and positive")
     omega_delta_factor = float(_cfg_get(reward, "omega_delta_factor", 0.0))
     if omega_delta_factor < 0.0:
         raise ValueError("env.reward.omega_delta_factor must be >= 0")
@@ -134,10 +137,9 @@ def config_from_omegaconf(config) -> JaxSocialNavConfig:
         workspace_low=jnp.asarray(workspace_low, dtype=jnp.float32),
         workspace_high=jnp.asarray(workspace_high, dtype=jnp.float32),
         robot_type=robot_type,
-        goal_tolerance=float(robot_cfg.goal_tolerance),
+        goal_tolerance=float(env_cfg.robot_goal.tolerance),
         robot_radius=float(robot_cfg.radius),
-        robot_vmax=float(robot_cfg.v_max),
-        robot_omega_max=float(_cfg_get(robot_cfg, "omega_max", 0.0)),
+        robot=robot,
         robot_goal_min_distance=float(env_cfg.robot_goal.min_distance),
         robot_goal_max_tries=int(env_cfg.robot_goal.max_tries),
         num_humans=num_humans,
@@ -166,6 +168,7 @@ def config_from_omegaconf(config) -> JaxSocialNavConfig:
         discomfort_dist=float(reward.discomfort_dist),
         discomfort_penalty_factor=float(reward.discomfort_penalty_factor),
         potential_factor=float(reward.potential_factor),
+        progress_speed_scale=progress_speed_scale,
         back_factor=float(_cfg_get(reward, "back_factor", 0.0)),
         spin_factor=float(_cfg_get(reward, "spin_factor", 0.0)),
         omega_delta_factor=omega_delta_factor,
@@ -194,6 +197,18 @@ def robot_boundary_violation(cfg: JaxSocialNavConfig, state: JaxSocialNavState):
     return jnp.maximum(jnp.max(violations, axis=1), 0.0).astype(jnp.float32)
 
 
+def navigation_done(cfg: JaxSocialNavConfig, state: JaxSocialNavState,
+                    dist_to_goal, min_clearance):
+    """Navigation outcomes independent of robot controls and reward shaping."""
+    next_step = state.step_count + 1
+    collision = min_clearance < 0.0
+    success = dist_to_goal < cfg.goal_tolerance
+    timeout = (next_step >= cfg.max_steps) & ~(collision | success)
+    done = collision | success | timeout
+    return (done, success, collision, timeout, next_step,
+            robot_boundary_violation(cfg, state))
+
+
 def reward_done(
     cfg: JaxSocialNavConfig,
     state: JaxSocialNavState,
@@ -202,18 +217,16 @@ def reward_done(
     action,
     omega_delta_penalty,
 ):
-    next_step = state.step_count + 1
-    collision = min_clearance < 0.0
-    success = dist_to_goal < cfg.goal_tolerance
-    timeout = (next_step >= cfg.max_steps) & ~(collision | success)
+    done, success, collision, timeout, next_step, boundary_violation = navigation_done(
+        cfg, state, dist_to_goal, min_clearance)
     discomfort = (min_clearance < cfg.discomfort_dist) & ~(collision | success | timeout)
     potential = ~(collision | success | timeout | discomfort)
 
     potential_reward = cfg.potential_factor * (state.prev_dist_to_goal - dist_to_goal)
     potential_reward = jnp.clip(
         potential_reward,
-        -cfg.dt * cfg.robot_vmax * cfg.potential_factor,
-        cfg.dt * cfg.robot_vmax * cfg.potential_factor,
+        -cfg.dt * cfg.progress_speed_scale * cfg.potential_factor,
+        cfg.dt * cfg.progress_speed_scale * cfg.potential_factor,
     )
     reward = jnp.where(collision, cfg.collision_penalty, 0.0)
     reward = jnp.where(success, cfg.success_reward, reward)
@@ -223,7 +236,6 @@ def reward_done(
 
     spin = -cfg.spin_factor * jnp.square(action[:, 1] * cfg.dt)
     back = jnp.where(action[:, 0] < 0.0, -cfg.back_factor * jnp.abs(action[:, 0]), 0.0)
-    boundary_violation = robot_boundary_violation(cfg, state)
     boundary_penalty = cfg.boundary_penalty_factor * boundary_violation
     reward = (
         reward
@@ -233,7 +245,6 @@ def reward_done(
         - boundary_penalty
         - omega_delta_penalty
     ) / 10.0
-    done = collision | success | timeout
     return reward, done, success, collision, timeout, next_step, boundary_violation
 
 
@@ -277,7 +288,7 @@ def _reset_one(cfg: JaxSocialNavConfig, rng):
     key_active = jax.random.fold_in(rng, 17)
     angle = jax.random.uniform(key_robot, (), minval=0.0, maxval=2.0 * jnp.pi, dtype=jnp.float32)
     robot_pos = ellipse_points_from_angles(cfg, angle)
-    if cfg.robot_type == "unicycle":
+    if cfg.robot_type != "single_integrator":
         robot_theta = jax.random.uniform(
             key_theta,
             (),
@@ -414,13 +425,15 @@ def reset_env_with_keys(cfg: JaxSocialNavConfig, keys):
 def step_env(cfg: JaxSocialNavConfig, state: JaxSocialNavState, action, rng):
     action = jnp.asarray(action, dtype=jnp.float32)
     omega_delta = jnp.zeros_like(action[:, 1])
+    omega_delta_penalty = jnp.zeros_like(omega_delta)
     if cfg.omega_delta_factor > 0.0:
-        commanded_omega = jnp.clip(action[:, 1], -cfg.robot_omega_max, cfg.robot_omega_max)
+        omega_max = cfg.robot.omega_max
+        commanded_omega = jnp.clip(action[:, 1], -omega_max, omega_max)
         omega_delta = jnp.where(
             state.step_count <= 0, 0.0, commanded_omega - state.robot_action[:, 1]
         )
-    omega_denom = jnp.maximum(jnp.asarray(cfg.robot_omega_max, dtype=jnp.float32), 1.0e-6)
-    omega_delta_penalty = cfg.omega_delta_factor * jnp.square(omega_delta / omega_denom)
+        omega_denom = jnp.maximum(jnp.asarray(omega_max, dtype=jnp.float32), 1.0e-6)
+        omega_delta_penalty = cfg.omega_delta_factor * jnp.square(omega_delta / omega_denom)
     next_robot_state, robot_vel, robot_action = robot_step(cfg, state.robot_state, action)
     moved_state = state._replace(robot_state=next_robot_state, robot_vel=robot_vel, robot_action=robot_action)
 

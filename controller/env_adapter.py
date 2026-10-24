@@ -8,7 +8,7 @@ from omegaconf import OmegaConf
 
 from env.jax_env.jax_social_nav import (
     config_from_omegaconf, reset_env, step_env, compute_distances,
-    reward_done, _clip_robot_to_outer_bounds,
+    navigation_done, _clip_robot_to_outer_bounds,
 )
 from env.obstacle.obstacle import advance_obstacles
 from env.robots import make_robot
@@ -46,9 +46,8 @@ def _finish_navigation_step(cfg, crowd, state, rng):
     correction = bounded.robot_state[0, :2]-state[:2]
     state = state.at[:2].set(bounded.robot_state[0, :2])
     dist, clearance = compute_distances(cfg, bounded)
-    _, done, success, collision, timeout, next_step, violation = reward_done(
-        cfg, bounded, dist, clearance, jnp.zeros_like(bounded.robot_action),
-        jnp.zeros_like(bounded.episode_returns))
+    done, success, collision, timeout, next_step, violation = navigation_done(
+        cfg, bounded, dist, clearance)
     lengths = bounded.episode_lengths+1
     bounded = bounded._replace(step_count=next_step, prev_dist_to_goal=dist.astype(jnp.float32),
                                episode_lengths=jnp.where(done, 0, lengths))
@@ -61,8 +60,7 @@ def _finish_navigation_step(cfg, crowd, state, rng):
 def step_quadrotor(cfg, crowd, state, action, rng, robot_cfg, max_integration_dt, state_tolerance):
     """Replace robot propagation; retain robot-first crowd/boundary/terminal semantics.
 
-    Shared reward_done supplies navigation flags with zero auxiliary reward inputs.
-    Its unicycle reward is discarded, never reported as a quadrotor/RL reward.
+    Shared navigation_done supplies termination flags without evaluating a planar reward.
     """
     count = max(1, math.ceil(cfg.dt/max_integration_dt))
     dt = cfg.dt/count
@@ -118,15 +116,12 @@ class NavigationEnv:
     def __init__(self, config, *, state_tolerance):
         if config.env.get("backend", "jax") != "jax":
             raise ValueError("NavigationEnv requires the JAX crowd backend")
-        raw = OmegaConf.to_container(config, resolve=True)
-        self.robot_type = str(raw["robot"]["type"])
+        self.robot_type = str(config.robot.type)
         if self.robot_type not in {"unicycle", "quadrotor", "humanoid"}:
             raise ValueError("NavigationEnv supports unicycle, quadrotor and humanoid")
-        self.robot_config = OmegaConf.create(raw["robot"])
-        self.robot = make_robot(self.robot_type, self.robot_config)
-        # The shared crowd stores the planar navigation projection only.
-        raw["robot"]["type"] = "unicycle"
-        self.cfg = config_from_omegaconf(OmegaConf.create(raw))
+        self.robot_config = OmegaConf.create(OmegaConf.to_container(config.robot, resolve=True))
+        self.cfg = config_from_omegaconf(config)
+        self.robot = self.cfg.robot
         self.qp_obs_top_k = config.controller.get("qp_obs_top_k")
         if self.qp_obs_top_k is not None and (
                 not isinstance(self.qp_obs_top_k, int) or isinstance(self.qp_obs_top_k, bool)

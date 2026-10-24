@@ -19,6 +19,7 @@ safety_margin: 0.05
 farthest_dist: 20.0
 
 robot_goal:
+  tolerance: ${robot.goal_tolerance}
   min_distance: ${robot.goal_min_distance}
   max_tries: 100
 
@@ -52,6 +53,7 @@ reward:
   collision_penalty: -20.0
   discomfort_dist: 0.25
   discomfort_penalty_factor: 10.0
+  progress_speed_scale: ${robot.reward.progress_speed_scale}
   potential_factor: ${robot.reward.potential_factor}
   back_factor: ${robot.reward.back_factor}
   spin_factor: ${robot.reward.spin_factor}

@@ -1,11 +1,23 @@
 type: unicycle
-radius: 0.3
-v_max: 1.5
-omega_max: 1.57
-goal_tolerance: 0.6
-goal_min_distance: 6.0
 
+# Collision geometry.
+radius: 0.3  # m; collision-envelope radius
+
+# Control input limits.
+# u = [v, omega]; enforced by QP bounds and environment clipping.
+v_max: 1.5  # m/s; |v| <= v_max (body-frame forward speed)
+omega_max: 1.57  # rad/s; |omega| <= omega_max (yaw rate)
+
+# State limits.
+# No additional state bounds are configured for this model.
+
+# Navigation settings.
+goal_tolerance: 0.6  # m; goal arrival distance
+goal_min_distance: 6.0  # m; minimum sampled start-to-goal distance
+
+# Reward settings (not dynamics or control input limits).
 reward:
-  potential_factor: 3.0
-  back_factor: 0.1
-  spin_factor: 4.5
+  progress_speed_scale: ${robot.v_max}  # m/s; reward clipping follows the speed limit
+  potential_factor: 3.0  # Goal-progress reward weight.
+  back_factor: 0.1  # Backward-motion penalty weight.
+  spin_factor: 4.5  # Turning penalty weight.

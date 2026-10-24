@@ -131,7 +131,7 @@ class CraxSocialNav(SafeGoalPoint):
         self._force_range = jnp.asarray(self.model.actuator_forcerange[:2], jnp.float32)
         self._ctrl_range = jnp.asarray(self.model.actuator_ctrlrange[:2], jnp.float32)
         self._gain = jnp.float32(self.model.actuator_gainprm[1, 0])
-        self._bounds = jnp.asarray([cfg.robot_vmax, cfg.robot_omega_max], jnp.float32)
+        self._bounds = jnp.asarray(cfg.robot.input_bounds()[1], jnp.float32)
         self._reset_with_keys = jax.jit(jax.vmap(self.reset), inline=True)
 
     def _mocap(self, physics, crowd, positions):

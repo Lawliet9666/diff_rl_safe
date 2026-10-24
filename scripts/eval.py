@@ -103,7 +103,7 @@ def _build_controller_config(config):
         names = {f.name for f in fields(UnicycleConfig)}-common.keys()-{"v_max", "goal_tolerance"}
         params = robot_section(c.unicycle, names, "controller.unicycle")
         params["weights"] = tuple(params["weights"])
-        return UnicycleConfig(goal_tolerance=float(r.goal_tolerance),
+        return UnicycleConfig(goal_tolerance=float(e.robot_goal.tolerance),
                               v_max=float(r.v_max), **common, **params)
     elif r.type == "humanoid":
         common.pop("omega_max")  # Physical limits belong to the robot model.
@@ -111,7 +111,7 @@ def _build_controller_config(config):
         params = robot_section(c.humanoid, names, "controller.humanoid")
         for name in ("gains", "weights"):
             params[name] = tuple(params[name])
-        return HumanoidConfig(dt=float(e.dt), goal_tolerance=float(r.goal_tolerance),
+        return HumanoidConfig(dt=float(e.dt), goal_tolerance=float(e.robot_goal.tolerance),
                               **common, **params)
     else:
         physical = {name: float(r[name]) for name in

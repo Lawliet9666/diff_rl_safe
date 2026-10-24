@@ -33,11 +33,9 @@ def make_robot(robot_type, config=None, **parameters):
 
 def robot_step(cfg, state, action):
     """Keep the original SocialNav tuple and its planar integration behavior."""
-    parameters = dict(v_max=cfg.robot_vmax)
-    if cfg.robot_type == "unicycle":
-        parameters['omega_max'] = cfg.robot_omega_max
-    robot = make_robot(cfg.robot_type, **parameters)
-    return tuple(robot.step_with_info(state, action, cfg.dt))
+    if cfg.robot_type not in {"single_integrator", "unicycle"}:
+        raise ValueError("planar robot_step requires single_integrator or unicycle")
+    return tuple(cfg.robot.step_with_info(state, action, cfg.dt))
 
 
 __all__ = ['Robot', 'RobotStep', 'SingleIntegratorRobot', 'UnicycleRobot',

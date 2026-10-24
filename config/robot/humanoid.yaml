@@ -1,19 +1,34 @@
 type: humanoid
-radius: 0.3
-vf_min: -1.0
-vf_max: 1.5
-vl_min: -1.0
-vl_max: 1.0
-af_max: 4.0
-al_max: 2.0
-omega_max: 1.0
-max_integration_dt: 0.01
 
-# Navigation metadata for the shared crowd adapter; no RL action mapping.
-v_max: ${robot.vf_max}
-goal_tolerance: 0.6
-goal_min_distance: 6.0
+# Collision geometry.
+radius: 0.3  # m; collision-envelope radius
+
+# Control input limits.
+# u = [a_f, a_l, omega]; a_f/a_l change body-frame forward/lateral velocities.
+# Enforced by hard QP bounds; the integrator does not clip inputs.
+af_max: 4.0  # m/s^2; |a_f| <= af_max
+al_max: 2.0  # m/s^2; |a_l| <= al_max
+omega_max: 1.0  # rad/s; |omega| <= omega_max (yaw rate)
+
+# State limits.
+# Enforced by QP next-step constraints; the integrator does not clip velocities.
+vf_min: -1.0  # m/s; body-frame v_f >= vf_min
+vf_max: 1.5  # m/s; body-frame v_f <= vf_max
+vl_min: -1.0  # m/s; body-frame v_l >= vl_min
+vl_max: 1.0  # m/s; body-frame v_l <= vl_max
+
+# Numerical integration.
+# The environment/control period is env.dt.
+max_integration_dt: 0.01  # s; maximum robot integration substep
+
+# Navigation settings.
+goal_tolerance: 0.6  # m; goal arrival distance
+goal_min_distance: 6.0  # m; minimum sampled start-to-goal distance
+
+# Reward settings (not dynamics or control input limits).
+# Controller-only evaluation for this model returns reward=None.
 reward:
-  potential_factor: 3.0
-  back_factor: 0.1
-  spin_factor: 4.5
+  progress_speed_scale: 1.5  # m/s; progress-reward clipping scale
+  potential_factor: 3.0  # Goal-progress reward weight.
+  back_factor: 0.1  # Backward-motion penalty weight.
+  spin_factor: 4.5  # Turning penalty weight.

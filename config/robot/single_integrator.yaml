@@ -1,10 +1,22 @@
 type: single_integrator
-radius: 0.3
-v_max: 1.5
-goal_tolerance: 0.3
-goal_min_distance: 8.0
 
+# Collision geometry.
+radius: 0.3  # m; collision-envelope radius
+
+# Control input limits.
+# u = [v_x, v_y] in world coordinates; the environment clips Euclidean speed.
+v_max: 1.5  # m/s; sqrt(v_x^2 + v_y^2) <= v_max
+
+# State limits.
+# No additional state bounds are configured for this model.
+
+# Navigation settings.
+goal_tolerance: 0.3  # m; goal arrival distance
+goal_min_distance: 8.0  # m; minimum sampled start-to-goal distance
+
+# Reward settings (not dynamics or control input limits).
 reward:
-  potential_factor: 2.0
-  back_factor: 0.0
-  spin_factor: 0.0
+  progress_speed_scale: ${robot.v_max}  # m/s; reward clipping follows the speed limit
+  potential_factor: 2.0  # Goal-progress reward weight.
+  back_factor: 0.0  # Backward-motion penalty weight.
+  spin_factor: 0.0  # Turning penalty weight.

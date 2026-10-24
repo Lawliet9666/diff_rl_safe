@@ -26,9 +26,10 @@ quadrotor:
     thrust_tracking_gain: 4.0
     acceleration_limits: [2.0, 2.0, 2.0]  # Desired acceleration clipping only.
   cbf:
-    gains: [1.5, 1.5, 1.5]  # Obstacle and altitude HOCBFs.
-    thrust_gain: 4.0
-    tilt_gain: 4.0
+    # Barrier rates [1/s]; permitted state ranges are defined in config/robot/quadrotor.yaml.
+    gains: [1.5, 1.5, 1.5]  # Recursive k1/k2/k3 for obstacle and altitude HOCBFs.
+    thrust_gain: 4.0  # k_T in nu >= -k_T*(T-T_min), nu <= k_T*(T_max-T).
+    tilt_gain: 4.0  # k_tilt in d(R33)/dt + k_tilt*(R33-cos(tilt_max)) >= 0.
   qp:
     weights: [1.0, 1.0, 1.0, 1.0e-6]  # World jerk x/y/z, then yaw-rate tie-breaker.
 
