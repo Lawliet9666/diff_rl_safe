@@ -8,8 +8,7 @@ radius: 0.3  # m; collision-envelope radius
 a_max: 2.0  # m/s^2; |a_x| and |a_y| <= a_max
 
 # State limits.
-# Euclidean speed bound, checked by check_state_limits; integration does not clip.
-v_max: 1.5  # m/s; sqrt(v_x^2 + v_y^2) <= v_max
+# No velocity bound; state checks require finite values only.
 
 # Navigation metadata, matching single_integrator for controlled comparisons.
 goal_tolerance: 0.3  # m; goal arrival distance
@@ -17,7 +16,7 @@ goal_min_distance: 8.0  # m; minimum sampled start-to-goal distance
 
 # Reward metadata; the model addition does not introduce an RL action mapping.
 reward:
-  progress_speed_scale: ${robot.v_max}
+  progress_speed_scale: 1.5  # Reward normalization only; not a speed limit.
   potential_factor: 2.0
   back_factor: 0.0
   spin_factor: 0.0

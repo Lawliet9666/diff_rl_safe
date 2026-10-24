@@ -232,7 +232,7 @@ def _run_controller_episode(config, *, controller_setup=None):
         if bool(metrics["physical_state_limit"]):
             status = "state_limit"
             if robot == "double_integrator":
-                reason = "double-integrator Euclidean speed limit exceeded during integration"
+                reason = "double-integrator state became nonfinite during integration"
             else:
                 reason = ("humanoid body velocity limit exceeded during integration" if robot == "humanoid"
                           else "quadrotor altitude, tilt or thrust limit exceeded during integration")
