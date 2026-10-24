@@ -15,8 +15,8 @@ _MODELS = dict(single_integrator=SingleIntegratorRobot, unicycle=UnicycleRobot,
 def make_robot(robot_type, config=None, **parameters):
     """Select a model by name, using explicit physical parameters or a config.
 
-    A supplied config must contain every physical field of the selected model.
-    Extra controller settings are ignored; no controller module is imported.
+    A supplied config must contain every original physical field. Keyword-only
+    settings may use robot defaults or explicit overrides. No controller is imported.
     """
     if config is None and not isinstance(robot_type, str):
         config = robot_type
@@ -26,8 +26,12 @@ def make_robot(robot_type, config=None, **parameters):
         raise ValueError(f"unsupported robot type {robot_type!r}; expected one of {tuple(_MODELS)}")
     model = _MODELS[name]
     if config is not None:
-        parameters = {**{field.name: getattr(config, field.name) for field in fields(model)},
-                      **parameters}
+        configured = {field.name: getattr(config, field.name) for field in fields(model)
+                      if not field.kw_only or hasattr(config, field.name)}
+        parameters = {**configured, **parameters}
+    for field in fields(model):
+        if field.name in parameters and isinstance(field.default, tuple):
+            parameters[field.name] = tuple(parameters[field.name])
     return model(**parameters)
 
 

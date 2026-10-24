@@ -1,10 +1,10 @@
 """Uniform reset/observe/step over the original JAX crowd and reduced robot models."""
 from typing import NamedTuple
+from dataclasses import fields
 import math
 
 import jax
 import jax.numpy as jnp
-from omegaconf import OmegaConf
 
 from env.jax_env.jax_social_nav import (
     config_from_omegaconf, reset_env, step_env, compute_distances,
@@ -15,9 +15,9 @@ from env.robots import make_robot
 from env.robots.base import Obstacles
 
 
-def quadrotor_from_crowd(crowd, robot_cfg):
-    state = make_robot("quadrotor", robot_cfg).hover_state(
-        jnp.array([crowd.robot_state[0, 0], crowd.robot_state[0, 1], robot_cfg.altitude]))
+def quadrotor_from_crowd(crowd, robot):
+    state = robot.hover_state(
+        jnp.array([crowd.robot_state[0, 0], crowd.robot_state[0, 1], robot.altitude]))
     yaw = crowd.robot_state[0, 2].astype(state.dtype)
     c, s = jnp.cos(yaw), jnp.sin(yaw)
     R = jnp.array([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]])
@@ -57,14 +57,13 @@ def _finish_navigation_step(cfg, crowd, state, rng):
     return state, bounded, done, metrics
 
 
-def step_quadrotor(cfg, crowd, state, action, rng, robot_cfg, max_integration_dt, state_tolerance):
+def step_quadrotor(cfg, crowd, state, action, rng, robot, max_integration_dt, state_tolerance):
     """Replace robot propagation; retain robot-first crowd/boundary/terminal semantics.
 
     Shared navigation_done supplies termination flags without evaluating a planar reward.
     """
     count = max(1, math.ceil(cfg.dt/max_integration_dt))
     dt = cfg.dt/count
-    robot = make_robot("quadrotor", robot_cfg)
 
     def advance(x, _):
         y = robot.step(x, action, dt)
@@ -73,9 +72,9 @@ def step_quadrotor(cfg, crowd, state, action, rng, robot_cfg, max_integration_dt
     state, substeps = jax.lax.scan(advance, state, None, length=count)
     state, bounded, done, metrics = _finish_navigation_step(
         cfg, project_quadrotor(crowd, state), state, rng)
-    domain = jnp.stack([substeps[:, 2]-robot_cfg.altitude_min,
-        robot_cfg.altitude_max-substeps[:, 2], substeps[:, 14]-math.cos(robot_cfg.tilt_max),
-        substeps[:, 15]-robot_cfg.thrust_min, robot_cfg.thrust_max-substeps[:, 15]])
+    domain = jnp.stack([substeps[:, 2]-robot.altitude_min,
+        robot.altitude_max-substeps[:, 2], substeps[:, 14]-math.cos(robot.tilt_max),
+        substeps[:, 15]-robot.thrust_min, robot.thrust_max-substeps[:, 15]])
     metrics["physical_state_limit"] = jnp.any(domain < -state_tolerance)
     return state, bounded, done, metrics
 
@@ -113,15 +112,22 @@ class NavigationEnv:
     Quadrotor/humanoid transitions preserve navigation flags and return reward=None.
     """
 
-    def __init__(self, config, *, state_tolerance):
+    def __init__(self, config, *, state_tolerance, robot=None):
         if config.env.get("backend", "jax") != "jax":
             raise ValueError("NavigationEnv requires the JAX crowd backend")
         self.robot_type = str(config.robot.type)
         if self.robot_type not in {"unicycle", "quadrotor", "humanoid"}:
             raise ValueError("NavigationEnv supports unicycle, quadrotor and humanoid")
-        self.robot_config = OmegaConf.create(OmegaConf.to_container(config.robot, resolve=True))
         self.cfg = config_from_omegaconf(config)
-        self.robot = self.cfg.robot
+        if robot is None:
+            from . import _build_robot
+            robot = _build_robot(config)
+        if (type(robot) is not type(self.cfg.robot)
+                or any(getattr(robot, field.name) != getattr(self.cfg.robot, field.name)
+                       for field in fields(robot) if not field.kw_only)):
+            raise ValueError("controller robot must match config.robot dynamics")
+        self.robot = robot
+        self.cfg = self.cfg._replace(robot=robot)
         self.qp_obs_top_k = config.controller.get("qp_obs_top_k")
         if self.qp_obs_top_k is not None and (
                 not isinstance(self.qp_obs_top_k, int) or isinstance(self.qp_obs_top_k, bool)
@@ -132,7 +138,7 @@ class NavigationEnv:
             raise ValueError("state_tolerance must be positive")
         self.integration_dt = self.cfg.dt
         if self.robot_type in {"quadrotor", "humanoid"}:
-            self.max_integration_dt = float(self.robot_config.max_integration_dt)
+            self.max_integration_dt = float(config.robot.max_integration_dt)
             if not math.isfinite(self.max_integration_dt) or self.max_integration_dt <= 0:
                 raise ValueError("robot.max_integration_dt must be positive")
             self.integration_dt /= max(1, math.ceil(self.cfg.dt/self.max_integration_dt))
@@ -141,7 +147,7 @@ class NavigationEnv:
     def reset(self, rng):
         crowd = reset_env(self.cfg, rng, 1)
         if self.robot_type == "quadrotor":
-            state = quadrotor_from_crowd(crowd, self.robot_config)
+            state = quadrotor_from_crowd(crowd, self.robot)
             crowd = project_quadrotor(crowd, state)
         elif self.robot_type == "humanoid":
             state = jnp.concatenate([crowd.robot_state[0].astype(jnp.float64), jnp.zeros(2)])
@@ -175,7 +181,7 @@ class NavigationEnv:
         if self.robot_type == "quadrotor":
             robot, crowd, done, info = step_quadrotor(
                 self.cfg, state.crowd, state.robot, action, rng,
-                self.robot_config, self.max_integration_dt, self.state_tolerance)
+                self.robot, self.max_integration_dt, self.state_tolerance)
             reward = None
             applied = action
         elif self.robot_type == "humanoid":

@@ -93,17 +93,17 @@ class Robot(ABC):
         """Return the [x, y, yaw] projection used by the crowd and renderer."""
         raise NotImplementedError
 
-    def cbf_constraints(self, state, obstacles, cbf_config):
+    def cbf_constraints(self, state, obstacles, dt):
         """Return A, b and initial domain conditions for A@u+b >= 0."""
         raise NotImplementedError(
             f"CBF constraints are not implemented for {type(self).__name__}")
 
-    def nominal_control(self, state, goal, control_config):
+    def nominal_control(self, state, goal):
         """Return a goal-tracking reference without applying a safety filter."""
         raise NotImplementedError(
             f"Nominal control is not implemented for {type(self).__name__}")
 
-    def control_output_matrix(self, state, control_config):
+    def control_output_matrix(self, state):
         """Map physical control to the motion output tracked by the controller."""
         raise NotImplementedError(
             f"Control output mapping is not implemented for {type(self).__name__}")

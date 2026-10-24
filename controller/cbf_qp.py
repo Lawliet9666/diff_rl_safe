@@ -10,7 +10,7 @@ import numpy as np
 import osqp
 from scipy import sparse
 
-from env.robots import UnicycleRobot, QuadrotorRobot, HumanoidRobot
+from env.robots import UnicycleRobot, HumanoidRobot
 from env.robots.base import check_obstacle_shapes
 
 
@@ -30,97 +30,6 @@ class SolverConfig:
                 or self.max_iter <= 0
                 or not isinstance(self.polishing, bool) or not isinstance(self.verbose, bool)):
             raise ValueError("invalid OSQP tolerances, iteration limit or logging settings")
-
-
-@dataclass(frozen=True)
-class UnicycleConfig:
-    goal_tolerance: float
-    radius: float = 0.3
-    margin: float = 0.05
-    lookahead: float = 0.2
-    alpha: float = 2.0
-    v_max: float = UnicycleRobot.v_max
-    omega_max: float = UnicycleRobot.omega_max
-    weights: tuple = (1., 1.)
-    position_gain: float = 1.0
-    solver: SolverConfig = SolverConfig()
-
-    def __post_init__(self):
-        vals = (self.radius, self.lookahead, self.alpha, self.v_max, self.omega_max,
-                self.position_gain, self.goal_tolerance, *self.weights)
-        if (not all(math.isfinite(v) and v > 0 for v in vals)
-                or not math.isfinite(self.margin) or self.margin < 0 or len(self.weights) != 2):
-            raise ValueError("radii, lookahead, gains and limits must be positive")
-
-
-@dataclass(frozen=True)
-class QuadrotorConfig:
-    mass: float = QuadrotorRobot.mass
-    gravity: float = QuadrotorRobot.gravity
-    radius: float = 0.3
-    margin: float = 0.05
-    gains: tuple = (1.5, 1.5, 1.5)
-    omega_max: float = QuadrotorRobot.omega_max
-    thrust_rate_max: float = QuadrotorRobot.thrust_rate_max
-    thrust_min: float = 2.0
-    thrust_max: float = 20.0
-    thrust_gain: float = 4.0
-    tilt_max: float = math.pi/4
-    tilt_gain: float = 4.0
-    altitude: float = QuadrotorRobot.altitude
-    altitude_min: float = 0.8
-    altitude_max: float = 1.6
-    weights: tuple = (1., 1., 1., 1e-6)
-    position_gain: float = 1.0
-    velocity_gain: float = 1.8
-    attitude_gain: float = 4.0
-    thrust_tracking_gain: float = 4.0
-    acceleration_limits: tuple = (2., 2., 2.)
-    solver: SolverConfig = SolverConfig()
-
-    def __post_init__(self):
-        positives = (self.mass, self.gravity, self.radius, *self.gains,
-                     self.omega_max, self.thrust_rate_max, self.thrust_gain,
-                     self.tilt_gain, self.thrust_min, *self.weights, self.position_gain,
-                     self.velocity_gain, self.attitude_gain, self.thrust_tracking_gain,
-                     *self.acceleration_limits)
-        if (not all(math.isfinite(v) and v > 0 for v in positives)
-                or not math.isfinite(self.margin) or self.margin < 0 or len(self.gains) != 3
-                or len(self.weights) != 4 or len(self.acceleration_limits) != 3
-                or not 0 < self.tilt_max < math.pi/2
-                or not self.altitude_min < self.altitude < self.altitude_max
-                or not self.thrust_min < self.mass*self.gravity < self.thrust_max):
-            raise ValueError("invalid quadrotor gains, physical limits or hover configuration")
-
-
-@dataclass(frozen=True)
-class HumanoidConfig:
-    goal_tolerance: float
-    dt: float
-    radius: float = 0.3
-    margin: float = 0.05
-    barrier: str = "distance"
-    gains: tuple = (1.5, 1.5)
-    alpha: float = 2.0
-    parabolic_gain: float = 1.0
-    clearance_gain: float = 1.0
-    speed_epsilon: float = 0.05
-    weights: tuple = (1., 1., 1.)
-    position_gain: float = 1.0
-    velocity_gain: float = 2.0
-    heading_gain: float = 2.0
-    solver: SolverConfig = SolverConfig()
-
-    def __post_init__(self):
-        values = (self.goal_tolerance, self.dt, self.radius, *self.gains,
-                  self.alpha, self.parabolic_gain, self.clearance_gain,
-                  self.speed_epsilon, *self.weights, self.position_gain,
-                  self.velocity_gain, self.heading_gain)
-        if (self.barrier not in {"distance", "parabolic"}
-                or len(self.gains) != 2 or len(self.weights) != 3
-                or not all(math.isfinite(v) and v > 0 for v in values)
-                or not math.isfinite(self.margin) or self.margin < 0):
-            raise ValueError("invalid humanoid barrier, gains or controller limits")
 
 
 class ControlResult(NamedTuple):
@@ -271,23 +180,25 @@ def solve_slack_qp(nominal, constraints, low, high, weights, *, soft_mask,
     return result, slack
 
 
-@partial(jax.jit, static_argnames=("robot", "control_config"))
-def _control_output_matrix(robot, state, control_config):
-    return robot.control_output_matrix(state, control_config)
+@partial(jax.jit, static_argnames=("robot",))
+def _control_output_matrix(robot, state):
+    return robot.control_output_matrix(state)
 
 
-def control_residual(robot, state, action, obstacles, control_config):
+def control_residual(robot, state, action, obstacles, dt):
     """Evaluate the actual applied input, including a requested fallback input."""
-    constraints = robot.cbf_constraints(state, obstacles, control_config)
+    constraints = robot.cbf_constraints(state, obstacles, dt)
     low, high = robot.input_bounds()
     return jnp.concatenate([constraints.A@action+constraints.b, action-low, high-action])
 
 
-def _solve_controller_qp(robot, state, nominal, obstacles, cbf_config, *, slack_weight):
+def _solve_controller_qp(robot, state, nominal, obstacles, dt, *, solver, slack_weight):
     """Prepare shared QP inputs, then select hard or relaxed obstacle constraints."""
+    if not math.isfinite(dt) or dt <= 0:
+        raise ValueError("dt must be finite and positive")
     if isinstance(robot, HumanoidRobot):
         check_obstacle_shapes(obstacles)
-        if not bool(robot.barrier_domain_valid(state, obstacles, cbf_config)):
+        if not bool(robot.barrier_domain_valid(state, obstacles)):
             # Do not extend the parabolic sqrt through collision or execute an old
             # acceleration. Return an explicit failed result before calling OSQP.
             action = jnp.full(robot.control_dim, jnp.nan)
@@ -296,10 +207,10 @@ def _solve_controller_qp(robot, state, nominal, obstacles, cbf_config, *, slack_
                                    False, False, float("nan"), "invalid barrier domain", 0)
             return result, jnp.zeros_like(obstacles.mask)
     low, high = robot.input_bounds()
-    constraints = robot.cbf_constraints(state, obstacles, cbf_config)
-    weights = jnp.asarray(cbf_config.weights)
-    options = dict(solver=cbf_config.solver,
-                   output_matrix=_control_output_matrix(robot, state, cbf_config))
+    constraints = robot.cbf_constraints(state, obstacles, dt)
+    weights = jnp.asarray(robot.weights)
+    options = dict(solver=solver,
+                   output_matrix=_control_output_matrix(robot, state))
     if slack_weight == 0:
         result = solve_qp(nominal, constraints, low, high, weights, **options)
         return result, jnp.zeros_like(obstacles.mask)
@@ -307,14 +218,14 @@ def _solve_controller_qp(robot, state, nominal, obstacles, cbf_config, *, slack_
                           soft_mask=obstacles.mask, slack_weight=slack_weight, **options)
 
 
-def solve_cbf_qp(robot, state, nominal, obstacles, cbf_config):
+def solve_cbf_qp(robot, state, nominal, obstacles, dt, *, solver=SolverConfig()):
     """Apply a hard CBF-QP to an externally supplied nominal input."""
-    result, _ = _solve_controller_qp(robot, state, nominal, obstacles, cbf_config,
-                                     slack_weight=0.0)
+    result, _ = _solve_controller_qp(robot, state, nominal, obstacles, dt,
+                                     solver=solver, slack_weight=0.0)
     return result
 
 
-def generate_action(robot, state, nominal, obstacles, control_config, *, slack_weight=0.0):
+def generate_action(robot, state, nominal, obstacles, dt, *, solver=SolverConfig(), slack_weight=0.0):
     """Filter a supplied nominal physical input; zero selects the hard QP.
 
     nominal has robot.control_dim entries in the robot input units.
@@ -326,6 +237,6 @@ def generate_action(robot, state, nominal, obstacles, control_config, *, slack_w
     validate_slack_weight(slack_weight)
     if slack_weight > 0 and not isinstance(robot, UnicycleRobot):
         raise ValueError("positive slack_weight currently supports unicycle only")
-    result, slack = _solve_controller_qp(robot, state, nominal, obstacles, control_config,
-                                        slack_weight=slack_weight)
+    result, slack = _solve_controller_qp(robot, state, nominal, obstacles, dt,
+                                        solver=solver, slack_weight=slack_weight)
     return result.action, {"nominal": nominal, "qp": result, "slack": slack}

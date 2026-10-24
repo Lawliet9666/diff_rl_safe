@@ -86,7 +86,7 @@ def _prepare_controller(config):
             or workspace[0] >= workspace[1] or workspace[2] >= workspace[3]):
         raise ValueError("env.workspace requires finite increasing x/y bounds")
     controller = make_controller(config)
-    return controller.keywords["control_config"], controller
+    return controller
 
 
 def _controller_failure_diagnostics(state, nominal, obs, result):
@@ -108,30 +108,29 @@ def _controller_failure_diagnostics(state, nominal, obs, result):
 
 
 def _run_controller_episode(config, *, controller_setup=None):
-    """Run a fresh episode; reuse an optional batch (parameters, generator) pair."""
+    """Run a fresh episode using an optional immutable bound controller."""
     import jax
     import jax.numpy as jnp
     from controller.cbf_qp import control_residual
     from env.jax_env.jax_social_nav import compute_distances
     from controller.env_adapter import NavigationEnv
 
-    rcfg, generate_action = (_prepare_controller(config) if controller_setup is None
-                             else controller_setup)
+    controller = _prepare_controller(config) if controller_setup is None else controller_setup
+    robot_model = controller.args[0]
+    solver = controller.keywords["solver"]
     robot, scenario, seed = str(config.robot.type), str(config.env.scenario), int(config.seed)
     use_slack = config.controller.slack_weight > 0
-    env = NavigationEnv(config, state_tolerance=rcfg.solver.feasibility_tolerance)
+    env = NavigationEnv(config, robot=robot_model, state_tolerance=solver.feasibility_tolerance)
     cfg = env.cfg
     navigation_state = env.reset(jax.random.PRNGKey(seed))
     state, crowd = navigation_state
     goal = env.observe(navigation_state).goal
-    robot_model = env.robot
     nominal_control = jax.jit(
-        type(robot_model).nominal_control, static_argnames=("self", "control_config"))
+        type(robot_model).nominal_control, static_argnames=("self",))
 
     def action_fn(observation):
-        nominal = nominal_control(robot_model, observation.robot, observation.goal, rcfg)
-        return generate_action(robot_model, observation.robot, nominal,
-                               observation.obstacles)
+        nominal = nominal_control(robot_model, observation.robot, observation.goal)
+        return controller(observation.robot, nominal, observation.obstacles)
 
     action_fn(env.observe(navigation_state))[0].block_until_ready()
     history = {k: [] for k in ["time", "state", "centers", "status", "active_obstacles",
@@ -193,14 +192,14 @@ def _run_controller_episode(config, *, controller_setup=None):
         executed = metrics["applied_action"]
         previous_action = executed
         fallback_steps += int(used_fallback)
-        applied_residual = np.asarray(control_residual(robot_model, previous, executed, obs, rcfg))
+        applied_residual = np.asarray(control_residual(robot_model, previous, executed, obs, cfg.dt))
         residual = float(np.min(applied_residual))
         min_residual = min(min_residual, residual)
         slack = np.asarray(diagnostics["slack"])
         cbf_residual = applied_residual[:cfg.num_humans]
-        cbf_satisfied = bool(np.all(cbf_residual >= -rcfg.solver.feasibility_tolerance))
+        cbf_satisfied = bool(np.all(cbf_residual >= -solver.feasibility_tolerance))
         history["active_obstacles"][-1] = (np.abs(cbf_residual+slack)
-            <= rcfg.solver.feasibility_tolerance) & (np.asarray(obs.mask) > .5)
+            <= solver.feasibility_tolerance) & (np.asarray(obs.mask) > .5)
         path_length += float(np.linalg.norm(np.asarray(state[:2])-np.asarray(previous[:2])))
         for name, value in dict(nominal=nominal, action=executed, requested_action=requested,
                 min_residual=residual, initial_safe=bool(result.initial_safe),
@@ -244,22 +243,22 @@ def _run_controller_episode(config, *, controller_setup=None):
         dt=cfg.dt, integration_dt=integration_dt, crowd_dt=cfg.dt,
         max_steps=cfg.max_steps, goal_tolerance=cfg.goal_tolerance, num_humans=cfg.num_humans,
         clearance_sampling="environment_step",
-        config={**asdict(rcfg), "workspace": tuple(float(v) for v in
+        config={**asdict(robot_model), "dt": cfg.dt, "solver": asdict(solver), "workspace": tuple(float(v) for v in
             [*config.env.workspace.x, *config.env.workspace.y])})
     summary.update(
         controller=str(config.controller.type)+("_slack" if use_slack else ""),
         slack_weight=config.controller.slack_weight,
         slack_steps=int(np.count_nonzero(np.any(
-            history["slack"] > rcfg.solver.feasibility_tolerance, axis=1))),
+            history["slack"] > solver.feasibility_tolerance, axis=1))),
         slack_sum=finite(np.sum(history["slack"])),
         max_slack=finite(np.max(history["slack"])) if history["slack"].size else 0.,
         cbf_violation_steps=int(np.count_nonzero(~history["cbf_satisfied"].astype(bool))),
         **{name: finite(np.min(history[name])) if history[name].size else None for name in
            ("min_cbf_residual", "min_relaxed_cbf_residual", "min_input_residual")})
-    return (summary, history, np.asarray(goal), crowd), cfg, rcfg
+    return (summary, history, np.asarray(goal), crowd), cfg, robot_model
 
 
-def _render_controller_frame(cfg, history, index, crowd, robot, robot_cfg):
+def _render_controller_frame(cfg, history, index, crowd, robot, robot_model):
     """Only adapt state; all pixels/layout come from the existing RL renderer."""
     import jax.numpy as jnp
     from controller.env_adapter import project_quadrotor, project_humanoid
@@ -276,19 +275,19 @@ def _render_controller_frame(cfg, history, index, crowd, robot, robot_cfg):
         human_positions=jnp.asarray(history["centers"][index])[None, ...],
         step_count=jnp.array([round(float(history["time"][index])/cfg.dt)], jnp.int32))
     qp_viz = dict(topk_ids=np.flatnonzero(history["active_obstacles"][index]),
-                  lookahead_distance=robot_cfg.lookahead if robot == "unicycle" else 0.)
+                  lookahead_distance=robot_model.lookahead if robot == "unicycle" else 0.)
     return render_jax_social_nav_frame(cfg, frame_state, status=str(history["status"][index]),
         robot_traj=history["state"][:index+1, :2], qp_viz=qp_viz, robot_type=robot)
 
 
-def _save_controller_video(path, cfg, history, crowd, robot, robot_cfg):
+def _save_controller_video(path, cfg, history, crowd, robot, robot_model):
     # The existing encoder accepts an indexable iterable. Render lazily to avoid
     # retaining hundreds of full-resolution frames in the controller-only run.
     class Frames:
         def __getitem__(self, index):
             if index >= len(history["state"]):
                 raise IndexError(index)
-            return _render_controller_frame(cfg, history, index, crowd, robot, robot_cfg)
+            return _render_controller_frame(cfg, history, index, crowd, robot, robot_model)
     save_video(path, Frames(), fps=1./cfg.dt)
 
 
@@ -333,7 +332,7 @@ def evaluate_controller(config, output, *, visualize=False, seeds=None, episodes
     episode_path.write_text("")
     for index, seed in enumerate(seed_values):
         episode_config = OmegaConf.merge(config, {"seed": int(seed)})
-        (result, history, goal, crowd), cfg, rcfg = _run_controller_episode(
+        (result, history, goal, crowd), cfg, robot_model = _run_controller_episode(
             episode_config, controller_setup=controller_setup)
         results.append(result)
         with episode_path.open("a") as episode_log:
@@ -344,7 +343,7 @@ def evaluate_controller(config, output, *, visualize=False, seeds=None, episodes
             video_dir = output/f"visualize_{controller}"
             video_dir.mkdir(parents=True, exist_ok=True)
             filename = f"episode_{index:04d}_seed_{int(seed)}_{result['status']}.mp4"
-            _save_controller_video(video_dir/filename, cfg, history, crowd, result["robot"], rcfg)
+            _save_controller_video(video_dir/filename, cfg, history, crowd, result["robot"], robot_model)
             print(f"Video: {video_dir/filename}")
 
     episode_metrics = [_controller_evaluation_metrics(result) for result in results]

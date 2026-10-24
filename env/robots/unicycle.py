@@ -1,6 +1,7 @@
 """Unicycle equations and the original SocialNav Euler/clipping convention."""
-from dataclasses import dataclass
+from dataclasses import KW_ONLY, dataclass
 from functools import partial
+import math
 from typing import ClassVar
 
 import jax
@@ -15,6 +16,31 @@ class UnicycleRobot(Robot):
     omega_max: float = 1.57
     state_dim: ClassVar[int] = 3
     control_dim: ClassVar[int] = 2
+
+    # Optional settings; ordinary environment construction needs only the physical fields above.
+    _: KW_ONLY
+
+    # Collision and navigation.
+    radius: float = 0.3
+    margin: float = 0.05
+    goal_tolerance: float = 0.6
+
+    # Nominal tracking; lookahead is shared with the CBF and QP.
+    lookahead: float = 0.2
+    position_gain: float = 1.0
+
+    # CBF decay.
+    alpha: float = 2.0
+
+    # QP tracking weights.
+    weights: tuple = (1.0, 1.0)
+
+    def __post_init__(self):
+        vals = (self.radius, self.lookahead, self.alpha, self.v_max, self.omega_max,
+                self.position_gain, self.goal_tolerance, *self.weights)
+        if (not all(math.isfinite(v) and v > 0 for v in vals)
+                or not math.isfinite(self.margin) or self.margin < 0 or len(self.weights) != 2):
+            raise ValueError("radii, lookahead, gains and limits must be positive")
 
     def dynamics(self, state, action):
         v, omega = action
@@ -41,40 +67,40 @@ class UnicycleRobot(Robot):
     def navigation_state(self, state):
         return state
 
-    def control_output_matrix(self, state, control_config):
+    def control_output_matrix(self, state):
         """J maps [v, omega] to the world velocity of the lookahead point."""
         c, s = jnp.cos(state[2]), jnp.sin(state[2])
-        ell = control_config.lookahead
+        ell = self.lookahead
         return jnp.array([[c, -ell*s], [s, ell*c]])
 
-    def barrier(self, state, obstacles, cfg):
+    def barrier(self, state, obstacles):
         """Return h, dh_dx_g and obstacle_motion; h_dot = dh_dx_g@u-obstacle_motion.
 
         dh_dx_g is the state gradient of h multiplied by the input map g.
         """
         heading = jnp.array([jnp.cos(state[2]), jnp.sin(state[2])])
-        q = state[:2]+cfg.lookahead*heading
+        q = state[:2]+self.lookahead*heading
         rel = q-obstacles.centers
         # Inflating by lookahead also separates the actual robot disk.
-        distance = cfg.radius+obstacles.radii+cfg.margin+cfg.lookahead
+        distance = self.radius+obstacles.radii+self.margin+self.lookahead
         h = jnp.sum(rel*rel, axis=-1)-distance**2
-        dh_dx_g = 2*rel@self.control_output_matrix(state, cfg)
+        dh_dx_g = 2*rel@self.control_output_matrix(state)
         obstacle_motion = 2*jnp.sum(rel*obstacles.velocities, axis=1)
         return h, dh_dx_g, obstacle_motion
 
-    @partial(jax.jit, static_argnames=("self", "cbf_config"))
-    def cbf_constraints(self, state, obstacles, cbf_config):
+    @partial(jax.jit, static_argnames=("self",))
+    def cbf_constraints(self, state, obstacles, dt):
         """First-order obstacle CBFs for the unicycle lookahead point."""
         check_obstacle_shapes(obstacles)
-        h, dh_dx_g, obstacle_motion = self.barrier(state, obstacles, cbf_config)
-        b = cbf_config.alpha*h-obstacle_motion
+        h, dh_dx_g, obstacle_motion = self.barrier(state, obstacles)
+        b = self.alpha*h-obstacle_motion
         return masked_rows(dh_dx_g, b, h[:, None], obstacles.mask)
 
-    def nominal_control(self, state, goal, control_config):
+    def nominal_control(self, state, goal):
         """Represent the old planar go-to-goal velocity in physical input coordinates."""
         delta = goal-state[:2]
-        velocity = control_config.position_gain*delta
+        velocity = self.position_gain*delta
         speed = jnp.linalg.norm(velocity)
         velocity *= jnp.minimum(1., self.v_max/jnp.maximum(speed, 1e-9))
-        nominal = jnp.linalg.solve(self.control_output_matrix(state, control_config), velocity)
-        return jnp.where(jnp.linalg.norm(delta) < control_config.goal_tolerance, jnp.zeros(2), nominal)
+        nominal = jnp.linalg.solve(self.control_output_matrix(state), velocity)
+        return jnp.where(jnp.linalg.norm(delta) < self.goal_tolerance, jnp.zeros(2), nominal)
