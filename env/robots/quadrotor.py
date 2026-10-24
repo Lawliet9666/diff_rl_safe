@@ -57,10 +57,10 @@ class QuadrotorRobot(Robot):
     thrust_tracking_gain: float
     acceleration_limits: tuple
 
-    # CBF decay.
-    gains: tuple
-    thrust_gain: float
-    tilt_gain: float
+    # Linear class-K rates for obstacle/altitude, thrust and tilt CBFs.
+    kappa: tuple
+    kappa_thrust: float
+    kappa_tilt: float
 
     # QP tracking weights.
     weights: tuple
@@ -72,7 +72,7 @@ class QuadrotorRobot(Robot):
         parameters = _control_parameters(
             config.controller.quadrotor,
             ("position_gain", "velocity_gain", "attitude_gain", "thrust_tracking_gain",
-             "acceleration_limits", "gains", "thrust_gain", "tilt_gain", "weights"),
+             "acceleration_limits", "kappa", "kappa_thrust", "kappa_tilt", "weights"),
             "controller.quadrotor")
         parameters.update(mass=r.mass, gravity=r.gravity, altitude=r.altitude,
                           omega_max=r.omega_max, thrust_rate_max=r.thrust_rate_max,
@@ -80,18 +80,18 @@ class QuadrotorRobot(Robot):
                           thrust_min=r.thrust_min, thrust_max=r.thrust_max,
                           tilt_max=r.tilt_max, altitude_min=r.altitude_min,
                           altitude_max=r.altitude_max)
-        for name in ("gains", "weights", "acceleration_limits"):
+        for name in ("kappa", "weights", "acceleration_limits"):
             parameters[name] = tuple(parameters[name])
         return cls(**parameters)
 
     def __post_init__(self):
-        positives = (self.mass, self.gravity, self.radius, *self.gains,
-                     self.omega_max, self.thrust_rate_max, self.thrust_gain,
-                     self.tilt_gain, self.thrust_min, *self.weights, self.position_gain,
+        positives = (self.mass, self.gravity, self.radius, *self.kappa,
+                     self.omega_max, self.thrust_rate_max, self.kappa_thrust,
+                     self.kappa_tilt, self.thrust_min, *self.weights, self.position_gain,
                      self.velocity_gain, self.attitude_gain, self.thrust_tracking_gain,
                      *self.acceleration_limits)
         if (not all(math.isfinite(v) and v > 0 for v in positives)
-                or not math.isfinite(self.margin) or self.margin < 0 or len(self.gains) != 3
+                or not math.isfinite(self.margin) or self.margin < 0 or len(self.kappa) != 3
                 or len(self.weights) != 4 or len(self.acceleration_limits) != 3
                 or not 0 < self.tilt_max < math.pi/2
                 or not self.altitude_min < self.altitude < self.altitude_max
@@ -172,7 +172,7 @@ class QuadrotorRobot(Robot):
     def altitude_barrier(self, state):
         """Floor/ceiling h, h_dot, h_ddot, dh_ddot_dx_g and h_dddot_drift.
 
-        h_dddot = dh_ddot_dx_g@u+h_dddot_drift; decay gains are external.
+        h_dddot = dh_ddot_dx_g@u+h_dddot_drift; class-K rates are applied separately.
         """
         p, v, _, _ = unpack(state)
         a, J = self.acceleration(state), self.jerk_map(state)
@@ -199,12 +199,12 @@ class QuadrotorRobot(Robot):
     def cbf_constraints(self, state, obstacles, dt):
         """Assemble obstacle/altitude HOCBFs and tilt/thrust state constraints."""
         check_obstacle_shapes(obstacles)
-        obs = _hocbf(*self.barrier(state, obstacles), gains=self.gains)
+        obs = _hocbf(*self.barrier(state, obstacles), kappa=self.kappa)
         obs = masked_rows(obs.A, obs.b, obs.domain.reshape((-1, 3)), obstacles.mask)
-        altitude = _hocbf(*self.altitude_barrier(state), gains=self.gains)
+        altitude = _hocbf(*self.altitude_barrier(state), kappa=self.kappa)
         h, dh_dx_g = self.state_barriers(state)
-        b = jnp.array([self.tilt_gain*h[0], self.thrust_gain*h[1],
-                       self.thrust_gain*h[2]])
+        b = jnp.array([self.kappa_tilt*h[0], self.kappa_thrust*h[1],
+                       self.kappa_thrust*h[2]])
         return join_constraints(obs, altitude, Constraints(dh_dx_g, b, h))
 
     def nominal_control(self, state, goal):

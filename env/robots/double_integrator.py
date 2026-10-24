@@ -22,7 +22,7 @@ class DoubleIntegratorRobot(Robot):
     goal_tolerance: float
     position_gain: float
     velocity_gain: float
-    gains: tuple
+    kappa: tuple  # Linear class-K rates [kappa_1, kappa_2].
     weights: tuple
     state_dim: ClassVar[int] = 4
     control_dim: ClassVar[int] = 2
@@ -32,12 +32,12 @@ class DoubleIntegratorRobot(Robot):
         """Read physical, navigation and CBF-QP parameters from Hydra."""
         parameters = _control_parameters(
             config.controller.double_integrator,
-            ("position_gain", "velocity_gain", "gains", "weights"),
+            ("position_gain", "velocity_gain", "kappa", "weights"),
             "controller.double_integrator")
         parameters.update(a_max=config.robot.a_max,
                           radius=config.robot.radius, margin=float(config.env.safety_margin),
                           goal_tolerance=float(config.env.robot_goal.tolerance))
-        for name in ("gains", "weights"):
+        for name in ("kappa", "weights"):
             parameters[name] = tuple(parameters[name])
         return cls(**parameters)
 
@@ -45,8 +45,8 @@ class DoubleIntegratorRobot(Robot):
         if not math.isfinite(self.a_max) or self.a_max <= 0:
             raise ValueError("double-integrator acceleration limit must be finite and positive")
         values = (self.radius, self.goal_tolerance, self.position_gain,
-                  self.velocity_gain, *self.gains, *self.weights)
-        if (len(self.gains) != 2 or len(self.weights) != 2
+                  self.velocity_gain, *self.kappa, *self.weights)
+        if (len(self.kappa) != 2 or len(self.weights) != 2
                 or not all(math.isfinite(value) and value > 0 for value in values)
                 or not math.isfinite(self.margin) or self.margin < 0):
             raise ValueError("invalid double-integrator CBF gains or weights")
@@ -98,9 +98,9 @@ class DoubleIntegratorRobot(Robot):
         """Second-order obstacle CBFs, evaluated at control instants."""
         check_obstacle_shapes(obstacles)
         h, h_dot, A, drift = self.distance_barrier(state, obstacles)
-        k1, k2 = self.gains
-        b = drift + (k1+k2)*h_dot + k1*k2*h
-        domain = jnp.stack([h, h_dot+k1*h], axis=1)
+        kappa1, kappa2 = self.kappa
+        b = drift + (kappa1+kappa2)*h_dot + kappa1*kappa2*h
+        domain = jnp.stack([h, h_dot+kappa1*h], axis=1)
         return masked_rows(A, b, domain, obstacles.mask)
 
     def nominal_control(self, state, goal):

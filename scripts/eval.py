@@ -59,7 +59,7 @@ def save_video(path, frames, fps=30):
 
 
 def _prepare_controller(config):
-    """Validate settings and create the shared parameters and action generator."""
+    """Validate run settings and return the robot, solver and action function."""
     from controller import make_controller
 
     if not isinstance(config.seed, int) or isinstance(config.seed, bool):
@@ -85,8 +85,7 @@ def _prepare_controller(config):
     if (len(workspace) != 4 or not all(math.isfinite(v) for v in workspace)
             or workspace[0] >= workspace[1] or workspace[2] >= workspace[3]):
         raise ValueError("env.workspace requires finite increasing x/y bounds")
-    controller = make_controller(config)
-    return controller
+    return make_controller(config)
 
 
 def _controller_failure_diagnostics(state, nominal, obs, result):
@@ -108,17 +107,16 @@ def _controller_failure_diagnostics(state, nominal, obs, result):
 
 
 def _run_controller_episode(config, *, controller_setup=None):
-    """Run a fresh episode using an optional immutable bound controller."""
+    """Run a fresh episode with an optional (robot, solver, action_fn) setup."""
     import jax
     import jax.numpy as jnp
-    from controller.cbf_qp import control_residual, select_obstacles
+    from controller.cbf_qp import control_residual
     from controller import Obstacles
     from env import make_env
     from env.jax_env.jax_social_nav import compute_distances, config_from_omegaconf
 
-    controller = _prepare_controller(config) if controller_setup is None else controller_setup
-    robot_model = controller.args[0]
-    solver = controller.keywords["solver"]
+    robot_model, solver, controller = (
+        _prepare_controller(config) if controller_setup is None else controller_setup)
     robot, scenario, seed = str(config.robot.type), str(config.env.scenario), int(config.seed)
     use_slack = config.controller.slack_weight > 0
     env = make_env(config)
@@ -137,7 +135,6 @@ def _run_controller_episode(config, *, controller_setup=None):
         obstacles = Obstacles(current.human_positions[0].astype(jnp.float64),
             current.human_vels[0].astype(jnp.float64),
             current.human_radii[0].astype(jnp.float64), current.human_mask[0])
-        obstacles = select_obstacles(x[:2], obstacles, config.controller.qp_obs_top_k)
         return x, current.goal_pos[0].astype(jnp.float64), obstacles
 
     def action_fn(observation):
@@ -175,9 +172,10 @@ def _run_controller_episode(config, *, controller_setup=None):
         start = time.perf_counter()
         action, diagnostics = action_fn(observation)
         action.block_until_ready()
-        # Preserve the timing field; it now includes nominal action generation.
+        # Includes nominal generation, obstacle selection and the QP solve.
         solve_ms = (time.perf_counter()-start)*1000
         nominal, result = diagnostics["nominal"], diagnostics["qp"]
+        obs = obs._replace(mask=diagnostics["obstacle_mask"])
         violations += int(not bool(result.initial_safe))
         used_fallback = not bool(result.valid)
         if used_fallback:

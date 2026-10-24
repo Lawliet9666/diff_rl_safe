@@ -26,23 +26,23 @@ def _parabolic_value(z, w, radius, cfg):
 
 @dataclass(frozen=True)
 class DistanceCBFParams:
-    gains: tuple
+    kappa: tuple  # Linear class-K rates [kappa_1, kappa_2].
 
     def __post_init__(self):
-        if len(self.gains) != 2 or not all(math.isfinite(v) and v > 0 for v in self.gains):
+        if len(self.kappa) != 2 or not all(math.isfinite(v) and v > 0 for v in self.kappa):
             raise ValueError("invalid humanoid distance CBF gains")
 
 
 @dataclass(frozen=True)
 class ParabolicCBFParams:
-    alpha: float
+    kappa: tuple  # Linear class-K rate [kappa_1].
     parabolic_gain: float
     clearance_gain: float
     speed_epsilon: float
 
     def __post_init__(self):
-        values = (self.alpha, self.parabolic_gain, self.clearance_gain, self.speed_epsilon)
-        if not all(math.isfinite(v) and v > 0 for v in values):
+        values = (*self.kappa, self.parabolic_gain, self.clearance_gain, self.speed_epsilon)
+        if len(self.kappa) != 1 or not all(math.isfinite(v) and v > 0 for v in values):
             raise ValueError("invalid humanoid parabolic CBF parameters")
 
 
@@ -92,8 +92,7 @@ class HumanoidRobot(Robot):
             section,
             ("barrier", "position_gain", "velocity_gain", "heading_gain", "weights", *cbf_names),
             "controller.humanoid", selected_cbf=barrier)
-        if barrier == "distance":
-            parameters["gains"] = tuple(parameters["gains"])
+        parameters["kappa"] = tuple(parameters["kappa"])
         parameters["cbf"] = cbf_type(**{name: parameters.pop(name) for name in cbf_names})
         parameters.update(vf_min=r.vf_min, vf_max=r.vf_max, vl_min=r.vl_min,
                           vl_max=r.vl_max, af_max=r.af_max, al_max=r.al_max,
@@ -222,12 +221,12 @@ class HumanoidRobot(Robot):
         check_obstacle_shapes(obstacles)
         if self.barrier == "distance":
             h, h_dot, A, h_ddot_drift = self.distance_barrier(state, obstacles)
-            k1, k2 = self.cbf.gains
-            b = h_ddot_drift+(k1+k2)*h_dot+k1*k2*h
-            domain = jnp.stack([h, h_dot+k1*h], axis=1)
+            kappa1, kappa2 = self.cbf.kappa
+            b = h_ddot_drift+(kappa1+kappa2)*h_dot+kappa1*kappa2*h
+            domain = jnp.stack([h, h_dot+kappa1*h], axis=1)
         elif self.barrier == "parabolic":
             h, q, A, h_dot_drift = self.parabolic_barrier(state, obstacles)
-            b = h_dot_drift+self.cbf.alpha*h
+            b = h_dot_drift+self.cbf.kappa[0]*h
             domain = jnp.stack([h, q], axis=1)
         else:
             raise ValueError("humanoid barrier must be distance or parabolic")

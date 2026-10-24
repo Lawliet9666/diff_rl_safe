@@ -26,8 +26,8 @@ class UnicycleRobot(Robot):
     lookahead: float
     position_gain: float
 
-    # CBF decay.
-    alpha: float
+    # Linear class-K rate: alpha_1(s) = kappa[0]*s.
+    kappa: tuple
 
     # QP tracking weights.
     weights: tuple
@@ -37,19 +37,21 @@ class UnicycleRobot(Robot):
         """Extract this robot's parameters from the complete Hydra configuration."""
         r = config.robot
         parameters = _control_parameters(
-            config.controller.unicycle, ("lookahead", "position_gain", "alpha", "weights"),
+            config.controller.unicycle, ("lookahead", "position_gain", "kappa", "weights"),
             "controller.unicycle")
         parameters.update(v_max=r.v_max, omega_max=r.omega_max, radius=r.radius,
                           margin=float(config.env.safety_margin),
                           goal_tolerance=float(config.env.robot_goal.tolerance))
-        parameters["weights"] = tuple(parameters["weights"])
+        for name in ("kappa", "weights"):
+            parameters[name] = tuple(parameters[name])
         return cls(**parameters)
 
     def __post_init__(self):
-        vals = (self.radius, self.lookahead, self.alpha, self.v_max, self.omega_max,
+        vals = (self.radius, self.lookahead, *self.kappa, self.v_max, self.omega_max,
                 self.position_gain, self.goal_tolerance, *self.weights)
         if (not all(math.isfinite(v) and v > 0 for v in vals)
-                or not math.isfinite(self.margin) or self.margin < 0 or len(self.weights) != 2):
+                or not math.isfinite(self.margin) or self.margin < 0
+                or len(self.kappa) != 1 or len(self.weights) != 2):
             raise ValueError("radii, lookahead, gains and limits must be positive")
 
     def dynamics(self, state, action):
@@ -106,7 +108,7 @@ class UnicycleRobot(Robot):
         """First-order obstacle CBFs for the unicycle lookahead point."""
         check_obstacle_shapes(obstacles)
         h, dh_dx_g, obstacle_motion = self.barrier(state, obstacles)
-        b = self.alpha*h-obstacle_motion
+        b = self.kappa[0]*h-obstacle_motion
         return masked_rows(dh_dx_g, b, h[:, None], obstacles.mask)
 
     def nominal_control(self, state, goal):

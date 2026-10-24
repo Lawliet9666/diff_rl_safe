@@ -10,12 +10,13 @@ solver:
   polishing: false
   verbose: false
 
+# Linear class-K functions: alpha_i(s) = kappa_i*s; rates are positive [1/s].
 unicycle:
   lookahead: 0.2  # Shared tracking point for nominal control, CBF and QP.
   nominal:
     position_gain: 1.0
   cbf:
-    alpha: 2.0
+    kappa: [2.0]  # [kappa_1]: h_dot + kappa_1*h >= 0.
   qp:
     weights: [1.0, 1.0]  # World velocity x/y of the lookahead point.
 
@@ -27,10 +28,9 @@ quadrotor:
     thrust_tracking_gain: 4.0
     acceleration_limits: [2.0, 2.0, 2.0]  # Desired acceleration clipping only.
   cbf:
-    # Barrier rates [1/s]; permitted state ranges are defined in config/robot/quadrotor.yaml.
-    gains: [1.5, 1.5, 1.5]  # Recursive k1/k2/k3 for obstacle and altitude HOCBFs.
-    thrust_gain: 4.0  # k_T in nu >= -k_T*(T-T_min), nu <= k_T*(T_max-T).
-    tilt_gain: 4.0  # k_tilt in d(R33)/dt + k_tilt*(R33-cos(tilt_max)) >= 0.
+    kappa: [1.5, 1.5, 1.5]  # [kappa_1, kappa_2, kappa_3]: obstacle/altitude HOCBFs.
+    kappa_thrust: 4.0  # First-order thrust CBF rate [1/s].
+    kappa_tilt: 4.0  # First-order tilt CBF rate [1/s].
   qp:
     weights: [1.0, 1.0, 1.0, 1.0e-6]  # World jerk x/y/z, then yaw-rate tie-breaker.
 
@@ -42,11 +42,11 @@ humanoid:
     heading_gain: 2.0
   cbf:
     distance:
-      gains: [1.5, 1.5]
+      kappa: [1.5, 1.5]  # [kappa_1, kappa_2]: recursive distance HOCBF.
     parabolic:
-      alpha: 2.0
-      parabolic_gain: 1.0
-      clearance_gain: 1.0
+      kappa: [2.0]  # [kappa_1]: h_dot + kappa_1*h >= 0.
+      parabolic_gain: 1.0  # Barrier curvature; not a class-K rate.
+      clearance_gain: 1.0  # Barrier clearance term; not a class-K rate.
       speed_epsilon: 0.05  # Smooth speed regularization used in content.tex.
   qp:
     weights: [1.0, 1.0, 1.0]  # Forward/lateral acceleration, then yaw rate.
@@ -56,6 +56,6 @@ double_integrator:
     position_gain: 1.0
     velocity_gain: 2.0
   cbf:
-    gains: [1.5, 1.5]  # Second-order distance CBF rates [1/s].
+    kappa: [1.5, 1.5]  # [kappa_1, kappa_2]: recursive distance HOCBF.
   qp:
     weights: [1.0, 1.0]  # World acceleration x/y.

@@ -21,7 +21,7 @@ def _required_section(node, names, label):
 
 
 def make_controller(config):
-    """Bind a configured robot, environment period and common solver settings."""
+    """Return (robot, solver, action_fn), binding settings only for action calls."""
     if config.controller.type != "cbf_qp":
         raise ValueError(f"unsupported controller type: {config.controller.type!r}")
     top_k = config.controller.qp_obs_top_k
@@ -40,4 +40,6 @@ def make_controller(config):
     values = _required_section(config.controller.solver,
                                [field.name for field in fields(SolverConfig)], "controller.solver")
     solver = SolverConfig(**values)
-    return partial(generate_action, robot, dt=dt, solver=solver, slack_weight=weight)
+    action_fn = partial(generate_action, robot, dt=dt, solver=solver, slack_weight=weight,
+                        qp_obs_top_k=top_k)
+    return robot, solver, action_fn

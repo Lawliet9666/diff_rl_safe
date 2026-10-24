@@ -57,12 +57,13 @@ def join_constraints(*blocks):
                          for i in range(3)))
 
 
-def _hocbf(h, h_dot, h_ddot, dh_ddot_dx_g, h_dddot_drift, gains):
-    k1, k2, k3 = gains
-    psi1 = h_dot+k1*h
-    psi2 = h_ddot+(k1+k2)*h_dot+k1*k2*h
-    b = (h_dddot_drift+(k1+k2+k3)*h_ddot
-         +(k1*k2+k1*k3+k2*k3)*h_dot+k1*k2*k3*h)
+def _hocbf(h, h_dot, h_ddot, dh_ddot_dx_g, h_dddot_drift, kappa):
+    # Recursive psi_i = d(psi_{i-1})/dt + kappa_i*psi_{i-1}; psi_0 = h.
+    kappa1, kappa2, kappa3 = kappa
+    psi1 = h_dot+kappa1*h
+    psi2 = h_ddot+(kappa1+kappa2)*h_dot+kappa1*kappa2*h
+    b = (h_dddot_drift+(kappa1+kappa2+kappa3)*h_ddot
+         +(kappa1*kappa2+kappa1*kappa3+kappa2*kappa3)*h_dot+kappa1*kappa2*kappa3*h)
     domain = jnp.stack([h, psi1, psi2], axis=-1).reshape(-1)
     return Constraints(dh_ddot_dx_g, b, domain)
 

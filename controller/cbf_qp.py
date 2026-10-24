@@ -18,6 +18,8 @@ def select_obstacles(position, obstacles, top_k):
     """Restrict QP visibility while preserving original scene indices and shapes."""
     if top_k is None:
         return obstacles
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
+        raise ValueError("controller.qp_obs_top_k must be null or a positive integer")
     distance = jnp.linalg.norm(obstacles.centers-position, axis=1)
     _, indices = jax.lax.top_k(-jnp.where(obstacles.mask > .5, distance, jnp.inf),
                               min(top_k, obstacles.mask.size))
@@ -236,10 +238,13 @@ def solve_cbf_qp(robot, state, nominal, obstacles, dt, *, solver=SolverConfig())
     return result
 
 
-def generate_action(robot, state, nominal, obstacles, dt, *, solver=SolverConfig(), slack_weight=0.0):
+def generate_action(robot, state, nominal, obstacles, dt, *, solver=SolverConfig(),
+                    slack_weight=0.0, qp_obs_top_k=None):
     """Filter a supplied nominal physical input; zero selects the hard QP.
 
     nominal has robot.control_dim entries in the robot input units.
+    Pass the full obstacle scene; qp_obs_top_k=None uses all valid obstacles.
+    Diagnostics include obstacle_mask in the original scene order and shape.
     Slack currently relaxes only unicycle obstacle constraints. CBF calculations
     are JIT-compiled; the CPU OSQP solve is not differentiable.
     Invalid results keep their NaN action; callers must inspect qp.valid and
@@ -248,6 +253,8 @@ def generate_action(robot, state, nominal, obstacles, dt, *, solver=SolverConfig
     validate_slack_weight(slack_weight)
     if slack_weight > 0 and not isinstance(robot, UnicycleRobot):
         raise ValueError("positive slack_weight currently supports unicycle only")
+    obstacles = select_obstacles(state[:2], obstacles, qp_obs_top_k)
     result, slack = _solve_controller_qp(robot, state, nominal, obstacles, dt,
                                         solver=solver, slack_weight=slack_weight)
-    return result.action, {"nominal": nominal, "qp": result, "slack": slack}
+    return result.action, {"nominal": nominal, "qp": result, "slack": slack,
+                           "obstacle_mask": obstacles.mask}
