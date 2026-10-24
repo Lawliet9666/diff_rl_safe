@@ -46,7 +46,7 @@ class SolverConfig:
 
 
 class ControlResult(NamedTuple):
-    action: jax.Array          # NaN when the candidate is invalid; never executed.
+    action: jax.Array          # NaN only for confirmed primal infeasibility; never executed.
     candidate: jax.Array
     residual: jax.Array        # Original CBF/input residuals, without relaxation.
     kkt_residual: jax.Array    # Scaled primal, dual and complementarity residuals.
@@ -63,8 +63,8 @@ def _tracking_qp_data(nominal, constraints, low, high, weights, output_matrix):
         raise ValueError("CBF-QP requires JAX_ENABLE_X64=true before importing JAX")
     nominal, low, high, weights = [np.asarray(x, dtype=np.float64)
                                    for x in (nominal, low, high, weights)]
-    if nominal.ndim != 1:
-        raise ValueError("nominal must be a vector")
+    if nominal.ndim != 1 or nominal.size == 0:
+        raise ValueError("nominal must be a nonempty vector")
     d = nominal.shape[0]
     if low.shape != (d,) or high.shape != (d,):
         raise ValueError("nominal and bounds must be vectors of equal size")
@@ -75,7 +75,8 @@ def _tracking_qp_data(nominal, constraints, low, high, weights, output_matrix):
     cbf_A, cbf_b = np.asarray(constraints.A, dtype=np.float64), np.asarray(constraints.b, dtype=np.float64)
     if cbf_A.ndim != 2 or cbf_A.shape[1] != d or cbf_b.shape != (cbf_A.shape[0],):
         raise ValueError("expected constraint matrix [M,D] and offset [M]")
-    if (not all(np.isfinite(x).all() for x in (nominal, low, high, weights, M, cbf_A, cbf_b))
+    domain = np.asarray(constraints.domain, dtype=np.float64)
+    if (not all(np.isfinite(x).all() for x in (nominal, low, high, weights, M, cbf_A, cbf_b, domain))
             or np.any(weights <= 0) or np.any(low > high)):
         raise ValueError("QP data must be finite, with positive weights and ordered bounds")
     MS = M*scale[None, :]
@@ -97,12 +98,24 @@ def _solve_qp_data(nominal, A, b, P, scale, domain, solver):
     lower = -b / row_scale
     q = -P @ (nominal/scale)
     problem = osqp.OSQP()
-    problem.setup(P=sparse.csc_matrix(np.triu(P)), q=q,
-                  A=sparse.csc_matrix(C), l=lower, u=np.full(len(b), np.inf),
-                  eps_abs=solver.eps_abs, eps_rel=solver.eps_rel,
-                  max_iter=solver.max_iter, polishing=solver.polishing,
-                  verbose=solver.verbose)
-    result = problem.solve(raise_error=False)
+    try:
+        problem.setup(P=sparse.csc_matrix(np.triu(P)), q=q,
+                      A=sparse.csc_matrix(C), l=lower, u=np.full(len(b), np.inf),
+                      eps_abs=solver.eps_abs, eps_rel=solver.eps_rel,
+                      max_iter=solver.max_iter, polishing=solver.polishing,
+                      verbose=solver.verbose)
+        result = problem.solve(raise_error=False)
+    except osqp.OSQPException as error:
+        raise RuntimeError(f"OSQP setup/solve failed: {error}") from error
+    status = str(result.info.status)
+    if status not in {"solved", "primal infeasible"}:
+        raise RuntimeError(f"OSQP failed: status={status}, iterations={result.info.iter}")
+    if status == "solved" and (result.x is None or result.y is None):
+        raise RuntimeError("OSQP reported solved without a primal/dual solution")
+    if status == "solved" and (
+            np.shape(result.x) != (d,) or np.shape(result.y) != (len(b),)
+            or not np.isfinite(result.x).all() or not np.isfinite(result.y).all()):
+        raise RuntimeError("OSQP returned a malformed or nonfinite primal/dual solution")
     candidate = (np.full(d, np.nan) if result.x is None
                  else np.asarray(result.x, dtype=np.float64) * scale)
     residual = A @ candidate + b
@@ -113,10 +126,13 @@ def _solve_qp_data(nominal, A, b, P, scale, domain, solver):
         kkt = np.array([max(0., float(np.max(-slack))),
                         np.max(np.abs(P@z + q + C.T@dual)),
                         max(float(np.max(np.abs(slack*dual))), float(np.max(dual)), 0.)])
-    status = str(result.info.status)
     valid = bool(status == "solved" and np.isfinite(candidate).all()
-                 and np.all(residual >= -tolerance)
+                 and np.isfinite(residual).all() and np.all(residual >= -tolerance)
                  and np.isfinite(kkt).all() and np.all(kkt <= tolerance))
+    if status == "solved" and not valid:
+        raise RuntimeError(
+            f"OSQP solution failed feasibility/KKT checks after {result.info.iter} iterations: "
+            f"min_residual={np.min(residual)}, kkt_residual={kkt.tolist()}")
     domain = np.asarray(domain)
     initial_safe = bool(np.isfinite(domain).all() and np.all(domain >= -tolerance))
     return ControlResult(jnp.asarray(candidate if valid else np.full(d, np.nan)),
@@ -205,20 +221,27 @@ def control_residual(robot, state, action, obstacles, dt):
     return jnp.concatenate([constraints.A@action+constraints.b, action-low, high-action])
 
 
-def _solve_controller_qp(robot, state, nominal, obstacles, dt, *, solver, slack_weight):
-    """Prepare shared QP inputs, then select hard or relaxed obstacle constraints."""
+def _validate_controller_inputs(robot, state, nominal, obstacles, dt):
+    """Reject malformed/nonfinite data while allowing finite unsafe states and references."""
     if not math.isfinite(dt) or dt <= 0:
         raise ValueError("dt must be finite and positive")
-    if isinstance(robot, HumanoidRobot):
-        check_obstacle_shapes(obstacles)
-        if not bool(robot.barrier_domain_valid(state, obstacles)):
-            # Do not extend the parabolic sqrt through collision or execute an old
-            # acceleration. Return an explicit failed result before calling OSQP.
-            action = jnp.full(robot.control_dim, jnp.nan)
-            residual = jnp.full(obstacles.mask.size+4+2*robot.control_dim, jnp.nan)
-            result = ControlResult(action, action, residual, jnp.full(3, jnp.inf),
-                                   False, False, float("nan"), "invalid barrier domain", 0)
-            return result, jnp.zeros_like(obstacles.mask)
+    if np.shape(state) != (robot.state_dim,):
+        raise ValueError(f"state must have shape ({robot.state_dim},)")
+    if np.shape(nominal) != (robot.control_dim,):
+        raise ValueError(f"nominal must have shape ({robot.control_dim},)")
+    if np.ndim(obstacles.centers) != 2:
+        raise ValueError("obstacle centers must have shape [N,2]")
+    check_obstacle_shapes(obstacles)
+    if not all(np.isfinite(np.asarray(value)).all() for value in (state, nominal, *obstacles)):
+        raise ValueError("state, nominal and obstacle data must be finite")
+    if np.any(np.asarray(obstacles.radii) < 0):
+        raise ValueError("obstacle radii must be nonnegative")
+
+
+def _solve_controller_qp(robot, state, nominal, obstacles, dt, *, solver, slack_weight):
+    """Prepare shared QP inputs, then select hard or relaxed obstacle constraints."""
+    if isinstance(robot, HumanoidRobot) and not bool(robot.barrier_domain_valid(state, obstacles)):
+        raise ValueError("parabolic CBF requires strict separation from inflated obstacles")
     low, high = robot.input_bounds()
     constraints = robot.cbf_constraints(state, obstacles, dt)
     weights = jnp.asarray(robot.weights)
@@ -232,7 +255,8 @@ def _solve_controller_qp(robot, state, nominal, obstacles, dt, *, solver, slack_
 
 
 def solve_cbf_qp(robot, state, nominal, obstacles, dt, *, solver=SolverConfig()):
-    """Apply a hard CBF-QP to an externally supplied nominal input."""
+    """Apply a hard CBF-QP; invalid data and numerical failures raise."""
+    _validate_controller_inputs(robot, state, nominal, obstacles, dt)
     result, _ = _solve_controller_qp(robot, state, nominal, obstacles, dt,
                                      solver=solver, slack_weight=0.0)
     return result
@@ -247,12 +271,13 @@ def generate_action(robot, state, nominal, obstacles, dt, *, solver=SolverConfig
     Diagnostics include obstacle_mask in the original scene order and shape.
     Slack currently relaxes only unicycle obstacle constraints. CBF calculations
     are JIT-compiled; the CPU OSQP solve is not differentiable.
-    Invalid results keep their NaN action; callers must inspect qp.valid and
-    qp.initial_safe before stepping.
+    Invalid data and numerical failures raise. Confirmed primal infeasibility
+    returns qp.valid=False with a NaN action. Inspect qp.initial_safe separately.
     """
     validate_slack_weight(slack_weight)
     if slack_weight > 0 and not isinstance(robot, UnicycleRobot):
         raise ValueError("positive slack_weight currently supports unicycle only")
+    _validate_controller_inputs(robot, state, nominal, obstacles, dt)
     obstacles = select_obstacles(state[:2], obstacles, qp_obs_top_k)
     result, slack = _solve_controller_qp(robot, state, nominal, obstacles, dt,
                                         solver=solver, slack_weight=slack_weight)

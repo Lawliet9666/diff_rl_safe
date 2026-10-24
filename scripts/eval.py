@@ -89,6 +89,8 @@ def _prepare_controller(config):
 
 
 def _controller_failure_diagnostics(state, nominal, obs, result):
+    if result.solver_status != "primal infeasible":
+        raise RuntimeError(f"unexpected invalid QP result: {result.solver_status}")
     def values(x):
         return [float(v) if np.isfinite(v) else None for v in np.asarray(x).reshape(-1)]
     diagnostic = dict(solver="osqp", solver_status=result.solver_status,
@@ -96,14 +98,7 @@ def _controller_failure_diagnostics(state, nominal, obs, result):
         candidate=values(result.candidate), kkt_residual=values(result.kkt_residual),
         residual=values(result.residual), centers=values(obs.centers),
         velocities=values(obs.velocities), radii=values(obs.radii), mask=values(obs.mask))
-    if result.solver_status == "invalid barrier domain":
-        diagnostic["solver"] = "not_run"
-        return "controller_failure", "parabolic barrier requires separation beyond the inflated radius", diagnostic
-    if result.solver_status == "primal infeasible":
-        return "infeasible", "OSQP reports incompatible hard constraints", diagnostic
-    reason = ("OSQP solution failed independent residual checks"
-              if result.solver_status == "solved" else "OSQP: " + result.solver_status)
-    return "controller_failure", reason, diagnostic
+    return "infeasible", "OSQP reports incompatible hard constraints", diagnostic
 
 
 def _run_controller_episode(config, *, controller_setup=None):
