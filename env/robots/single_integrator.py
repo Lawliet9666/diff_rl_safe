@@ -9,9 +9,14 @@ from .base import Robot, RobotStep
 
 @dataclass(frozen=True)
 class SingleIntegratorRobot(Robot):
-    v_max: float = 1.5
+    v_max: float
     state_dim: ClassVar[int] = 3
     control_dim: ClassVar[int] = 2
+
+    @classmethod
+    def from_config(cls, config):
+        """Read this model's parameters from the complete Hydra configuration."""
+        return cls(v_max=config.robot.v_max)
 
     def dynamics(self, state, action):
         return jnp.array([action[0], action[1], 0.])

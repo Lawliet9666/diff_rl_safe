@@ -130,7 +130,7 @@ def config_from_omegaconf(config) -> JaxSocialNavConfig:
     if avoid_robot_ratio < 0.0 or avoid_robot_ratio > 1.0:
         raise ValueError("env.social_force.avoid_robot_ratio must satisfy 0 <= ratio <= 1")
     robot_type = str(robot_cfg.type).strip().lower()
-    robot = make_robot(robot_type, robot_cfg)
+    robot = make_robot(config)
     progress_speed_scale = float(reward.progress_speed_scale)
     if not np.isfinite(progress_speed_scale) or progress_speed_scale <= 0:
         raise ValueError("env.reward.progress_speed_scale must be finite and positive")

@@ -1,5 +1,6 @@
-"""Shared pure-JAX robot data, constraint tools and stateless robot contract."""
+"""Shared robot configuration, JAX constraint tools and stateless robot contract."""
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import NamedTuple
 
 from jax import Array
@@ -64,6 +65,45 @@ def _hocbf(h, h_dot, h_ddot, dh_ddot_dx_g, h_dddot_drift, gains):
          +(k1*k2+k1*k3+k2*k3)*h_dot+k1*k2*k3*h)
     domain = jnp.stack([h, psi1, psi2], axis=-1).reshape(-1)
     return Constraints(dh_ddot_dx_g, b, domain)
+
+
+def _control_parameters(section, names, label, *, selected_cbf=None):
+    """Flatten loaded controller parameters, visiting only the selected CBF group."""
+    groups = ("nominal", "cbf", "qp")
+    if not isinstance(section, Mapping):
+        raise ValueError(f"{label} must be a mapping")
+    missing = set(groups)-section.keys()
+    if missing:
+        raise ValueError(f"{label} is missing required fields: {', '.join(sorted(missing))}")
+    parameters = {}
+
+    def collect(node):
+        for name, value in node.items():
+            if isinstance(value, Mapping):
+                collect(value)
+            else:
+                if name in parameters:
+                    raise ValueError(f"{label} has duplicate parameters: {name}")
+                parameters[name] = value
+
+    for group in groups:
+        if not isinstance(section[group], Mapping):
+            raise ValueError(f"{label} parameter groups must be mappings")
+    if selected_cbf is not None:
+        if selected_cbf not in section["cbf"]:
+            raise ValueError(f"{label}.cbf is missing required fields: {selected_cbf}")
+        active = section["cbf"][selected_cbf]
+        if not isinstance(active, Mapping):
+            raise ValueError(f"{label}.cbf.{selected_cbf} must be a mapping")
+        section = {**section, "cbf": active}
+    collect(section)
+    missing = set(names)-parameters.keys()
+    if missing:
+        raise ValueError(f"{label} is missing required fields: {', '.join(sorted(missing))}")
+    extra = parameters.keys()-set(names)
+    if extra:
+        raise ValueError(f"{label} has unexpected parameters: {', '.join(sorted(extra))}")
+    return parameters
 
 
 class Robot(ABC):

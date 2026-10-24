@@ -1,5 +1,5 @@
 """Attitude-aware quadrotor: [p(3), v(3), row-major R(9), thrust(1)]."""
-from dataclasses import KW_ONLY, dataclass
+from dataclasses import dataclass
 from functools import partial
 import math
 from typing import ClassVar
@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 
 from .base import (Robot, RobotStep, Constraints, check_obstacle_shapes,
-                   masked_rows, join_constraints, _hocbf)
+                   masked_rows, join_constraints, _control_parameters, _hocbf)
 
 
 def skew(w):
@@ -31,42 +31,58 @@ def _rotation_increment(omega, dt):
 
 @dataclass(frozen=True)
 class QuadrotorRobot(Robot):
-    mass: float = 1.0
-    gravity: float = 9.81
-    altitude: float = 1.2
-    omega_max: float = 2.0
-    thrust_rate_max: float = 20.0
+    mass: float
+    gravity: float
+    altitude: float
+    omega_max: float
+    thrust_rate_max: float
     state_dim: ClassVar[int] = 16
     control_dim: ClassVar[int] = 4
 
-    # Optional settings; ordinary environment construction needs only the physical fields above.
-    _: KW_ONLY
-
     # Collision geometry and clearance.
-    radius: float = 0.3
-    margin: float = 0.05
+    radius: float
+    margin: float
 
     # State limits.
-    thrust_min: float = 2.0
-    thrust_max: float = 20.0
-    tilt_max: float = math.pi / 4
-    altitude_min: float = 0.8
-    altitude_max: float = 1.6
+    thrust_min: float
+    thrust_max: float
+    tilt_max: float
+    altitude_min: float
+    altitude_max: float
 
     # Nominal tracking.
-    position_gain: float = 1.0
-    velocity_gain: float = 1.8
-    attitude_gain: float = 4.0
-    thrust_tracking_gain: float = 4.0
-    acceleration_limits: tuple = (2.0, 2.0, 2.0)
+    position_gain: float
+    velocity_gain: float
+    attitude_gain: float
+    thrust_tracking_gain: float
+    acceleration_limits: tuple
 
     # CBF decay.
-    gains: tuple = (1.5, 1.5, 1.5)
-    thrust_gain: float = 4.0
-    tilt_gain: float = 4.0
+    gains: tuple
+    thrust_gain: float
+    tilt_gain: float
 
     # QP tracking weights.
-    weights: tuple = (1.0, 1.0, 1.0, 1e-06)
+    weights: tuple
+
+    @classmethod
+    def from_config(cls, config):
+        """Extract this robot's parameters from the complete Hydra configuration."""
+        r = config.robot
+        parameters = _control_parameters(
+            config.controller.quadrotor,
+            ("position_gain", "velocity_gain", "attitude_gain", "thrust_tracking_gain",
+             "acceleration_limits", "gains", "thrust_gain", "tilt_gain", "weights"),
+            "controller.quadrotor")
+        parameters.update(mass=r.mass, gravity=r.gravity, altitude=r.altitude,
+                          omega_max=r.omega_max, thrust_rate_max=r.thrust_rate_max,
+                          radius=r.radius, margin=float(config.env.safety_margin),
+                          thrust_min=r.thrust_min, thrust_max=r.thrust_max,
+                          tilt_max=r.tilt_max, altitude_min=r.altitude_min,
+                          altitude_max=r.altitude_max)
+        for name in ("gains", "weights", "acceleration_limits"):
+            parameters[name] = tuple(parameters[name])
+        return cls(**parameters)
 
     def __post_init__(self):
         positives = (self.mass, self.gravity, self.radius, *self.gains,

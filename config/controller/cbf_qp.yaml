@@ -50,3 +50,13 @@ humanoid:
       speed_epsilon: 0.05  # Smooth speed regularization used in content.tex.
   qp:
     weights: [1.0, 1.0, 1.0]  # Forward/lateral acceleration, then yaw rate.
+
+double_integrator:
+  nominal:
+    position_gain: 1.0
+    velocity_gain: 2.0
+  cbf:
+    gains: [1.5, 1.5]  # Second-order distance CBF rates [1/s].
+    speed_facets: 16  # Inscribed next-velocity polygon; conservatively enforces Euclidean v_max.
+  qp:
+    weights: [1.0, 1.0]  # World acceleration x/y.

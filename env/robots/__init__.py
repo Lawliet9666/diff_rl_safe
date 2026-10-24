@@ -1,39 +1,30 @@
-"""Robot model selection and the shared stateless interface."""
-from dataclasses import fields
-
+"""Select a Robot class; Hydra supplies the complete configuration."""
 from .base import Robot, RobotStep, angle_normalize
 from .single_integrator import SingleIntegratorRobot
+from .double_integrator import DoubleIntegratorRobot
 from .unicycle import UnicycleRobot
 from .quadrotor import QuadrotorRobot
 from .humanoid import HumanoidRobot
 
 
-_MODELS = dict(single_integrator=SingleIntegratorRobot, unicycle=UnicycleRobot,
-               quadrotor=QuadrotorRobot, humanoid=HumanoidRobot)
+def make_robot(config):
+    """Dispatch by robot type; each model parses its own configuration block."""
+    name = str(config.robot.type).strip().lower()
+    if name == "single_integrator":
+        model = SingleIntegratorRobot
+    elif name == "double_integrator":
+        model = DoubleIntegratorRobot
+    elif name == "unicycle":
+        model = UnicycleRobot
+    elif name == "quadrotor":
+        model = QuadrotorRobot
+    elif name == "humanoid":
+        model = HumanoidRobot
+    else:
+        raise ValueError(f"unsupported robot type {config.robot.type!r}; expected single_integrator, "
+                         "double_integrator, unicycle, quadrotor or humanoid")
+    return model.from_config(config)
 
 
-def make_robot(robot_type, config=None, **parameters):
-    """Select a model by name, using explicit physical parameters or a config.
-
-    A supplied config must contain every original physical field. Keyword-only
-    settings may use robot defaults or explicit overrides. No controller is imported.
-    """
-    if config is None and not isinstance(robot_type, str):
-        config = robot_type
-        robot_type = config.type
-    name = str(robot_type).strip().lower()
-    if name not in _MODELS:
-        raise ValueError(f"unsupported robot type {robot_type!r}; expected one of {tuple(_MODELS)}")
-    model = _MODELS[name]
-    if config is not None:
-        configured = {field.name: getattr(config, field.name) for field in fields(model)
-                      if not field.kw_only or hasattr(config, field.name)}
-        parameters = {**configured, **parameters}
-    for field in fields(model):
-        if field.name in parameters and isinstance(field.default, tuple):
-            parameters[field.name] = tuple(parameters[field.name])
-    return model(**parameters)
-
-
-__all__ = ['Robot', 'RobotStep', 'SingleIntegratorRobot', 'UnicycleRobot',
+__all__ = ['Robot', 'RobotStep', 'SingleIntegratorRobot', 'DoubleIntegratorRobot', 'UnicycleRobot',
            'QuadrotorRobot', 'HumanoidRobot', 'make_robot', 'angle_normalize']

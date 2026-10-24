@@ -184,7 +184,7 @@ def _run_controller_episode(config, *, controller_setup=None):
             failures += 1
             qp_status, qp_reason, failure = _controller_failure_diagnostics(state, nominal, obs, result)
             failure["step"] = k
-            if robot == "humanoid" and qp_status == "infeasible":
+            if robot in {"humanoid", "double_integrator"} and qp_status == "infeasible":
                 infeasible_steps += 1
                 status, reason = qp_status, qp_reason
                 break  # An old acceleration is not a safe fallback.
@@ -231,8 +231,11 @@ def _run_controller_episode(config, *, controller_setup=None):
             break
         if bool(metrics["physical_state_limit"]):
             status = "state_limit"
-            reason = ("humanoid body velocity limit exceeded during integration" if robot == "humanoid"
-                      else "quadrotor altitude, tilt or thrust limit exceeded during integration")
+            if robot == "double_integrator":
+                reason = "double-integrator Euclidean speed limit exceeded during integration"
+            else:
+                reason = ("humanoid body velocity limit exceeded during integration" if robot == "humanoid"
+                          else "quadrotor altitude, tilt or thrust limit exceeded during integration")
             break
         if bool(done[0]):
             status = "success" if bool(metrics["success"][0]) else "timeout"

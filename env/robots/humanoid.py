@@ -2,7 +2,8 @@
 
 This ideal velocity-tracking model does not simulate joints or balance.
 """
-from dataclasses import KW_ONLY, dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, fields
 from functools import partial
 import math
 from typing import ClassVar
@@ -11,7 +12,7 @@ import jax
 import jax.numpy as jnp
 
 from .base import (Robot, RobotStep, angle_normalize, Constraints,
-                   check_obstacle_shapes, masked_rows, join_constraints)
+                   check_obstacle_shapes, masked_rows, join_constraints, _control_parameters)
 
 
 def _parabolic_value(z, w, radius, cfg):
@@ -24,40 +25,83 @@ def _parabolic_value(z, w, radius, cfg):
 
 
 @dataclass(frozen=True)
+class DistanceCBFParams:
+    gains: tuple
+
+    def __post_init__(self):
+        if len(self.gains) != 2 or not all(math.isfinite(v) and v > 0 for v in self.gains):
+            raise ValueError("invalid humanoid distance CBF gains")
+
+
+@dataclass(frozen=True)
+class ParabolicCBFParams:
+    alpha: float
+    parabolic_gain: float
+    clearance_gain: float
+    speed_epsilon: float
+
+    def __post_init__(self):
+        values = (self.alpha, self.parabolic_gain, self.clearance_gain, self.speed_epsilon)
+        if not all(math.isfinite(v) and v > 0 for v in values):
+            raise ValueError("invalid humanoid parabolic CBF parameters")
+
+
+@dataclass(frozen=True)
 class HumanoidRobot(Robot):
-    vf_min: float = -1.0
-    vf_max: float = 2.0
-    vl_min: float = -1.0
-    vl_max: float = 1.0
-    af_max: float = 4.0
-    al_max: float = 2.0
-    omega_max: float = 1.0
+    vf_min: float
+    vf_max: float
+    vl_min: float
+    vl_max: float
+    af_max: float
+    al_max: float
+    omega_max: float
     state_dim: ClassVar[int] = 5
     control_dim: ClassVar[int] = 3
 
-    # Optional settings; ordinary environment construction needs only the physical fields above.
-    _: KW_ONLY
-
     # Collision and navigation.
-    radius: float = 0.3
-    margin: float = 0.05
-    goal_tolerance: float = 0.6
+    radius: float
+    margin: float
+    goal_tolerance: float
 
     # Nominal tracking.
-    position_gain: float = 1.0
-    velocity_gain: float = 2.0
-    heading_gain: float = 2.0
+    position_gain: float
+    velocity_gain: float
+    heading_gain: float
 
     # CBF choice, shape and decay.
-    barrier: str = 'distance'
-    gains: tuple = (1.5, 1.5)
-    alpha: float = 2.0
-    parabolic_gain: float = 1.0
-    clearance_gain: float = 1.0
-    speed_epsilon: float = 0.05
+    barrier: str
+    cbf: DistanceCBFParams | ParabolicCBFParams
 
     # QP tracking weights.
-    weights: tuple = (1.0, 1.0, 1.0)
+    weights: tuple
+
+    @classmethod
+    def from_config(cls, config):
+        """Extract this robot's parameters from the complete Hydra configuration."""
+        r = config.robot
+        section = config.controller.humanoid
+        barrier = section.get("barrier") if isinstance(section, Mapping) else None
+        if barrier == "distance":
+            cbf_type = DistanceCBFParams
+        elif barrier == "parabolic":
+            cbf_type = ParabolicCBFParams
+        else:
+            raise ValueError("humanoid barrier must be distance or parabolic")
+        cbf_names = tuple(field.name for field in fields(cbf_type))
+        parameters = _control_parameters(
+            section,
+            ("barrier", "position_gain", "velocity_gain", "heading_gain", "weights", *cbf_names),
+            "controller.humanoid", selected_cbf=barrier)
+        if barrier == "distance":
+            parameters["gains"] = tuple(parameters["gains"])
+        parameters["cbf"] = cbf_type(**{name: parameters.pop(name) for name in cbf_names})
+        parameters.update(vf_min=r.vf_min, vf_max=r.vf_max, vl_min=r.vl_min,
+                          vl_max=r.vl_max, af_max=r.af_max, al_max=r.al_max,
+                          omega_max=r.omega_max, radius=r.radius,
+                          margin=float(config.env.safety_margin),
+                          goal_tolerance=float(config.env.robot_goal.tolerance))
+        parameters["weights"] = tuple(parameters["weights"])
+        return cls(**parameters)
 
     def __post_init__(self):
         values = (self.vf_min, self.vf_max, self.vl_min, self.vl_max,
@@ -67,12 +111,11 @@ class HumanoidRobot(Robot):
                 or min(self.af_max, self.al_max, self.omega_max) <= 0):
             raise ValueError("invalid humanoid velocity or input limits")
 
-        values = (self.goal_tolerance, self.radius, *self.gains,
-                  self.alpha, self.parabolic_gain, self.clearance_gain,
-                  self.speed_epsilon, *self.weights, self.position_gain,
-                  self.velocity_gain, self.heading_gain)
-        if (self.barrier not in {"distance", "parabolic"}
-                or len(self.gains) != 2 or len(self.weights) != 3
+        valid_cbf = ((self.barrier == "distance" and isinstance(self.cbf, DistanceCBFParams))
+                     or (self.barrier == "parabolic" and isinstance(self.cbf, ParabolicCBFParams)))
+        values = (self.goal_tolerance, self.radius, *self.weights,
+                  self.position_gain, self.velocity_gain, self.heading_gain)
+        if (not valid_cbf or len(self.weights) != 3
                 or not all(math.isfinite(v) and v > 0 for v in values)
                 or not math.isfinite(self.margin) or self.margin < 0):
             raise ValueError("invalid humanoid barrier, gains or controller limits")
@@ -165,7 +208,7 @@ class HumanoidRobot(Robot):
         dummy = jnp.stack([radius+1., jnp.zeros_like(radius)], axis=1)
         z = jnp.where((obstacles.mask > .5)[:, None], z, dummy)
         w = jnp.where((obstacles.mask > .5)[:, None], w, 0.)
-        value = lambda z, w, r: _parabolic_value(z, w, r, self)
+        value = lambda z, w, r: _parabolic_value(z, w, r, self.cbf)
         h = jax.vmap(value)(z, w, radius)
         dh_dz, dh_dw = jax.vmap(jax.grad(value, argnums=(0, 1)))(z, w, radius)
         q = jnp.sum(z*z, axis=1)-radius**2
@@ -179,12 +222,12 @@ class HumanoidRobot(Robot):
         check_obstacle_shapes(obstacles)
         if self.barrier == "distance":
             h, h_dot, A, h_ddot_drift = self.distance_barrier(state, obstacles)
-            k1, k2 = self.gains
+            k1, k2 = self.cbf.gains
             b = h_ddot_drift+(k1+k2)*h_dot+k1*k2*h
             domain = jnp.stack([h, h_dot+k1*h], axis=1)
         elif self.barrier == "parabolic":
             h, q, A, h_dot_drift = self.parabolic_barrier(state, obstacles)
-            b = h_dot_drift+self.alpha*h
+            b = h_dot_drift+self.cbf.alpha*h
             domain = jnp.stack([h, q], axis=1)
         else:
             raise ValueError("humanoid barrier must be distance or parabolic")

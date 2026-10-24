@@ -20,41 +20,6 @@ def _required_section(node, names, label):
     return values
 
 
-def _build_robot(config):
-    """Merge current grouped YAML settings into one immutable robot snapshot."""
-    r, c, e = config.robot, config.controller, config.env
-    if r.type not in {"unicycle", "quadrotor", "humanoid"}:
-        raise ValueError("controller robot must be unicycle, quadrotor or humanoid")
-    label = f"controller.{r.type}"
-    groups = ("nominal", "cbf", "qp")
-    sections = _required_section(c[r.type], groups, label)
-    params = {key: value for key, value in sections.items() if key not in groups}
-    blocks = [sections["nominal"], sections["qp"]]
-    if r.type == "humanoid":
-        cbf = _required_section(OmegaConf.create(sections["cbf"]),
-                                ("distance", "parabolic"), f"{label}.cbf")
-        blocks.extend([cbf["distance"], cbf["parabolic"]])
-    else:
-        blocks.append(sections["cbf"])
-    for block in blocks:
-        if not isinstance(block, dict):
-            raise ValueError(f"{label} parameter groups must be mappings")
-        duplicate = params.keys() & block.keys()
-        if duplicate:
-            raise ValueError(f"{label} has duplicate parameters: {', '.join(sorted(duplicate))}")
-        params.update(block)
-    common = dict(margin=float(e.safety_margin))
-    if r.type in {"unicycle", "humanoid"}:
-        common["goal_tolerance"] = float(e.robot_goal.tolerance)
-    robot = make_robot(r, **common, **params)
-    required = {field.name for field in fields(robot) if field.kw_only}-common.keys()-r.keys()
-    _required_section(OmegaConf.create(params), required, label)
-    extra = params.keys()-required
-    if extra:
-        raise ValueError(f"{label} has unexpected parameters: {', '.join(sorted(extra))}")
-    return robot
-
-
 def make_controller(config):
     """Bind a configured robot, environment period and common solver settings."""
     if config.controller.type != "cbf_qp":
@@ -69,7 +34,9 @@ def make_controller(config):
     dt = float(config.env.dt)
     if not math.isfinite(dt) or dt <= 0:
         raise ValueError("env.dt must be positive")
-    robot = _build_robot(config)
+    if config.robot.type not in {"unicycle", "double_integrator", "quadrotor", "humanoid"}:
+        raise ValueError("controller robot must be unicycle, double_integrator, quadrotor or humanoid")
+    robot = make_robot(config)
     values = _required_section(config.controller.solver,
                                [field.name for field in fields(SolverConfig)], "controller.solver")
     solver = SolverConfig(**values)

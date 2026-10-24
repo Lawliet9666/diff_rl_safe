@@ -1,5 +1,5 @@
 """Unicycle equations and the original SocialNav Euler/clipping convention."""
-from dataclasses import KW_ONLY, dataclass
+from dataclasses import dataclass
 from functools import partial
 import math
 from typing import ClassVar
@@ -7,33 +7,43 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 
-from .base import Robot, RobotStep, angle_normalize, check_obstacle_shapes, masked_rows
+from .base import Robot, RobotStep, angle_normalize, check_obstacle_shapes, masked_rows, _control_parameters
 
 
 @dataclass(frozen=True)
 class UnicycleRobot(Robot):
-    v_max: float = 1.5
-    omega_max: float = 1.57
+    v_max: float
+    omega_max: float
     state_dim: ClassVar[int] = 3
     control_dim: ClassVar[int] = 2
 
-    # Optional settings; ordinary environment construction needs only the physical fields above.
-    _: KW_ONLY
-
     # Collision and navigation.
-    radius: float = 0.3
-    margin: float = 0.05
-    goal_tolerance: float = 0.6
+    radius: float
+    margin: float
+    goal_tolerance: float
 
     # Nominal tracking; lookahead is shared with the CBF and QP.
-    lookahead: float = 0.2
-    position_gain: float = 1.0
+    lookahead: float
+    position_gain: float
 
     # CBF decay.
-    alpha: float = 2.0
+    alpha: float
 
     # QP tracking weights.
-    weights: tuple = (1.0, 1.0)
+    weights: tuple
+
+    @classmethod
+    def from_config(cls, config):
+        """Extract this robot's parameters from the complete Hydra configuration."""
+        r = config.robot
+        parameters = _control_parameters(
+            config.controller.unicycle, ("lookahead", "position_gain", "alpha", "weights"),
+            "controller.unicycle")
+        parameters.update(v_max=r.v_max, omega_max=r.omega_max, radius=r.radius,
+                          margin=float(config.env.safety_margin),
+                          goal_tolerance=float(config.env.robot_goal.tolerance))
+        parameters["weights"] = tuple(parameters["weights"])
+        return cls(**parameters)
 
     def __post_init__(self):
         vals = (self.radius, self.lookahead, self.alpha, self.v_max, self.omega_max,
