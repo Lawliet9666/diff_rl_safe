@@ -111,28 +111,41 @@ def _run_controller_episode(config, *, controller_setup=None):
     """Run a fresh episode using an optional immutable bound controller."""
     import jax
     import jax.numpy as jnp
-    from controller.cbf_qp import control_residual
-    from env.jax_env.jax_social_nav import compute_distances
-    from controller.env_adapter import NavigationEnv
+    from controller.cbf_qp import control_residual, select_obstacles
+    from controller import Obstacles
+    from env import make_env
+    from env.jax_env.jax_social_nav import compute_distances, config_from_omegaconf
 
     controller = _prepare_controller(config) if controller_setup is None else controller_setup
     robot_model = controller.args[0]
     solver = controller.keywords["solver"]
     robot, scenario, seed = str(config.robot.type), str(config.env.scenario), int(config.seed)
     use_slack = config.controller.slack_weight > 0
-    env = NavigationEnv(config, robot=robot_model, state_tolerance=solver.feasibility_tolerance)
-    cfg = env.cfg
-    navigation_state = env.reset(jax.random.PRNGKey(seed))
-    state, crowd = navigation_state
-    goal = env.observe(navigation_state).goal
+    env = make_env(config)
+    cfg = config_from_omegaconf(config)._replace(
+        robot=robot_model, state_tolerance=solver.feasibility_tolerance)
+    navigation_state = env.reset_fn(cfg, jax.random.PRNGKey(seed), 1)
+    crowd = navigation_state
+    state = crowd.robot_state[0].astype(jnp.float64)
+    goal = crowd.goal_pos[0].astype(jnp.float64)
+    advance_env = jax.jit(lambda current, action, key: env.step_fn(cfg, current, action, key))
     nominal_control = jax.jit(
         type(robot_model).nominal_control, static_argnames=("self",))
 
-    def action_fn(observation):
-        nominal = nominal_control(robot_model, observation.robot, observation.goal)
-        return controller(observation.robot, nominal, observation.obstacles)
+    def observe_state(current):
+        x = current.robot_state[0].astype(jnp.float64)
+        obstacles = Obstacles(current.human_positions[0].astype(jnp.float64),
+            current.human_vels[0].astype(jnp.float64),
+            current.human_radii[0].astype(jnp.float64), current.human_mask[0])
+        obstacles = select_obstacles(x[:2], obstacles, config.controller.qp_obs_top_k)
+        return x, current.goal_pos[0].astype(jnp.float64), obstacles
 
-    action_fn(env.observe(navigation_state))[0].block_until_ready()
+    def action_fn(observation):
+        x, target, obstacles = observation
+        nominal = nominal_control(robot_model, x, target)
+        return controller(x, nominal, obstacles)
+
+    action_fn(observe_state(navigation_state))[0].block_until_ready()
     history = {k: [] for k in ["time", "state", "centers", "status", "active_obstacles",
         "nominal", "action", "requested_action", "min_residual", "initial_safe", "kkt_residual", "solve_ms",
         "qp_valid", "fallback", "solver_status", "slack", "cbf_satisfied",
@@ -157,8 +170,8 @@ def _run_controller_episode(config, *, controller_setup=None):
 
     record_frame("running")
     for k in range(cfg.max_steps):
-        observation = env.observe(navigation_state)
-        obs = observation.obstacles
+        observation = observe_state(navigation_state)
+        obs = observation[2]
         start = time.perf_counter()
         action, diagnostics = action_fn(observation)
         action.block_until_ready()
@@ -187,9 +200,11 @@ def _run_controller_episode(config, *, controller_setup=None):
         requested = action
         previous = state
         key, motion_key = jax.random.split(key)
-        navigation_state, _, done, metrics = env.step(navigation_state, requested, motion_key)
-        state, crowd = navigation_state
-        executed = metrics["applied_action"]
+        navigation_state, _, done, metrics = advance_env(
+            navigation_state, requested[None, :], motion_key)
+        crowd = navigation_state
+        state = crowd.robot_state[0].astype(jnp.float64)
+        executed = metrics["applied_action"][0]
         previous_action = executed
         fallback_steps += int(used_fallback)
         applied_residual = np.asarray(control_residual(robot_model, previous, executed, obs, cfg.dt))
@@ -232,7 +247,7 @@ def _run_controller_episode(config, *, controller_setup=None):
     history["slack"] = history["slack"].reshape((-1, cfg.num_humans))
     finite = lambda value: float(value) if np.isfinite(value) else None
     dist, _ = compute_distances(cfg, crowd)
-    integration_dt = env.integration_dt
+    integration_dt = cfg.integration_dt
     summary = dict(robot=robot, scenario=scenario, seed=seed, status=status, reason=reason,
         steps=len(history["action"]), min_clearance=finite(worst_clearance),
         min_constraint_residual=finite(min_residual), qp_failures=failures,
@@ -261,16 +276,11 @@ def _run_controller_episode(config, *, controller_setup=None):
 def _render_controller_frame(cfg, history, index, crowd, robot, robot_model):
     """Only adapt state; all pixels/layout come from the existing RL renderer."""
     import jax.numpy as jnp
-    from controller.env_adapter import project_quadrotor, project_humanoid
+    from env.jax_env.jax_social_nav import planar_state
 
     from env.jax_env.jax_render import render_jax_social_nav_frame
     state = jnp.asarray(history["state"][index])
-    if robot == "quadrotor":
-        frame_state = project_quadrotor(crowd, state)
-    elif robot == "humanoid":
-        frame_state = project_humanoid(crowd, state)
-    else:
-        frame_state = crowd._replace(robot_state=state[None, :])
+    frame_state = planar_state(cfg, crowd._replace(robot_state=state[None, :]))
     frame_state = frame_state._replace(
         human_positions=jnp.asarray(history["centers"][index])[None, ...],
         step_count=jnp.array([round(float(history["time"][index])/cfg.dt)], jnp.int32))

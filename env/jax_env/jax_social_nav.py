@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import NamedTuple
+import math
 
 import jax
 import jax.numpy as jnp
@@ -14,7 +15,7 @@ from env.obstacle.obstacle import (
     outer_motion_bounds,
     workspace_center_radii,
 )
-from env.robots import Robot, angle_normalize, make_robot, robot_step
+from env.robots import Robot, angle_normalize, make_robot
 
 
 class JaxSocialNavConfig(NamedTuple):
@@ -61,9 +62,16 @@ class JaxSocialNavConfig(NamedTuple):
     constant_penalty: float
     boundary_penalty_factor: float
     boundary_buffer: float
+    integration_steps: int
+    state_tolerance: float
+
+    @property
+    def integration_dt(self):
+        return self.dt / self.integration_steps
 
 
 class JaxSocialNavState(NamedTuple):
+    """Full model state/action plus the shared navigation task; no duplicate pose."""
     robot_state: jnp.ndarray
     robot_vel: jnp.ndarray
     robot_action: jnp.ndarray
@@ -131,8 +139,19 @@ def config_from_omegaconf(config) -> JaxSocialNavConfig:
         raise ValueError("env.reward.omega_delta_factor must be >= 0")
     if omega_delta_factor > 0.0 and robot_type != "unicycle":
         raise ValueError("env.reward.omega_delta_factor requires robot.type=unicycle")
+    dt = float(env_cfg.dt)
+    max_dt = float(_cfg_get(robot_cfg, "max_integration_dt", dt))
+    state_tolerance = float(_cfg_get(env_cfg, "state_tolerance", 1e-6))
+    if not math.isfinite(dt) or dt <= 0:
+        raise ValueError("env.dt must be positive")
+    if not math.isfinite(max_dt) or max_dt <= 0:
+        raise ValueError("robot.max_integration_dt must be positive")
+    if not math.isfinite(state_tolerance) or state_tolerance <= 0:
+        raise ValueError("env.state_tolerance must be positive")
     return JaxSocialNavConfig(
-        dt=float(env_cfg.dt),
+        dt=dt,
+        integration_steps=max(1, math.ceil(dt/max_dt)),
+        state_tolerance=state_tolerance,
         max_steps=int(env_cfg.max_steps),
         workspace_low=jnp.asarray(workspace_low, dtype=jnp.float32),
         workspace_high=jnp.asarray(workspace_high, dtype=jnp.float32),
@@ -260,7 +279,13 @@ def _clip_robot_to_outer_bounds(cfg: JaxSocialNavConfig, state: JaxSocialNavStat
     return state._replace(robot_state=robot_state)
 
 
+def planar_state(cfg, state):
+    """Build a temporary [x,y,yaw] view for existing navigation and rendering tools."""
+    return state._replace(robot_state=jax.vmap(cfg.robot.planar_pose)(state.robot_state))
+
+
 def fixed_order_policy_obs_from_state(cfg: JaxSocialNavConfig, state: JaxSocialNavState):
+    state = planar_state(cfg, state)
     batch_size = state.robot_state.shape[0]
     robot = jnp.concatenate(
         [
@@ -390,9 +415,10 @@ def _reset_one(cfg: JaxSocialNavConfig, rng):
         human_avoid_robot_mask = jnp.where(human_mask > 0.5, human_avoid_robot_mask, 0.0)
     else:
         human_avoid_robot_mask = jnp.zeros((cfg.num_humans,), dtype=jnp.float32)
-    robot_state = jnp.asarray([robot_pos[0], robot_pos[1], angle_normalize(robot_theta)], dtype=jnp.float32)
-    robot_action = jnp.zeros((2,), dtype=jnp.float32)
-    robot_vel = jnp.zeros((2,), dtype=jnp.float32)
+    pose = jnp.asarray([robot_pos[0], robot_pos[1], angle_normalize(robot_theta)], dtype=jnp.float32)
+    robot_state = cfg.robot.initial_state(pose)
+    robot_action = jnp.zeros((cfg.robot.control_dim,), dtype=robot_state.dtype)
+    robot_vel = jnp.zeros((2,), dtype=robot_state.dtype)
     prev_dist = jnp.linalg.norm(robot_pos - goal_pos)
     return JaxSocialNavState(
         robot_state=robot_state,
@@ -423,6 +449,43 @@ def reset_env_with_keys(cfg: JaxSocialNavConfig, keys):
 
 
 def step_env(cfg: JaxSocialNavConfig, state: JaxSocialNavState, action, rng):
+    """Advance any selected robot, then the original crowd, boundaries and task."""
+    def advance_one(x, u):
+        if cfg.integration_steps == 1:
+            result = cfg.robot.step(x, u, cfg.dt)
+            valid = cfg.robot.check_state_limits(result.state, cfg.state_tolerance)
+            return result.state, result.velocity[:2], result.action, ~valid
+        def substep(x, _):
+            result = cfg.robot.step(x, u, cfg.integration_dt)
+            valid = cfg.robot.check_state_limits(result.state, cfg.state_tolerance)
+            return result.state, (result.velocity[:2], result.action, valid)
+        x, (velocity, applied, valid) = jax.lax.scan(
+            substep, x, None, length=cfg.integration_steps)
+        return x, velocity[-1], applied[-1], ~jnp.all(valid)
+
+    next_robot_state, robot_vel, robot_action, physical_state_limit = jax.vmap(advance_one)(
+        state.robot_state, action)
+    moved_state = state._replace(robot_state=next_robot_state, robot_vel=robot_vel, robot_action=robot_action)
+    moved_state = advance_obstacles(cfg, moved_state, rng)
+    bounded_state = _clip_robot_to_outer_bounds(cfg, moved_state)
+    dist_to_goal, min_clearance = compute_distances(cfg, bounded_state)
+
+    if cfg.robot_type not in {"single_integrator", "unicycle"}:
+        done, success, collision, timeout, next_step, violation = navigation_done(
+            cfg, bounded_state, dist_to_goal, min_clearance)
+        lengths = bounded_state.episode_lengths + 1
+        next_state = bounded_state._replace(
+            step_count=next_step, prev_dist_to_goal=dist_to_goal.astype(jnp.float32),
+            episode_lengths=jnp.where(done, 0, lengths))
+        metrics = dict(success=success, collision=collision, timeout=timeout,
+            min_clearance=min_clearance, goal_distance=dist_to_goal,
+            boundary_violation=violation, episode_length=lengths,
+            boundary_correction=bounded_state.robot_state[:, :2]-moved_state.robot_state[:, :2],
+            physical_state_limit=physical_state_limit, applied_action=robot_action)
+        # These model rewards have not been defined for RL; never reinterpret
+        # their accelerations or thrust-rate inputs as a planar [v, omega].
+        return next_state, None, done, metrics
+
     action = jnp.asarray(action, dtype=jnp.float32)
     omega_delta = jnp.zeros_like(action[:, 1])
     omega_delta_penalty = jnp.zeros_like(omega_delta)
@@ -434,13 +497,6 @@ def step_env(cfg: JaxSocialNavConfig, state: JaxSocialNavState, action, rng):
         )
         omega_denom = jnp.maximum(jnp.asarray(omega_max, dtype=jnp.float32), 1.0e-6)
         omega_delta_penalty = cfg.omega_delta_factor * jnp.square(omega_delta / omega_denom)
-    next_robot_state, robot_vel, robot_action = robot_step(cfg, state.robot_state, action)
-    moved_state = state._replace(robot_state=next_robot_state, robot_vel=robot_vel, robot_action=robot_action)
-
-    moved_state = advance_obstacles(cfg, moved_state, rng)
-
-    bounded_state = _clip_robot_to_outer_bounds(cfg, moved_state)
-    dist_to_goal, min_clearance = compute_distances(cfg, bounded_state)
     reward, done, success, collision, timeout, next_step, boundary_violation = reward_done(
         cfg,
         bounded_state,
@@ -458,6 +514,9 @@ def step_env(cfg: JaxSocialNavConfig, state: JaxSocialNavState, action, rng):
         episode_lengths=jnp.where(done, 0, completed_lengths).astype(jnp.int32),
     )
     metrics = {
+        "physical_state_limit": physical_state_limit,
+        "applied_action": robot_action,
+        "boundary_correction": bounded_state.robot_state[:, :2]-moved_state.robot_state[:, :2],
         "success": success.astype(jnp.float32),
         "collision": collision.astype(jnp.float32),
         "timeout": timeout.astype(jnp.float32),
@@ -475,6 +534,7 @@ def step_env(cfg: JaxSocialNavConfig, state: JaxSocialNavState, action, rng):
 
 
 def _fixed_slot_policy_obs_from_state(env_cfg, state, model_humans):
+    state = planar_state(env_cfg, state)
     batch_size = state.robot_state.shape[0]
     model_humans = int(model_humans)
     if model_humans <= 0:
@@ -523,7 +583,11 @@ def _policy_obs_frame_from_state(env_cfg, state, hparams):
 
 
 class JaxSocialNav:
-    """Batched navigation interface backed by the original JAX task functions."""
+    """Shared batched navigation environment for every analytic Robot model.
+
+    Robot inputs remain physical. Quadrotor/humanoid rewards are undefined and
+    return None until a corresponding RL reward is introduced.
+    """
 
     @staticmethod
     def step_fn(env_cfg, state, action, key):
@@ -550,4 +614,6 @@ class JaxSocialNav:
     @staticmethod
     def save_videos(video_dir, traces, records, env_cfg, hparams, module):
         from env.jax_env.jax_render import save_videos
-        return save_videos(video_dir, traces, records, env_cfg, hparams, module)
+        planar_traces = [[{**frame, "snapshot": planar_state(env_cfg, frame["snapshot"])}
+                          for frame in trace] for trace in traces]
+        return save_videos(video_dir, planar_traces, records, env_cfg, hparams, module)

@@ -97,13 +97,20 @@ class HumanoidRobot(Robot):
         velocity = self.world_velocity(state)
         return jnp.column_stack([self.rotation(state), jnp.array([-velocity[1], velocity[0]])])
 
-    def step_with_info(self, state, action, dt):
+    def step(self, state, action, dt):
         """Midpoint world translation; exact held-input body velocities and yaw."""
         midpoint = state.at[2].add(action[2]*dt/2).at[3:5].add(action[:2]*dt/2)
         next_state = state.at[:2].add(self.world_velocity(midpoint)*dt)
         next_state = next_state.at[2].set(angle_normalize(state[2]+action[2]*dt))
         next_state = next_state.at[3:5].add(action[:2]*dt)
         return RobotStep(next_state, self.world_velocity(next_state), action)
+
+    def initial_state(self, pose):
+        return jnp.concatenate([pose.astype(jnp.float64), jnp.zeros(2)])
+
+    def check_state_limits(self, state, tolerance=1e-6):
+        return (jnp.all(jnp.isfinite(state))
+                & jnp.all(self.velocity_margin(state) >= -tolerance))
 
     def input_bounds(self):
         limits = jnp.array([self.af_max, self.al_max, self.omega_max])
@@ -113,7 +120,7 @@ class HumanoidRobot(Robot):
         return jnp.array([state[3]-self.vf_min, self.vf_max-state[3],
                           state[4]-self.vl_min, self.vl_max-state[4]])
 
-    def navigation_state(self, state):
+    def planar_pose(self, state):
         return state[:3]
 
     def control_output_matrix(self, state):

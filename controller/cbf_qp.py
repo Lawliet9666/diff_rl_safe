@@ -14,6 +14,17 @@ from env.robots import UnicycleRobot, HumanoidRobot
 from env.robots.base import check_obstacle_shapes
 
 
+def select_obstacles(position, obstacles, top_k):
+    """Restrict QP visibility while preserving original scene indices and shapes."""
+    if top_k is None:
+        return obstacles
+    distance = jnp.linalg.norm(obstacles.centers-position, axis=1)
+    _, indices = jax.lax.top_k(-jnp.where(obstacles.mask > .5, distance, jnp.inf),
+                              min(top_k, obstacles.mask.size))
+    mask = jnp.zeros_like(obstacles.mask).at[indices].set(obstacles.mask[indices])
+    return obstacles._replace(mask=mask)
+
+
 @dataclass(frozen=True)
 class SolverConfig:
     eps_abs: float = 1e-9

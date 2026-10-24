@@ -46,7 +46,7 @@ class UnicycleRobot(Robot):
         v, omega = action
         return jnp.array([v*jnp.cos(state[2]), v*jnp.sin(state[2]), omega])
 
-    def step_with_info(self, state, action, dt):
+    def step(self, state, action, dt):
         action = jnp.asarray(action, dtype=jnp.float32)
         v = jnp.clip(action[..., 0], -self.v_max, self.v_max)
         omega = jnp.clip(action[..., 1], -self.omega_max, self.omega_max)
@@ -60,11 +60,14 @@ class UnicycleRobot(Robot):
         velocity = jnp.stack([v * jnp.cos(next_theta), v * jnp.sin(next_theta)], axis=-1)
         return RobotStep(next_state, velocity, applied)
 
+    def initial_state(self, pose):
+        return jnp.asarray(pose, dtype=jnp.float32)
+
     def input_bounds(self):
         limits = jnp.array([self.v_max, self.omega_max])
         return -limits, limits
 
-    def navigation_state(self, state):
+    def planar_pose(self, state):
         return state
 
     def control_output_matrix(self, state):

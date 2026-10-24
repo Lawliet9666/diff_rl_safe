@@ -1,4 +1,4 @@
-"""Robot selection and the existing planar SocialNav stepping interface."""
+"""Robot model selection and the shared stateless interface."""
 from dataclasses import fields
 
 from .base import Robot, RobotStep, angle_normalize
@@ -35,12 +35,5 @@ def make_robot(robot_type, config=None, **parameters):
     return model(**parameters)
 
 
-def robot_step(cfg, state, action):
-    """Keep the original SocialNav tuple and its planar integration behavior."""
-    if cfg.robot_type not in {"single_integrator", "unicycle"}:
-        raise ValueError("planar robot_step requires single_integrator or unicycle")
-    return tuple(cfg.robot.step_with_info(state, action, cfg.dt))
-
-
 __all__ = ['Robot', 'RobotStep', 'SingleIntegratorRobot', 'UnicycleRobot',
-           'QuadrotorRobot', 'HumanoidRobot', 'make_robot', 'robot_step', 'angle_normalize']
+           'QuadrotorRobot', 'HumanoidRobot', 'make_robot', 'angle_normalize']

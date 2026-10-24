@@ -105,7 +105,7 @@ class QuadrotorRobot(Robot):
         return jnp.concatenate([v, self.acceleration(state),
                                 (R@skew(action[:3])).reshape(-1), action[3:4]])
 
-    def step_with_info(self, state, action, dt):
+    def step(self, state, action, dt):
         """Midpoint translation, exact held-rate rotation; no additional clipping."""
         p, v, R, T = unpack(state)
         Rmid = R@_rotation_increment(action[:3], dt/2)
@@ -115,11 +115,24 @@ class QuadrotorRobot(Robot):
             jnp.array([T+action[3]*dt])])
         return RobotStep(next_state, next_state[3:6], action)
 
+    def initial_state(self, pose):
+        state = self.hover_state(jnp.array([pose[0], pose[1], self.altitude]))
+        yaw = pose[2].astype(state.dtype)
+        c, s = jnp.cos(yaw), jnp.sin(yaw)
+        R = jnp.array([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]])
+        return state.at[6:15].set(R.reshape(-1))
+
+    def check_state_limits(self, state, tolerance=1e-6):
+        limits = jnp.array([state[2]-self.altitude_min, self.altitude_max-state[2],
+                            state[14]-math.cos(self.tilt_max),
+                            state[15]-self.thrust_min, self.thrust_max-state[15]])
+        return jnp.all(jnp.isfinite(state)) & jnp.all(limits >= -tolerance)
+
     def input_bounds(self):
         limits = jnp.array([self.omega_max]*3+[self.thrust_rate_max])
         return -limits, limits
 
-    def navigation_state(self, state):
+    def planar_pose(self, state):
         R = state[6:15].reshape(3, 3)
         yaw = jnp.arctan2(R[1, 0], R[0, 0])
         return jnp.array([state[0], state[1], yaw])

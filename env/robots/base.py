@@ -76,12 +76,18 @@ class Robot(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def step_with_info(self, state, action, dt):
+    def step(self, state, action, dt):
         """Return next state, world velocity and applied physical input."""
         raise NotImplementedError
 
-    def step(self, state, action, dt):
-        return self.step_with_info(state, action, dt).state
+    @abstractmethod
+    def initial_state(self, pose):
+        """Create the complete model state from a sampled [x, y, yaw] pose."""
+        raise NotImplementedError
+
+    def check_state_limits(self, state, tolerance=1e-6):
+        """Return whether the state is finite and satisfies physical state limits."""
+        return jnp.all(jnp.isfinite(state))
 
     @abstractmethod
     def input_bounds(self):
@@ -89,7 +95,7 @@ class Robot(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def navigation_state(self, state):
+    def planar_pose(self, state):
         """Return the [x, y, yaw] projection used by the crowd and renderer."""
         raise NotImplementedError
 

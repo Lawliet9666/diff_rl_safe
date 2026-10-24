@@ -16,7 +16,7 @@ class SingleIntegratorRobot(Robot):
     def dynamics(self, state, action):
         return jnp.array([action[0], action[1], 0.])
 
-    def step_with_info(self, state, action, dt):
+    def step(self, state, action, dt):
         action = jnp.asarray(action, dtype=jnp.float32)
         speed = jnp.linalg.norm(action, axis=-1, keepdims=True)
         scale = jnp.minimum(1.0, self.v_max / jnp.maximum(speed, 1e-8))
@@ -26,10 +26,13 @@ class SingleIntegratorRobot(Robot):
         next_state = jnp.concatenate([next_xy, next_theta], axis=-1)
         return RobotStep(next_state, applied, applied)
 
+    def initial_state(self, pose):
+        return jnp.asarray(pose, dtype=jnp.float32)
+
     def input_bounds(self):
         # The step also enforces the original Euclidean speed limit.
         limits = jnp.full(2, self.v_max)
         return -limits, limits
 
-    def navigation_state(self, state):
+    def planar_pose(self, state):
         return state

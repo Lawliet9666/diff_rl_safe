@@ -59,6 +59,9 @@ def make_controller(config):
     """Bind a configured robot, environment period and common solver settings."""
     if config.controller.type != "cbf_qp":
         raise ValueError(f"unsupported controller type: {config.controller.type!r}")
+    top_k = config.controller.qp_obs_top_k
+    if top_k is not None and (not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0):
+        raise ValueError("controller.qp_obs_top_k must be null or a positive integer")
     weight = config.controller.slack_weight
     validate_slack_weight(weight)
     if weight > 0 and config.robot.type != "unicycle":
