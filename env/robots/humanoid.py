@@ -3,12 +3,24 @@
 This ideal velocity-tracking model does not simulate joints or balance.
 """
 from dataclasses import dataclass
+from functools import partial
 import math
 from typing import ClassVar
 
+import jax
 import jax.numpy as jnp
 
-from .base import Robot, RobotStep, angle_normalize
+from .base import (Robot, RobotStep, angle_normalize, Constraints,
+                   check_obstacle_shapes, masked_rows, join_constraints)
+
+
+def _parabolic_value(z, w, radius, cfg):
+    distance = jnp.linalg.norm(z)
+    e = z / distance
+    tangent = jnp.array([-e[1], e[0]])
+    clearance = jnp.sqrt(z @ z - radius**2)
+    lam = cfg.parabolic_gain * clearance / jnp.sqrt(w @ w + cfg.speed_epsilon**2)
+    return e @ w + lam * (tangent @ w)**2 + cfg.clearance_gain * clearance
 
 
 @dataclass(frozen=True)
@@ -73,6 +85,76 @@ class HumanoidRobot(Robot):
     def control_output_matrix(self, state, control_config):
         """Physical input tracking, matching the paper's shared QP objective."""
         return jnp.eye(3)
+
+    def barrier_domain_valid(self, state, obstacles, cfg):
+        """The parabolic barrier is defined strictly outside inflated obstacles."""
+        if cfg.barrier == "distance":
+            return jnp.array(True)
+        radius = cfg.radius + obstacles.radii + cfg.margin
+        q = jnp.sum((state[:2]-obstacles.centers)**2, axis=1) - radius**2
+        return jnp.all((obstacles.mask <= .5) | (q > 0))
+
+    def distance_barrier(self, state, obstacles, cfg):
+        """Return h, h_dot, dh_dot_dx_g and h_ddot_drift.
+
+        dh_dot_dx_g = (d h_dot / d state) @ g(state).
+        h_ddot = dh_dot_dx_g@u+h_ddot_drift.
+        """
+        z = state[:2]-obstacles.centers
+        w = self.world_velocity(state)-obstacles.velocities
+        radius = cfg.radius + obstacles.radii + cfg.margin
+        B = self.acceleration_map(state)
+        h = jnp.sum(z*z, axis=1)-radius**2
+        h_dot = 2*jnp.sum(z*w, axis=1)
+        dh_dot_dx_g = 2*z @ B
+        h_ddot_drift = 2*jnp.sum(w*w, axis=1)
+        return h, h_dot, dh_dot_dx_g, h_ddot_drift
+
+    def parabolic_barrier(self, state, obstacles, cfg):
+        """Return h, squared-clearance q, dh_dx_g and h_dot_drift.
+
+        dh_dz and dh_dw are gradients with respect to relative position/velocity.
+        h_dot = dh_dx_g@u+h_dot_drift.
+        """
+        z = state[:2]-obstacles.centers
+        w = self.world_velocity(state)-obstacles.velocities
+        radius = cfg.radius + obstacles.radii + cfg.margin
+        B = self.acceleration_map(state)
+        # Give inactive padding a valid point before differentiating the square root.
+        dummy = jnp.stack([radius+1., jnp.zeros_like(radius)], axis=1)
+        z = jnp.where((obstacles.mask > .5)[:, None], z, dummy)
+        w = jnp.where((obstacles.mask > .5)[:, None], w, 0.)
+        value = lambda z, w, r: _parabolic_value(z, w, r, cfg)
+        h = jax.vmap(value)(z, w, radius)
+        dh_dz, dh_dw = jax.vmap(jax.grad(value, argnums=(0, 1)))(z, w, radius)
+        q = jnp.sum(z*z, axis=1)-radius**2
+        dh_dx_g = dh_dw @ B
+        h_dot_drift = jnp.sum(dh_dz*w, axis=1)
+        return h, q, dh_dx_g, h_dot_drift
+
+    @partial(jax.jit, static_argnames=("self", "cbf_config"))
+    def cbf_constraints(self, state, obstacles, cbf_config):
+        """Assemble distance/parabolic obstacle CBFs and next-step velocity bounds."""
+        check_obstacle_shapes(obstacles)
+        cfg = cbf_config
+        if cfg.barrier == "distance":
+            h, h_dot, A, h_ddot_drift = self.distance_barrier(state, obstacles, cfg)
+            k1, k2 = cfg.gains
+            b = h_ddot_drift+(k1+k2)*h_dot+k1*k2*h
+            domain = jnp.stack([h, h_dot+k1*h], axis=1)
+        elif cfg.barrier == "parabolic":
+            h, q, A, h_dot_drift = self.parabolic_barrier(state, obstacles, cfg)
+            b = h_dot_drift+cfg.alpha*h
+            domain = jnp.stack([h, q], axis=1)
+        else:
+            raise ValueError("humanoid barrier must be distance or parabolic")
+        obstacle_rows = masked_rows(A, b, domain, obstacles.mask)
+        # Bound the ideal model's next body-velocity command without integrator clipping.
+        margin = self.velocity_margin(state)
+        velocity_rows = Constraints(
+            cfg.dt*jnp.array([[1., 0., 0.], [-1., 0., 0.], [0., 1., 0.], [0., -1., 0.]]),
+            margin, margin)
+        return join_constraints(obstacle_rows, velocity_rows)
 
     def nominal_control(self, state, goal, control_config):
         delta = goal-state[:2]

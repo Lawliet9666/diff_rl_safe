@@ -1,10 +1,12 @@
 """Unicycle equations and the original SocialNav Euler/clipping convention."""
 from dataclasses import dataclass
+from functools import partial
 from typing import ClassVar
 
+import jax
 import jax.numpy as jnp
 
-from .base import Robot, RobotStep, angle_normalize
+from .base import Robot, RobotStep, angle_normalize, check_obstacle_shapes, masked_rows
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,29 @@ class UnicycleRobot(Robot):
         c, s = jnp.cos(state[2]), jnp.sin(state[2])
         ell = control_config.lookahead
         return jnp.array([[c, -ell*s], [s, ell*c]])
+
+    def barrier(self, state, obstacles, cfg):
+        """Return h, dh_dx_g and obstacle_motion; h_dot = dh_dx_g@u-obstacle_motion.
+
+        dh_dx_g is the state gradient of h multiplied by the input map g.
+        """
+        heading = jnp.array([jnp.cos(state[2]), jnp.sin(state[2])])
+        q = state[:2]+cfg.lookahead*heading
+        rel = q-obstacles.centers
+        # Inflating by lookahead also separates the actual robot disk.
+        distance = cfg.radius+obstacles.radii+cfg.margin+cfg.lookahead
+        h = jnp.sum(rel*rel, axis=-1)-distance**2
+        dh_dx_g = 2*rel@self.control_output_matrix(state, cfg)
+        obstacle_motion = 2*jnp.sum(rel*obstacles.velocities, axis=1)
+        return h, dh_dx_g, obstacle_motion
+
+    @partial(jax.jit, static_argnames=("self", "cbf_config"))
+    def cbf_constraints(self, state, obstacles, cbf_config):
+        """First-order obstacle CBFs for the unicycle lookahead point."""
+        check_obstacle_shapes(obstacles)
+        h, dh_dx_g, obstacle_motion = self.barrier(state, obstacles, cbf_config)
+        b = cbf_config.alpha*h-obstacle_motion
+        return masked_rows(dh_dx_g, b, h[:, None], obstacles.mask)
 
     def nominal_control(self, state, goal, control_config):
         """Represent the old planar go-to-goal velocity in physical input coordinates."""

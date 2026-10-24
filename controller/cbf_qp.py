@@ -1,4 +1,4 @@
-"""Model-specific JAX CBF constraints and shared CPU OSQP safety filtering."""
+"""Shared CPU OSQP safety filtering over robot-provided CBF constraints."""
 from typing import NamedTuple
 from dataclasses import dataclass
 from functools import partial
@@ -11,47 +11,7 @@ import osqp
 from scipy import sparse
 
 from env.robots import UnicycleRobot, QuadrotorRobot, HumanoidRobot
-from env.robots.quadrotor import skew, unpack
-
-
-class Obstacles(NamedTuple):
-    """Single scene: centers/velocities [N,2], radii/mask [N].
-
-    Velocities are world-frame and held constant in the barrier prediction.
-    Masked slots may contain arbitrary finite values; they add no constraint.
-    """
-    centers: jax.Array
-    velocities: jax.Array
-    radii: jax.Array
-    mask: jax.Array
-
-
-class Constraints(NamedTuple):
-    """A u + b >= 0; domain contains h and recursive HOCBF initial values."""
-    A: jax.Array
-    b: jax.Array
-    domain: jax.Array
-
-
-def check_obstacle_shapes(obstacles):
-    n = obstacles.centers.shape[0]
-    if (obstacles.centers.shape != (n, 2)
-            or obstacles.velocities.shape != (n, 2)
-            or obstacles.radii.shape != (n,) or obstacles.mask.shape != (n,)):
-        raise ValueError("expected centers/velocities [N,2] and radii/mask [N]")
-
-
-def masked_rows(A, b, domain, mask):
-    active = mask > 0.5
-    # A strictly feasible 0*u+1>=0 row avoids a degenerate masked equality.
-    return Constraints(jnp.where(active[:, None], A, 0.0),
-                       jnp.where(active, b, 1.0),
-                       jnp.where(active[:, None], domain, 1.0).reshape(-1))
-
-
-def join_constraints(*blocks):
-    return Constraints(*(jnp.concatenate([b[i] for b in blocks], axis=0)
-                         for i in range(3)))
+from env.robots.base import check_obstacle_shapes
 
 
 @dataclass(frozen=True)
@@ -173,115 +133,6 @@ class ControlResult(NamedTuple):
     correction_norm: float
     solver_status: str
     iterations: int
-
-
-def unicycle_constraints(robot, state, obstacles, cbf_config):
-    """First-order obstacle CBFs for the unicycle lookahead point."""
-    check_obstacle_shapes(obstacles)
-    theta = state[2]
-    heading = jnp.array([jnp.cos(theta), jnp.sin(theta)])
-    q = state[:2]+cbf_config.lookahead*heading
-    B = robot.control_output_matrix(state, cbf_config)
-    rel = q-obstacles.centers
-    # Inflating by lookahead also separates the actual robot disk.
-    distance = cbf_config.radius+obstacles.radii+cbf_config.margin+cbf_config.lookahead
-    h = jnp.sum(rel*rel, axis=-1)-distance**2
-    A = 2*rel@B
-    b = cbf_config.alpha*h-2*jnp.sum(rel*obstacles.velocities, axis=1)
-    return masked_rows(A, b, h[:, None], obstacles.mask)
-
-
-def _hocbf(h, h1, h2, A3, b3, gains):
-    k1, k2, k3 = gains
-    psi1 = h1+k1*h
-    psi2 = h2+(k1+k2)*h1+k1*k2*h
-    b = b3+(k1+k2+k3)*h2+(k1*k2+k1*k3+k2*k3)*h1+k1*k2*k3*h
-    domain = jnp.stack([h, psi1, psi2], axis=-1).reshape(-1)
-    return Constraints(A3, b, domain)
-
-
-def quadrotor_constraints(robot, state, obstacles, cbf_config):
-    """Obstacle/altitude HOCBFs plus tilt and thrust state constraints."""
-    check_obstacle_shapes(obstacles)
-    p, v, R, T = unpack(state)
-    a, J = robot.acceleration(state), robot.jerk_map(state)
-    rel, w = p[None, :2]-obstacles.centers, v[None, :2]-obstacles.velocities
-    h = jnp.sum(rel*rel, axis=-1)-(cbf_config.radius+obstacles.radii+cbf_config.margin)**2
-    h1 = 2*jnp.sum(rel*w, axis=1)
-    h2 = 2*jnp.sum(w*w, axis=1)+2*rel@a[:2]
-    obs = _hocbf(h, h1, h2, 2*rel@J[:2], 6*w@a[:2], cbf_config.gains)
-    obs = masked_rows(obs.A, obs.b, obs.domain.reshape((-1, 3)), obstacles.mask)
-    normals = jnp.array([[0., 0., 1.], [0., 0., -1.]])
-    offset = jnp.array([-cbf_config.altitude_min, cbf_config.altitude_max])
-    altitude = _hocbf(normals@p+offset, normals@v, normals@a,
-                       normals@J, jnp.zeros(2), cbf_config.gains)
-    htilt = R[2, 2]-math.cos(cbf_config.tilt_max)
-    tilt_A = jnp.concatenate([(-R@skew(jnp.array([0., 0., 1.])))[2], jnp.zeros(1)])
-    limits = Constraints(jnp.stack([tilt_A, jnp.array([0., 0., 0., 1.]),
-                                    jnp.array([0., 0., 0., -1.])]),
-                         jnp.array([cbf_config.tilt_gain*htilt,
-                                    cbf_config.thrust_gain*(T-cbf_config.thrust_min),
-                                    cbf_config.thrust_gain*(cbf_config.thrust_max-T)]),
-                         jnp.array([htilt, T-cbf_config.thrust_min, cbf_config.thrust_max-T]))
-    return join_constraints(obs, altitude, limits)
-
-
-def _parabolic_value(z, w, radius, cfg):
-    distance = jnp.linalg.norm(z)
-    e = z / distance
-    tangent = jnp.array([-e[1], e[0]])
-    clearance = jnp.sqrt(z @ z - radius**2)
-    lam = cfg.parabolic_gain * clearance / jnp.sqrt(w @ w + cfg.speed_epsilon**2)
-    return e @ w + lam * (tangent @ w)**2 + cfg.clearance_gain * clearance
-
-
-def _humanoid_barrier_domain_valid(state, obstacles, cfg):
-    """The parabolic formula is defined strictly outside inflated obstacles."""
-    check_obstacle_shapes(obstacles)
-    if cfg.barrier == "distance":
-        return jnp.array(True)
-    radius = cfg.radius + obstacles.radii + cfg.margin
-    q = jnp.sum((state[:2]-obstacles.centers)**2, axis=1) - radius**2
-    return jnp.all((obstacles.mask <= .5) | (q > 0))
-
-
-def humanoid_constraints(robot, state, obstacles, cbf_config):
-    """Distance or parabolic obstacle CBFs and next-step body velocity bounds."""
-    check_obstacle_shapes(obstacles)
-    cfg = cbf_config
-    z = state[:2]-obstacles.centers
-    w = robot.world_velocity(state)-obstacles.velocities
-    radius = cfg.radius + obstacles.radii + cfg.margin
-    B = robot.acceleration_map(state)
-    if cfg.barrier == "distance":
-        h = jnp.sum(z*z, axis=1)-radius**2
-        h1 = 2*jnp.sum(z*w, axis=1)
-        k1, k2 = cfg.gains
-        A = 2*z @ B
-        b = 2*jnp.sum(w*w, axis=1)+(k1+k2)*h1+k1*k2*h
-        domain = jnp.stack([h, h1+k1*h], axis=1)
-    elif cfg.barrier == "parabolic":
-        # Inactive padding may lie inside a disk; give it an irrelevant,
-        # valid evaluation point before differentiating, then mask its rows.
-        dummy = jnp.stack([radius+1., jnp.zeros_like(radius)], axis=1)
-        z = jnp.where((obstacles.mask > .5)[:, None], z, dummy)
-        w = jnp.where((obstacles.mask > .5)[:, None], w, 0.)
-        value = lambda z, w, r: _parabolic_value(z, w, r, cfg)
-        h = jax.vmap(value)(z, w, radius)
-        dz, dw = jax.vmap(jax.grad(value, argnums=(0, 1)))(z, w, radius)
-        A = dw @ B
-        b = jnp.sum(dz*w, axis=1)+cfg.alpha*h
-        domain = jnp.stack([h, jnp.sum(z*z, axis=1)-radius**2], axis=1)
-    else:
-        raise ValueError("humanoid barrier must be distance or parabolic")
-    obstacle_rows = masked_rows(A, b, domain, obstacles.mask)
-    # The ideal model's body velocities are its command-integrator states.
-    # These rows constrain the next command; the integrator never clips it.
-    margin = robot.velocity_margin(state)
-    velocity_rows = Constraints(
-        cfg.dt*jnp.array([[1., 0., 0.], [-1., 0., 0.], [0., 1., 0.], [0., -1., 0.]]),
-        margin, margin)
-    return join_constraints(obstacle_rows, velocity_rows)
 
 
 def _tracking_qp_data(nominal, constraints, low, high, weights, output_matrix):
@@ -420,18 +271,6 @@ def solve_slack_qp(nominal, constraints, low, high, weights, *, soft_mask,
     return result, slack
 
 
-@partial(jax.jit, static_argnames=("robot", "cbf_config"))
-def _cbf_constraints(robot, state, obstacles, cbf_config):
-    if isinstance(robot, UnicycleRobot):
-        return unicycle_constraints(robot, state, obstacles, cbf_config)
-    if isinstance(robot, QuadrotorRobot):
-        return quadrotor_constraints(robot, state, obstacles, cbf_config)
-    if isinstance(robot, HumanoidRobot):
-        return humanoid_constraints(robot, state, obstacles, cbf_config)
-    raise NotImplementedError(
-        f"CBF constraints are not implemented for {type(robot).__name__}")
-
-
 @partial(jax.jit, static_argnames=("robot", "control_config"))
 def _control_output_matrix(robot, state, control_config):
     return robot.control_output_matrix(state, control_config)
@@ -439,24 +278,25 @@ def _control_output_matrix(robot, state, control_config):
 
 def control_residual(robot, state, action, obstacles, control_config):
     """Evaluate the actual applied input, including a requested fallback input."""
-    constraints = _cbf_constraints(robot, state, obstacles, control_config)
+    constraints = robot.cbf_constraints(state, obstacles, control_config)
     low, high = robot.input_bounds()
     return jnp.concatenate([constraints.A@action+constraints.b, action-low, high-action])
 
 
 def _solve_controller_qp(robot, state, nominal, obstacles, cbf_config, *, slack_weight):
     """Prepare shared QP inputs, then select hard or relaxed obstacle constraints."""
-    if isinstance(robot, HumanoidRobot) and not bool(
-            _humanoid_barrier_domain_valid(state, obstacles, cbf_config)):
-        # Do not extend the parabolic sqrt through collision or execute an old
-        # acceleration. Return an explicit failed result before calling OSQP.
-        action = jnp.full(robot.control_dim, jnp.nan)
-        residual = jnp.full(obstacles.mask.size+4+2*robot.control_dim, jnp.nan)
-        result = ControlResult(action, action, residual, jnp.full(3, jnp.inf),
-                               False, False, float("nan"), "invalid barrier domain", 0)
-        return result, jnp.zeros_like(obstacles.mask)
+    if isinstance(robot, HumanoidRobot):
+        check_obstacle_shapes(obstacles)
+        if not bool(robot.barrier_domain_valid(state, obstacles, cbf_config)):
+            # Do not extend the parabolic sqrt through collision or execute an old
+            # acceleration. Return an explicit failed result before calling OSQP.
+            action = jnp.full(robot.control_dim, jnp.nan)
+            residual = jnp.full(obstacles.mask.size+4+2*robot.control_dim, jnp.nan)
+            result = ControlResult(action, action, residual, jnp.full(3, jnp.inf),
+                                   False, False, float("nan"), "invalid barrier domain", 0)
+            return result, jnp.zeros_like(obstacles.mask)
     low, high = robot.input_bounds()
-    constraints = _cbf_constraints(robot, state, obstacles, cbf_config)
+    constraints = robot.cbf_constraints(state, obstacles, cbf_config)
     weights = jnp.asarray(cbf_config.weights)
     options = dict(solver=cbf_config.solver,
                    output_matrix=_control_output_matrix(robot, state, cbf_config))

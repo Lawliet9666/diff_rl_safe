@@ -1,4 +1,4 @@
-"""Stateless robot contract; all changing state stays in JAX arrays."""
+"""Shared pure-JAX robot data, constraint tools and stateless robot contract."""
 from abc import ABC, abstractmethod
 from typing import NamedTuple
 
@@ -14,6 +14,56 @@ class RobotStep(NamedTuple):
 
 def angle_normalize(angle):
     return (angle + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+
+
+class Obstacles(NamedTuple):
+    """Single scene: centers/velocities [N,2], radii/mask [N].
+
+    Velocities are world-frame and held constant in the barrier prediction.
+    Masked slots may contain arbitrary finite values; they add no constraint.
+    """
+    centers: Array
+    velocities: Array
+    radii: Array
+    mask: Array
+
+
+class Constraints(NamedTuple):
+    """A u + b >= 0; domain contains h and recursive HOCBF initial values."""
+    A: Array
+    b: Array
+    domain: Array
+
+
+def check_obstacle_shapes(obstacles):
+    n = obstacles.centers.shape[0]
+    if (obstacles.centers.shape != (n, 2)
+            or obstacles.velocities.shape != (n, 2)
+            or obstacles.radii.shape != (n,) or obstacles.mask.shape != (n,)):
+        raise ValueError("expected centers/velocities [N,2] and radii/mask [N]")
+
+
+def masked_rows(A, b, domain, mask):
+    active = mask > 0.5
+    # A strictly feasible 0*u+1>=0 row avoids a degenerate masked equality.
+    return Constraints(jnp.where(active[:, None], A, 0.0),
+                       jnp.where(active, b, 1.0),
+                       jnp.where(active[:, None], domain, 1.0).reshape(-1))
+
+
+def join_constraints(*blocks):
+    return Constraints(*(jnp.concatenate([b[i] for b in blocks], axis=0)
+                         for i in range(3)))
+
+
+def _hocbf(h, h_dot, h_ddot, dh_ddot_dx_g, h_dddot_drift, gains):
+    k1, k2, k3 = gains
+    psi1 = h_dot+k1*h
+    psi2 = h_ddot+(k1+k2)*h_dot+k1*k2*h
+    b = (h_dddot_drift+(k1+k2+k3)*h_ddot
+         +(k1*k2+k1*k3+k2*k3)*h_dot+k1*k2*k3*h)
+    domain = jnp.stack([h, psi1, psi2], axis=-1).reshape(-1)
+    return Constraints(dh_ddot_dx_g, b, domain)
 
 
 class Robot(ABC):
@@ -42,6 +92,11 @@ class Robot(ABC):
     def navigation_state(self, state):
         """Return the [x, y, yaw] projection used by the crowd and renderer."""
         raise NotImplementedError
+
+    def cbf_constraints(self, state, obstacles, cbf_config):
+        """Return A, b and initial domain conditions for A@u+b >= 0."""
+        raise NotImplementedError(
+            f"CBF constraints are not implemented for {type(self).__name__}")
 
     def nominal_control(self, state, goal, control_config):
         """Return a goal-tracking reference without applying a safety filter."""

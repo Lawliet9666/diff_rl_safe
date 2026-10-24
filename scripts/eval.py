@@ -1,7 +1,7 @@
 """Evaluate RL checkpoints or a CBF-QP controller and optionally render its episodes."""
 
 from pathlib import Path
-from dataclasses import asdict, fields
+from dataclasses import asdict
 import argparse
 import json
 import math
@@ -58,72 +58,6 @@ def save_video(path, frames, fps=30):
             raise
 
 
-def _build_controller_config(config):
-    from controller.cbf_qp import SolverConfig, UnicycleConfig, QuadrotorConfig, HumanoidConfig
-
-    r, c, e = config.robot, config.controller, config.env
-    if r.type not in {"unicycle", "quadrotor", "humanoid"}:
-        raise ValueError("controller robot must be unicycle, quadrotor or humanoid")
-    workspace = tuple(float(v) for v in [*e.workspace.x, *e.workspace.y])
-    if (len(workspace) != 4 or not all(math.isfinite(v) for v in workspace)
-            or workspace[0] >= workspace[1] or workspace[2] >= workspace[3]):
-        raise ValueError("env.workspace requires finite increasing x/y bounds")
-    def required_section(node, names, label):
-        values = OmegaConf.to_container(node, resolve=True)
-        missing = set(names)-values.keys()
-        if missing:
-            raise ValueError(f"{label} is missing required fields: {', '.join(sorted(missing))}")
-        return values
-
-    def robot_section(node, names, label):
-        groups = ("nominal", "cbf", "qp")
-        sections = required_section(node, groups, label)
-        params = {key: value for key, value in sections.items() if key not in groups}
-        blocks = [sections["nominal"], sections["qp"]]
-        if r.type == "humanoid":
-            cbf = required_section(OmegaConf.create(sections["cbf"]),
-                                   ("distance", "parabolic"), f"{label}.cbf")
-            blocks.extend([cbf["distance"], cbf["parabolic"]])
-        else:
-            blocks.append(sections["cbf"])
-        for block in blocks:
-            if not isinstance(block, dict):
-                raise ValueError(f"{label} parameter groups must be mappings")
-            duplicate = params.keys() & block.keys()
-            if duplicate:
-                raise ValueError(f"{label} has duplicate parameters: {', '.join(sorted(duplicate))}")
-            params.update(block)
-        return required_section(OmegaConf.create(params), names, label)
-
-    solver = SolverConfig(**required_section(c.solver, [f.name for f in fields(SolverConfig)],
-                                            "controller.solver"))
-    common = dict(radius=float(r.radius), margin=float(e.safety_margin),
-                  omega_max=float(r.omega_max), solver=solver)
-    if r.type == "unicycle":
-        names = {f.name for f in fields(UnicycleConfig)}-common.keys()-{"v_max", "goal_tolerance"}
-        params = robot_section(c.unicycle, names, "controller.unicycle")
-        params["weights"] = tuple(params["weights"])
-        return UnicycleConfig(goal_tolerance=float(e.robot_goal.tolerance),
-                              v_max=float(r.v_max), **common, **params)
-    elif r.type == "humanoid":
-        common.pop("omega_max")  # Physical limits belong to the robot model.
-        names = {f.name for f in fields(HumanoidConfig)}-common.keys()-{"dt", "goal_tolerance"}
-        params = robot_section(c.humanoid, names, "controller.humanoid")
-        for name in ("gains", "weights"):
-            params[name] = tuple(params[name])
-        return HumanoidConfig(dt=float(e.dt), goal_tolerance=float(e.robot_goal.tolerance),
-                              **common, **params)
-    else:
-        physical = {name: float(r[name]) for name in
-                    ["mass", "gravity", "thrust_rate_max", "thrust_min", "thrust_max",
-                     "tilt_max", "altitude", "altitude_min", "altitude_max"]}
-        names = {f.name for f in fields(QuadrotorConfig)}-common.keys()-physical.keys()
-        params = robot_section(c.quadrotor, names, "controller.quadrotor")
-        for name in ("gains", "weights", "acceleration_limits"):
-            params[name] = tuple(params[name])
-        return QuadrotorConfig(**common, **physical, **params)
-
-
 def _prepare_controller(config):
     """Validate settings and create the shared parameters and action generator."""
     from controller import make_controller
@@ -147,7 +81,12 @@ def _prepare_controller(config):
         raise ValueError("simulation overrides are no longer supported; configure env.* instead")
     if config.env.humans.num_humans < 1:
         raise ValueError("env.humans.num_humans must be >=1")
-    return _build_controller_config(config), make_controller(config)
+    workspace = tuple(float(v) for v in [*config.env.workspace.x, *config.env.workspace.y])
+    if (len(workspace) != 4 or not all(math.isfinite(v) for v in workspace)
+            or workspace[0] >= workspace[1] or workspace[2] >= workspace[3]):
+        raise ValueError("env.workspace requires finite increasing x/y bounds")
+    controller = make_controller(config)
+    return controller.keywords["control_config"], controller
 
 
 def _controller_failure_diagnostics(state, nominal, obs, result):
@@ -192,7 +131,7 @@ def _run_controller_episode(config, *, controller_setup=None):
     def action_fn(observation):
         nominal = nominal_control(robot_model, observation.robot, observation.goal, rcfg)
         return generate_action(robot_model, observation.robot, nominal,
-                               observation.obstacles, rcfg)
+                               observation.obstacles)
 
     action_fn(env.observe(navigation_state))[0].block_until_ready()
     history = {k: [] for k in ["time", "state", "centers", "status", "active_obstacles",
