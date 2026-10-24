@@ -1,12 +1,10 @@
 """Attitude-aware quadrotor: [p(3), v(3), row-major R(9), thrust(1)]."""
 from dataclasses import dataclass
-import math
 from typing import ClassVar
 
 import jax.numpy as jnp
 
 from .base import Robot, RobotStep
-from .cbf import Constraints, check_obstacle_shapes, masked_rows, join_constraints
 
 
 def skew(w):
@@ -25,15 +23,6 @@ def _rotation_increment(omega, dt):
     theta = jnp.sqrt(w@w+1e-24)
     K = skew(w)
     return jnp.eye(3)+jnp.sinc(theta/jnp.pi)*K+0.5*jnp.sinc(theta/(2*jnp.pi))**2*(K@K)
-
-
-def _hocbf(h, h1, h2, A3, b3, gains):
-    k1, k2, k3 = gains
-    psi1 = h1+k1*h
-    psi2 = h2+(k1+k2)*h1+k1*k2*h
-    b = b3+(k1+k2+k3)*h2+(k1*k2+k1*k3+k2*k3)*h1+k1*k2*k3*h
-    domain = jnp.stack([h, psi1, psi2], axis=-1).reshape(-1)
-    return Constraints(A3, b, domain)
 
 
 @dataclass(frozen=True)
@@ -87,34 +76,6 @@ class QuadrotorRobot(Robot):
         R = state[6:15].reshape(3, 3)
         yaw = jnp.arctan2(R[1, 0], R[0, 0])
         return jnp.array([state[0], state[1], yaw])
-
-    def barrier(self, state, centers, radii, cfg):
-        rel = state[:2]-centers
-        return jnp.sum(rel*rel, axis=-1)-(cfg.radius+radii+cfg.margin)**2
-
-    def cbf_constraints(self, state, obstacles, cbf_config):
-        check_obstacle_shapes(obstacles)
-        p, v, R, T = unpack(state)
-        a, J = self.acceleration(state), self.jerk_map(state)
-        rel, w = p[None, :2]-obstacles.centers, v[None, :2]-obstacles.velocities
-        h = self.barrier(state, obstacles.centers, obstacles.radii, cbf_config)
-        h1 = 2*jnp.sum(rel*w, axis=1)
-        h2 = 2*jnp.sum(w*w, axis=1)+2*rel@a[:2]
-        obs = _hocbf(h, h1, h2, 2*rel@J[:2], 6*w@a[:2], cbf_config.gains)
-        obs = masked_rows(obs.A, obs.b, obs.domain.reshape((-1, 3)), obstacles.mask)
-        normals = jnp.array([[0., 0., 1.], [0., 0., -1.]])
-        offset = jnp.array([-cbf_config.altitude_min, cbf_config.altitude_max])
-        altitude = _hocbf(normals@p+offset, normals@v, normals@a,
-                           normals@J, jnp.zeros(2), cbf_config.gains)
-        htilt = R[2, 2]-math.cos(cbf_config.tilt_max)
-        tilt_A = jnp.concatenate([(-R@skew(jnp.array([0., 0., 1.])))[2], jnp.zeros(1)])
-        limits = Constraints(jnp.stack([tilt_A, jnp.array([0., 0., 0., 1.]),
-                                        jnp.array([0., 0., 0., -1.])]),
-                             jnp.array([cbf_config.tilt_gain*htilt,
-                                        cbf_config.thrust_gain*(T-cbf_config.thrust_min),
-                                        cbf_config.thrust_gain*(cbf_config.thrust_max-T)]),
-                             jnp.array([htilt, T-cbf_config.thrust_min, cbf_config.thrust_max-T]))
-        return join_constraints(obs, altitude, limits)
 
     def nominal_control(self, state, goal, control_config):
         """Goal-tracking reference; CBF-QP filtering remains external."""

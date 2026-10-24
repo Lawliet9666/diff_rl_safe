@@ -1,26 +1,14 @@
 """DODGER planar model: [x, y, yaw, v_forward, v_lateral], [a_f, a_l, yaw_rate].
 
 This ideal velocity-tracking model does not simulate joints or balance.
-Distance ECBF and the paper's smooth parabolic variant share the same dynamics.
 """
 from dataclasses import dataclass
 import math
 from typing import ClassVar
 
-import jax
 import jax.numpy as jnp
 
 from .base import Robot, RobotStep, angle_normalize
-from .cbf import Constraints, check_obstacle_shapes, join_constraints, masked_rows
-
-
-def _parabolic_value(z, w, radius, cfg):
-    distance = jnp.linalg.norm(z)
-    e = z / distance
-    tangent = jnp.array([-e[1], e[0]])
-    clearance = jnp.sqrt(z @ z - radius**2)
-    lam = cfg.parabolic_gain * clearance / jnp.sqrt(w @ w + cfg.speed_epsilon**2)
-    return e @ w + lam * (tangent @ w)**2 + cfg.clearance_gain * clearance
 
 
 @dataclass(frozen=True)
@@ -81,52 +69,6 @@ class HumanoidRobot(Robot):
 
     def navigation_state(self, state):
         return state[:3]
-
-    def barrier_domain_valid(self, state, obstacles, cfg):
-        """The parabolic formula is defined strictly outside inflated obstacles."""
-        check_obstacle_shapes(obstacles)
-        if cfg.barrier == "distance":
-            return jnp.array(True)
-        radius = cfg.radius + obstacles.radii + cfg.margin
-        q = jnp.sum((state[:2]-obstacles.centers)**2, axis=1) - radius**2
-        return jnp.all((obstacles.mask <= .5) | (q > 0))
-
-    def cbf_constraints(self, state, obstacles, cbf_config):
-        check_obstacle_shapes(obstacles)
-        cfg = cbf_config
-        z = state[:2]-obstacles.centers
-        w = self.world_velocity(state)-obstacles.velocities
-        radius = cfg.radius + obstacles.radii + cfg.margin
-        B = self.acceleration_map(state)
-        if cfg.barrier == "distance":
-            h = jnp.sum(z*z, axis=1)-radius**2
-            h1 = 2*jnp.sum(z*w, axis=1)
-            k1, k2 = cfg.gains
-            A = 2*z @ B
-            b = 2*jnp.sum(w*w, axis=1)+(k1+k2)*h1+k1*k2*h
-            domain = jnp.stack([h, h1+k1*h], axis=1)
-        elif cfg.barrier == "parabolic":
-            # Inactive padding may lie inside a disk; give it an irrelevant,
-            # valid evaluation point before differentiating, then mask its rows.
-            dummy = jnp.stack([radius+1., jnp.zeros_like(radius)], axis=1)
-            z = jnp.where((obstacles.mask > .5)[:, None], z, dummy)
-            w = jnp.where((obstacles.mask > .5)[:, None], w, 0.)
-            value = lambda z, w, r: _parabolic_value(z, w, r, cfg)
-            h = jax.vmap(value)(z, w, radius)
-            dz, dw = jax.vmap(jax.grad(value, argnums=(0, 1)))(z, w, radius)
-            A = dw @ B
-            b = jnp.sum(dz*w, axis=1)+cfg.alpha*h
-            domain = jnp.stack([h, jnp.sum(z*z, axis=1)-radius**2], axis=1)
-        else:
-            raise ValueError("humanoid barrier must be distance or parabolic")
-        obstacle_rows = masked_rows(A, b, domain, obstacles.mask)
-        # The ideal model's body velocities are its command-integrator states.
-        # These rows constrain the next command; the integrator never clips it.
-        margin = self.velocity_margin(state)
-        velocity_rows = Constraints(
-            cfg.dt*jnp.array([[1., 0., 0.], [-1., 0., 0.], [0., 1., 0.], [0., -1., 0.]]),
-            margin, margin)
-        return join_constraints(obstacle_rows, velocity_rows)
 
     def control_output_matrix(self, state, control_config):
         """Physical input tracking, matching the paper's shared QP objective."""

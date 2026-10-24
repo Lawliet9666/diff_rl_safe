@@ -12,7 +12,7 @@ from env.jax_env.jax_social_nav import (
 )
 from env.obstacle.obstacle import advance_obstacles
 from env.robots import make_robot
-from env.robots.cbf import Obstacles
+from .cbf_qp import Obstacles
 
 
 def quadrotor_from_crowd(crowd, robot_cfg):

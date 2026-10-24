@@ -5,7 +5,6 @@ from typing import ClassVar
 import jax.numpy as jnp
 
 from .base import Robot, RobotStep, angle_normalize
-from .cbf import check_obstacle_shapes, masked_rows
 
 
 @dataclass(frozen=True)
@@ -39,25 +38,6 @@ class UnicycleRobot(Robot):
 
     def navigation_state(self, state):
         return state
-
-    def barrier(self, state, centers, radii, cfg):
-        heading = jnp.array([jnp.cos(state[2]), jnp.sin(state[2])])
-        rel = state[:2]+cfg.lookahead*heading-centers
-        # Inflating by lookahead ensures the actual base disk is also separated.
-        distance = cfg.radius+radii+cfg.margin+cfg.lookahead
-        return jnp.sum(rel*rel, axis=-1)-distance**2
-
-    def cbf_constraints(self, state, obstacles, cbf_config):
-        check_obstacle_shapes(obstacles)
-        theta = state[2]
-        heading = jnp.array([jnp.cos(theta), jnp.sin(theta)])
-        q = state[:2]+cbf_config.lookahead*heading
-        B = self.control_output_matrix(state, cbf_config)
-        rel = q-obstacles.centers
-        h = self.barrier(state, obstacles.centers, obstacles.radii, cbf_config)
-        A = 2*rel@B
-        b = cbf_config.alpha*h-2*jnp.sum(rel*obstacles.velocities, axis=1)
-        return masked_rows(A, b, h[:, None], obstacles.mask)
 
     def control_output_matrix(self, state, control_config):
         """J maps [v, omega] to the world velocity of the lookahead point."""

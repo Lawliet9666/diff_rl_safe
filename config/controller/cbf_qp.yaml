@@ -1,4 +1,5 @@
 type: cbf_qp
+slack_weight: 0.0  # 0: hard CBF-QP; >0: obstacle slack penalty (unicycle only).
 qp_obs_top_k: null  # null: all; positive integer: nearest obstacles by robot-center distance.
 
 solver:

@@ -1,6 +1,0 @@
-defaults:
-  - cbf_qp
-  - _self_
-
-type: cbf_qp_slack
-slack_weight: 10.0  # rho/2 * sum(delta_i^2), in the original CBF residual units.

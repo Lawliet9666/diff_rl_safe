@@ -43,11 +43,6 @@ class Robot(ABC):
         """Return the [x, y, yaw] projection used by the crowd and renderer."""
         raise NotImplementedError
 
-    def cbf_constraints(self, state, obstacles, cbf_config):
-        """Return A, b and initial safety conditions without solving a QP."""
-        raise NotImplementedError(
-            f"CBF constraints are not implemented for {type(self).__name__}")
-
     def nominal_control(self, state, goal, control_config):
         """Return a goal-tracking reference without applying a safety filter."""
         raise NotImplementedError(

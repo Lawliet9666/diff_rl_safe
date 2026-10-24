@@ -179,15 +179,19 @@ def _run_controller_episode(config, *, controller_setup=None):
     rcfg, generate_action = (_prepare_controller(config) if controller_setup is None
                              else controller_setup)
     robot, scenario, seed = str(config.robot.type), str(config.env.scenario), int(config.seed)
+    use_slack = config.controller.slack_weight > 0
     env = NavigationEnv(config, state_tolerance=rcfg.solver.feasibility_tolerance)
     cfg = env.cfg
     navigation_state = env.reset(jax.random.PRNGKey(seed))
     state, crowd = navigation_state
     goal = env.observe(navigation_state).goal
     robot_model = env.robot
+    nominal_control = jax.jit(
+        type(robot_model).nominal_control, static_argnames=("self", "control_config"))
 
     def action_fn(observation):
-        return generate_action(robot_model, observation.robot, observation.goal,
+        nominal = nominal_control(robot_model, observation.robot, observation.goal, rcfg)
+        return generate_action(robot_model, observation.robot, nominal,
                                observation.obstacles, rcfg)
 
     action_fn(env.observe(navigation_state))[0].block_until_ready()
@@ -233,8 +237,8 @@ def _run_controller_episode(config, *, controller_setup=None):
                 infeasible_steps += 1
                 status, reason = qp_status, qp_reason
                 break  # An old acceleration is not a safe fallback.
-            if qp_status != "infeasible" or config.controller.type == "cbf_qp_slack":
-                status = "controller_failure" if config.controller.type == "cbf_qp_slack" else qp_status
+            if qp_status != "infeasible" or use_slack:
+                status = "controller_failure" if use_slack else qp_status
                 reason = qp_reason
                 break
             infeasible_steps += 1
@@ -304,8 +308,8 @@ def _run_controller_episode(config, *, controller_setup=None):
         config={**asdict(rcfg), "workspace": tuple(float(v) for v in
             [*config.env.workspace.x, *config.env.workspace.y])})
     summary.update(
-        controller=str(config.controller.type),
-        slack_weight=config.controller.get("slack_weight"),
+        controller=str(config.controller.type)+("_slack" if use_slack else ""),
+        slack_weight=config.controller.slack_weight,
         slack_steps=int(np.count_nonzero(np.any(
             history["slack"] > rcfg.solver.feasibility_tolerance, axis=1))),
         slack_sum=finite(np.sum(history["slack"])),
@@ -384,7 +388,7 @@ def evaluate_controller(config, output, *, visualize=False, seeds=None, episodes
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(config, output/"config.yaml", resolve=True)
-    controller = str(config.controller.type)
+    controller = str(config.controller.type)+("_slack" if config.controller.slack_weight > 0 else "")
     results = []
     episode_path = output/"episodes.jsonl"
     episode_path.write_text("")
