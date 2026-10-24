@@ -17,9 +17,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from env.jax_env.jax_render import render_jax_social_nav_frame
-
-
 def _frame_to_rgb_array(frame):
     if hasattr(frame, "convert"):
         return np.asarray(frame.convert("RGB"), dtype=np.uint8)
@@ -64,10 +61,8 @@ def save_video(path, frames, fps=30):
 def _build_controller_config(config):
     from controller.cbf_qp import SolverConfig, UnicycleConfig, QuadrotorConfig, HumanoidConfig
 
-    from controller import make_controller
-    make_controller(config)  # Validate controller selection and its own parameters.
     r, c, e = config.robot, config.controller, config.env
-    if r.type not in {"unicycle", "quadrotor", "humanoid"} or r.get("simulator_model"):
+    if r.type not in {"unicycle", "quadrotor", "humanoid"}:
         raise ValueError("controller robot must be unicycle, quadrotor or humanoid")
     workspace = tuple(float(v) for v in [*e.workspace.x, *e.workspace.y])
     if (len(workspace) != 4 or not all(math.isfinite(v) for v in workspace)
@@ -82,9 +77,6 @@ def _build_controller_config(config):
 
     def robot_section(node, names, label):
         groups = ("nominal", "cbf", "qp")
-        if not any(group in node for group in groups):
-            # Saved controller runs still contain the previous flat layout.
-            return required_section(node, names, label)
         sections = required_section(node, groups, label)
         params = {key: value for key, value in sections.items() if key not in groups}
         blocks = [sections["nominal"], sections["qp"]]
@@ -110,8 +102,6 @@ def _build_controller_config(config):
     if r.type == "unicycle":
         names = {f.name for f in fields(UnicycleConfig)}-common.keys()-{"v_max", "goal_tolerance"}
         params = robot_section(c.unicycle, names, "controller.unicycle")
-        # Older saved runs contain heading_gain; Cartesian tracking no longer uses it.
-        params.pop("heading_gain", None)
         params["weights"] = tuple(params["weights"])
         return UnicycleConfig(goal_tolerance=float(r.goal_tolerance),
                               v_max=float(r.v_max), **common, **params)
@@ -134,7 +124,10 @@ def _build_controller_config(config):
         return QuadrotorConfig(**common, **physical, **params)
 
 
-def _validate_controller_config(config):
+def _prepare_controller(config):
+    """Validate settings and create the shared parameters and action generator."""
+    from controller import make_controller
+
     if not isinstance(config.seed, int) or isinstance(config.seed, bool):
         raise ValueError("seed must be an integer")
     if config.env.get("backend", "jax") != "jax":
@@ -154,7 +147,7 @@ def _validate_controller_config(config):
         raise ValueError("simulation overrides are no longer supported; configure env.* instead")
     if config.env.humans.num_humans < 1:
         raise ValueError("env.humans.num_humans must be >=1")
-    return _build_controller_config(config)
+    return _build_controller_config(config), make_controller(config)
 
 
 def _controller_failure_diagnostics(state, nominal, obs, result):
@@ -175,22 +168,16 @@ def _controller_failure_diagnostics(state, nominal, obs, result):
     return "controller_failure", reason, diagnostic
 
 
-def run_controller_episode(config):
-    """States include initial and terminal frames; command arrays contain executed steps only."""
-    episode, _, _ = _run_controller_episode(config)
-    return episode
-
-
-def _run_controller_episode(config):
-    """Return episode data and its existing renderer/controller configurations."""
+def _run_controller_episode(config, *, controller_setup=None):
+    """Run a fresh episode; reuse an optional batch (parameters, generator) pair."""
     import jax
     import jax.numpy as jnp
-    from controller import make_controller
     from controller.cbf_qp import control_residual
     from env.jax_env.jax_social_nav import compute_distances
     from controller.env_adapter import NavigationEnv
 
-    rcfg = _validate_controller_config(config)
+    rcfg, generate_action = (_prepare_controller(config) if controller_setup is None
+                             else controller_setup)
     robot, scenario, seed = str(config.robot.type), str(config.env.scenario), int(config.seed)
     env = NavigationEnv(config, state_tolerance=rcfg.solver.feasibility_tolerance)
     cfg = env.cfg
@@ -198,7 +185,6 @@ def _run_controller_episode(config):
     state, crowd = navigation_state
     goal = env.observe(navigation_state).goal
     robot_model = env.robot
-    generate_action = make_controller(config)
 
     def action_fn(observation):
         return generate_action(robot_model, observation.robot, observation.goal,
@@ -349,7 +335,7 @@ def _render_controller_frame(cfg, history, index, crowd, robot, robot_cfg):
     qp_viz = dict(topk_ids=np.flatnonzero(history["active_obstacles"][index]),
                   lookahead_distance=robot_cfg.lookahead if robot == "unicycle" else 0.)
     return render_jax_social_nav_frame(cfg, frame_state, status=str(history["status"][index]),
-        robot_traj=history["state"][:index+1, :2], qp_viz=qp_viz)
+        robot_traj=history["state"][:index+1, :2], qp_viz=qp_viz, robot_type=robot)
 
 
 def _save_controller_video(path, cfg, history, crowd, robot, robot_cfg):
@@ -393,7 +379,7 @@ def evaluate_controller(config, output, *, visualize=False, seeds=None, episodes
 
     from trainer.evaluation import eval_seed_values, safe_mean_std, paper_metric_summary
 
-    _validate_controller_config(config)
+    controller_setup = _prepare_controller(config)
     seed_values = eval_seed_values(episodes, [int(config.seed)] if seeds is None else seeds)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -404,7 +390,8 @@ def evaluate_controller(config, output, *, visualize=False, seeds=None, episodes
     episode_path.write_text("")
     for index, seed in enumerate(seed_values):
         episode_config = OmegaConf.merge(config, {"seed": int(seed)})
-        (result, history, goal, crowd), cfg, rcfg = _run_controller_episode(episode_config)
+        (result, history, goal, crowd), cfg, rcfg = _run_controller_episode(
+            episode_config, controller_setup=controller_setup)
         results.append(result)
         with episode_path.open("a") as episode_log:
             episode_log.write(json.dumps(result, allow_nan=False)+"\n")

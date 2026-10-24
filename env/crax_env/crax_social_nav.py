@@ -90,8 +90,8 @@ class CraxSocialNav(SafeGoalPoint):
     """CRAX Point scene and MJX pipeline; our task, controller and observations."""
 
     def __init__(self, config):
-        if config.robot.get("simulator_model") != "Point" or config.robot.type != "unicycle":
-            raise ValueError("crax_social_nav requires robot=point")
+        if config.robot.type != "unicycle":
+            raise ValueError("crax_social_nav requires robot.type=unicycle")
         configure_mjx_float32()
         self.nav_cfg = cfg = config_from_omegaconf(config)
         if cfg.omega_delta_factor:

@@ -6,6 +6,52 @@ def _scalar(value):
     return float(np.asarray(value).reshape(-1)[0])
 
 
+def _draw_robot(ax, position, yaw, radius, kind, color):
+    """Draw a heading-aware marker inside the unchanged circular footprint."""
+    from matplotlib.patches import Circle, Ellipse, Polygon, Rectangle
+    from matplotlib.transforms import Affine2D
+
+    pose = Affine2D().scale(radius).rotate(yaw).translate(*position) + ax.transData
+    dark, pale = "#1e40af", "#dbeafe"
+
+    def add(shape):
+        shape.set_transform(pose)
+        shape.set_zorder(6.5)
+        ax.add_artist(shape)
+
+    if kind not in {"quadrotor", "humanoid"}:
+        ax.add_artist(Circle(position, radius, facecolor=color, edgecolor="none",
+                            linewidth=0.0, alpha=0.82, zorder=6))
+        if kind == "unicycle":
+            add(Polygon([[.65, 0.], [.05, .28], [.18, 0.], [.05, -.28]],
+                        facecolor="white", edgecolor="none"))
+        return
+
+    ax.add_artist(Circle(position, radius, facecolor="none", edgecolor="#64748b",
+                        linewidth=0.9, linestyle="--", alpha=0.75, zorder=6))
+    if kind == "quadrotor":
+        for sign in (-1, 1):
+            ax.plot([-.5, .5], [-.5*sign, .5*sign], transform=pose,
+                    color=dark, linewidth=2, solid_capstyle="round", zorder=6)
+        for x in (-.5, .5):
+            for y in (-.5, .5):
+                add(Circle((x, y), .2, facecolor="white", edgecolor=color, linewidth=1))
+                add(Ellipse((x, y), .3, .075, angle=20 if x*y > 0 else -20,
+                            facecolor=pale, edgecolor=dark, linewidth=.5))
+        add(Rectangle((-.18, -.14), .36, .28, facecolor=color, edgecolor=dark, linewidth=.7))
+        add(Polygon([[.22, 0.], [.04, .07], [.04, -.07]], facecolor="white", edgecolor="none"))
+    else:
+        for sign in (-1, 1):
+            add(Ellipse((-.47, sign*.25), .46, .23, facecolor=dark, edgecolor="none"))
+            ax.plot([-.03, .02, .25], [sign*.35, sign*.57, sign*.67],
+                    transform=pose, color=color, linewidth=2, solid_capstyle="round", zorder=6)
+            add(Circle((.25, sign*.67), .09, facecolor=pale, edgecolor=dark, linewidth=.5))
+        add(Ellipse((-.04, 0.), .65, .9, facecolor=color, edgecolor=dark, linewidth=.7))
+        add(Circle((.18, 0.), .25, facecolor=pale, edgecolor=dark, linewidth=.8))
+        for y in (-.085, .085):
+            add(Circle((.34, y), .03, facecolor=dark, edgecolor="none"))
+
+
 def render_jax_social_nav_frame(
     env_cfg,
     state,
@@ -13,6 +59,8 @@ def render_jax_social_nav_frame(
     size=740,
     robot_traj=None,
     qp_viz=None,
+    *,
+    robot_type=None,
 ):
     """Render one JAX SocialNav state as a Matplotlib frame."""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -59,7 +107,7 @@ def render_jax_social_nav_frame(
     robot_color = "#3b82f6"
     traj_cmap = LinearSegmentedColormap.from_list("robot_traj", ["#dbeafe", robot_color])
     qp_viz = qp_viz or {}
-    robot_type = str(getattr(env_cfg, "robot_type", "unicycle"))
+    robot_type = str(getattr(env_cfg, "robot_type", "unicycle") if robot_type is None else robot_type)
     lookahead_distance = float(qp_viz.get("lookahead_distance", 0.0) or 0.0)
     if robot_type != "unicycle":
         lookahead_distance = 0.0
@@ -91,7 +139,7 @@ def render_jax_social_nav_frame(
         collection.set_capstyle("round")
         ax.add_collection(collection)
 
-    ax.add_artist(Circle(robot_pos, robot_radius, facecolor=robot_color, edgecolor="none", linewidth=0.0, alpha=0.82, zorder=6))
+    _draw_robot(ax, robot_pos, robot_theta, robot_radius, robot_type, robot_color)
     if lookahead_distance > 0.0:
         lookahead_point = robot_pos + lookahead_distance * np.asarray([np.cos(robot_theta), np.sin(robot_theta)], dtype=float)
         ax.add_artist(

@@ -11,7 +11,7 @@ import osqp
 from scipy import sparse
 
 from env.robots import UnicycleRobot, QuadrotorRobot, HumanoidRobot
-from env.robots.cbf import Obstacles, Constraints
+from env.robots.cbf import Obstacles
 
 
 @dataclass(frozen=True)
@@ -147,8 +147,7 @@ def _tracking_qp_data(nominal, constraints, low, high, weights, output_matrix):
     if low.shape != (d,) or high.shape != (d,):
         raise ValueError("nominal and bounds must be vectors of equal size")
     scale = np.maximum(np.maximum(np.abs(low), np.abs(high)), 1e-6)
-    M = (np.diag(1.0/scale) if output_matrix is None
-         else np.asarray(output_matrix, dtype=np.float64))
+    M = np.asarray(output_matrix, dtype=np.float64)
     if M.ndim != 2 or M.shape[1] != d or weights.shape != (M.shape[0],):
         raise ValueError("output matrix must have D columns and one weight per row")
     cbf_A, cbf_b = np.asarray(constraints.A, dtype=np.float64), np.asarray(constraints.b, dtype=np.float64)
@@ -162,8 +161,9 @@ def _tracking_qp_data(nominal, constraints, low, high, weights, output_matrix):
     return nominal, low, high, cbf_A, cbf_b, P, scale
 
 
-def _solve_qp_data(nominal, A, b, P, scale, domain, solver, tolerance):
+def _solve_qp_data(nominal, A, b, P, scale, domain, solver):
     """Solve and independently check a scaled QP; all physical rows use A z+b>=0."""
+    tolerance = solver.feasibility_tolerance
     d = nominal.size
     try:
         np.linalg.cholesky(P)
@@ -203,21 +203,19 @@ def _solve_qp_data(nominal, A, b, P, scale, domain, solver, tolerance):
                         status, int(result.info.iter))
 
 
-def solve_qp(nominal, constraints, low, high, weights, tolerance=None, *,
-             solver=SolverConfig(), output_matrix=None):
+def solve_qp(nominal, constraints, low, high, weights, *,
+             output_matrix, solver=SolverConfig()):
     """Hard CPU QP with the original physical input limits and tracking cost.
 
     Neither JIT-compatible nor differentiable. With output_matrix=M, minimize
-    0.5*||M@(u-nominal)||_W^2; otherwise use normalized input tracking.
+    0.5*||M@(u-nominal)||_W^2 using solver.feasibility_tolerance for validation.
     """
-    if tolerance is None:
-        tolerance = solver.feasibility_tolerance
     nominal, low, high, cbf_A, cbf_b, P, scale = _tracking_qp_data(
         nominal, constraints, low, high, weights, output_matrix)
     d = nominal.size
     A = np.concatenate([cbf_A, np.eye(d), -np.eye(d)])
     b = np.concatenate([cbf_b, -low, high])
-    return _solve_qp_data(nominal, A, b, P, scale, constraints.domain, solver, tolerance)
+    return _solve_qp_data(nominal, A, b, P, scale, constraints.domain, solver)
 
 
 @partial(jax.jit, static_argnames=("robot", "control_config"))

@@ -17,7 +17,7 @@ def validate_slack_weight(weight):
 
 
 def solve_slack_qp(nominal, constraints, low, high, weights, *, soft_mask,
-                   slack_weight, solver=SolverConfig(), output_matrix=None):
+                   slack_weight, output_matrix, solver=SolverConfig()):
     """Minimize tracking cost + rho/2*||delta||^2 with A*u+b+E*delta>=0.
 
     Only rows selected by soft_mask receive nonnegative, unbounded slacks.
@@ -49,7 +49,7 @@ def solve_slack_qp(nominal, constraints, low, high, weights, *, soft_mask,
     P[d:, d:] = np.eye(k)
     augmented = _solve_qp_data(
         np.concatenate([nominal, np.zeros(k)]), A, b, P, scale,
-        constraints.domain, solver, solver.feasibility_tolerance)
+        constraints.domain, solver)
     candidate = augmented.candidate[:d]
     raw = jnp.concatenate([
         jnp.asarray(cbf_A)@candidate+jnp.asarray(cbf_b),

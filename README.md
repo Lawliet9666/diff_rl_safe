@@ -60,7 +60,7 @@ Policies: `barriernet_gnn`, `barriernet_mlp`, `diff_cvar_gnn`, `diff_cvar_mlp`,
 For the optional CRAX/MJX backend, install its physics dependencies first, then run:
 
 ```bash
-WANDB_MODE=disabled RUN_NAME=crax_barriernet bash scripts/run_ppo.sh env=crax_social_nav robot=point
+WANDB_MODE=disabled RUN_NAME=crax_barriernet bash scripts/run_ppo.sh env=crax_social_nav robot=unicycle
 ```
 
 ## W&B Logging
