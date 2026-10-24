@@ -1,1 +1,1 @@
-"""Optional CRAX/MJX environment and native rendering helpers."""
+"""CRAX/MJX navigation environment."""

@@ -22,11 +22,7 @@ def get_model_module(model_cfg):
 
 
 def make_action_fn(params, hparams, policy_action_mean_fn, policy_action_to_env_action_fn):
-    """Adapt deterministic inference to action_fn(observation) -> (action, info).
-
-    Action scaling and optional QP context stay in the existing model functions.
-    PPO training still uses get_action_and_value for probability/value terms.
-    """
+    """Wrap deterministic inference as action_fn(obs) -> (action, info)."""
     def generate_action(observation, **kwargs):
         policy_action = policy_action_mean_fn(params, hparams, observation, **kwargs)
         action = policy_action_to_env_action_fn(params, policy_action)
@@ -35,4 +31,28 @@ def make_action_fn(params, hparams, policy_action_mean_fn, policy_action_to_env_
     return generate_action
 
 
-__all__ = ["get_model_module", "make_action_fn"]
+__all__ = ["get_model_module", "make_action_fn", "prepare_robot_policy"]
+
+
+def prepare_robot_policy(config):
+    """Resolve Robot-derived policy dimensions and validate model support."""
+    from omegaconf import open_dict
+    from env.robots import make_robot
+    robot_type = str(config.robot.type)
+    extended = robot_type in {"double_integrator", "humanoid", "quadrotor"}
+    if extended:
+        if config.model.type not in {"barriernet_gnn", "barriernet_mlp"}:
+            raise ValueError("New RL robots require BarrierNet GNN or MLP")
+        if config.env.get("backend", "jax") != "jax":
+            raise ValueError("New RL robots currently require the JAX environment")
+        if robot_type == "humanoid" and config.controller.humanoid.barrier != "distance":
+            raise ValueError("Humanoid RL currently requires the distance HOCBF")
+    robot = make_robot(config)
+    with open_dict(config):
+        config.env.act_dim = robot.control_dim
+        if config.model.type in {"barriernet_gnn", "barriernet_mlp"} and "num_humans" not in config.model:
+            # Infer missing human-slot counts in planar checkpoints.
+            config.model.num_humans = (int(config.model.obs_frame_dim)-6)//6
+        if extended:
+            config.model.obs_frame_dim = 6 + 6*int(config.model.num_humans) + robot.state_dim
+    return robot

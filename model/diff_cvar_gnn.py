@@ -12,7 +12,7 @@ import math
 import jax
 import jax.numpy as jnp
 
-from model.ppo_base import normalize_robot_type
+from model.actor_critic import normalize_robot_type
 
 from model import actor_critic
 from model import cvar_qp
@@ -24,7 +24,7 @@ from model.gnn_encoder import (
     shared_critic_value,
     spatio_temporal_graph_encode,
 )
-from model.ppo_base import activation, cfg_get, dense, init_linear, mlp, require_config_value
+from model.actor_critic import activation, cfg_get, dense, init_linear, mlp, require_config_value
 
 
 @dataclass(frozen=True)

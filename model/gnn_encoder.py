@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from model.observation import _world_to_body
+from model.observation import _world_to_body, robot_features
 
 import math
 
 import jax
 import jax.numpy as jnp
 
-from model.ppo_base import activation, dense, init_head, init_linear, mlp
+from model.actor_critic import activation, dense, init_head, init_linear, mlp
 
 
 def _init_mlp(keys, dims, gains, use_init_weights=True):
@@ -190,7 +190,7 @@ def _build_spatio_temporal_graph_tensors(hparams, obs_history):
     robot_theta = obs_history[:, :, 4]
     robot_radius = obs_history[:, :, 5:6]
 
-    obstacle_blocks = obs_history[:, :, 6:].reshape((batch_size, history_len, num_obstacles, 6))
+    obstacle_blocks = obs_history[:, :, 6:6+6*num_obstacles].reshape((batch_size, history_len, num_obstacles, 6))
     robot_minus_obstacle = obstacle_blocks[:, :, :, 0:2]
     obstacle_vel = obstacle_blocks[:, :, :, 2:4]
     obstacle_radius = obstacle_blocks[:, :, :, 4:5]
@@ -265,6 +265,13 @@ def spatio_temporal_graph_encode(params, hparams, obs_history, return_human_late
     nodes, edges, node_mask, receiver_idx, sender_idx = _build_spatio_temporal_graph_tensors(hparams, obs_history)
     for layer in params["layers"]:
         nodes = reference_attention_layer_sparse(layer, nodes, edges, node_mask, receiver_idx, sender_idx, act_name="relu")
+    if getattr(hparams, "robot_state_dim", 0):
+        robot_latent, human_latents = _current_outputs(nodes, hparams, True)
+        features = robot_features(obs_history, hparams).reshape((nodes.shape[0], -1))
+        robot_latent = jnp.concatenate([robot_latent, features], axis=-1)
+        human_features = jnp.broadcast_to(features[:, None, :], (*human_latents.shape[:2], features.shape[-1]))
+        human_latents = jnp.concatenate([human_latents, human_features], axis=-1)
+        return (robot_latent, human_latents) if return_human_latents else robot_latent
     return _current_outputs(nodes, hparams, return_human_latents)
 
 
@@ -289,13 +296,13 @@ def init_shared_gnn_actor(
         "logstd": jnp.full((act_dim,), math.log(float(action_std_init)), dtype=jnp.float32),
         "graph_encoder": init_spatio_temporal_encoder(
             keys[0],
-            obs_frame_dim=hparams.obs_frame_dim,
+            obs_frame_dim=6+6*hparams.num_humans,
             graph_hidden_dim=hparams.graph_hidden_dim,
             graph_latent_dim=hparams.graph_latent_dim,
             graph_layers=hparams.graph_layers,
             use_init_weights=use_init_weights,
         ),
-        "fc1": init_linear(keys[1], hparams.graph_latent_dim, hidden_dim, sqrt2, use_init_weights),
+        "fc1": init_linear(keys[1], hparams.graph_latent_dim + getattr(hparams, "robot_feature_dim", 0), hidden_dim, sqrt2, use_init_weights),
         head_name: init_head(keys[2:4], hidden_dim, control_hidden_dim, act_dim, use_init_weights),
     }
 
@@ -303,7 +310,7 @@ def init_shared_gnn_actor(
 def init_shared_gnn_critic(keys, hparams, hidden_dim, hidden_dim2, use_init_weights):
     sqrt2 = math.sqrt(2.0)
     return {
-        "fc1": init_linear(keys[0], hparams.graph_latent_dim, hidden_dim, sqrt2, use_init_weights),
+        "fc1": init_linear(keys[0], hparams.graph_latent_dim + getattr(hparams, "robot_feature_dim", 0), hidden_dim, sqrt2, use_init_weights),
         "fc21": init_linear(keys[1], hidden_dim, hidden_dim2, sqrt2, use_init_weights),
         "fc31": init_linear(keys[2], hidden_dim2, 1, 1.0, use_init_weights),
     }

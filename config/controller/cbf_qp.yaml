@@ -1,25 +1,25 @@
 type: cbf_qp
-slack_weight: 0.0  # 0: hard CBF-QP; >0: obstacle slack penalty (unicycle only).
-qp_obs_top_k: null  # null: all; positive integer: nearest obstacles by robot-center distance.
+slack_weight: 0.0  # 0: hard; >0: obstacle slack (unicycle only).
+qp_obs_top_k: null  # null: all; k>0: nearest k obstacles.
 
 solver:
   eps_abs: 1.0e-9
   eps_rel: 1.0e-9
   max_iter: 10000
-  adaptive_rho_interval: 25  # Fixed update period; avoids timing-dependent rho adaptation.
+  adaptive_rho_interval: 25  # Fixed rho-update interval.
   feasibility_tolerance: 1.0e-6
   polishing: false
   verbose: false
 
-# Linear class-K functions: alpha_i(s) = kappa_i*s; rates are positive [1/s].
+# Class-K rates: alpha_i(s) = kappa_i*s [1/s].
 unicycle:
-  lookahead: 0.2  # Shared tracking point for nominal control, CBF and QP.
+  lookahead: 0.2  # m; tracking-point offset
   nominal:
     position_gain: 1.0
   cbf:
-    kappa: [2.0]  # [kappa_1]: h_dot + kappa_1*h >= 0.
+    kappa: [2.0]  # h_dot + kappa_1*h >= 0
   qp:
-    weights: [1.0, 1.0]  # World velocity x/y of the lookahead point.
+    weights: [1.0, 1.0]  # Lookahead world velocity x/y.
 
 quadrotor:
   nominal:
@@ -27,36 +27,36 @@ quadrotor:
     velocity_gain: 1.8
     attitude_gain: 4.0
     thrust_tracking_gain: 4.0
-    acceleration_limits: [2.0, 2.0, 2.0]  # Desired acceleration clipping only.
+    acceleration_limits: [2.0, 2.0, 2.0]  # Nominal acceleration clipping.
   cbf:
-    kappa: [1.5, 1.5, 1.5]  # [kappa_1, kappa_2, kappa_3]: obstacle/altitude HOCBFs.
-    kappa_thrust: 4.0  # First-order thrust CBF rate [1/s].
-    kappa_tilt: 4.0  # First-order tilt CBF rate [1/s].
+    kappa: [1.5, 1.5, 1.5]  # Obstacle/altitude HOCBF rates.
+    kappa_thrust: 4.0  # Thrust CBF rate.
+    kappa_tilt: 4.0  # Tilt CBF rate.
   qp:
-    weights: [1.0, 1.0, 1.0, 1.0e-6]  # World jerk x/y/z, then yaw-rate tie-breaker.
+    weights: [1.0, 1.0, 1.0, 1.0e-6]  # World jerk x/y/z, then omega_z.
 
 humanoid:
-  barrier: distance  # distance (second order) or parabolic (first order).
+  barrier: distance  # distance: order 2; parabolic: order 1.
   nominal:
     position_gain: 1.0
     velocity_gain: 2.0
     heading_gain: 2.0
   cbf:
     distance:
-      kappa: [1.5, 1.5]  # [kappa_1, kappa_2]: recursive distance HOCBF.
+      kappa: [1.5, 1.5]  # Distance HOCBF rates.
     parabolic:
-      kappa: [2.0]  # [kappa_1]: h_dot + kappa_1*h >= 0.
-      parabolic_gain: 1.0  # Barrier curvature; not a class-K rate.
-      clearance_gain: 1.0  # Barrier clearance term; not a class-K rate.
-      speed_epsilon: 0.05  # Smooth speed regularization used in content.tex.
+      kappa: [2.0]  # h_dot + kappa_1*h >= 0
+      parabolic_gain: 1.0  # Curvature.
+      clearance_gain: 1.0  # Clearance term.
+      speed_epsilon: 0.05  # Speed smoothing.
   qp:
-    weights: [1.0, 1.0, 1.0]  # Forward/lateral acceleration, then yaw rate.
+    weights: [1.0, 1.0, 1.0]  # a_f, a_l, omega.
 
 double_integrator:
   nominal:
     position_gain: 1.0
     velocity_gain: 2.0
   cbf:
-    kappa: [1.5, 1.5]  # [kappa_1, kappa_2]: recursive distance HOCBF.
+    kappa: [1.5, 1.5]  # Distance HOCBF rates.
   qp:
-    weights: [1.0, 1.0]  # World acceleration x/y.
+    weights: [1.0, 1.0]  # a_x, a_y.

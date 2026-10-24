@@ -71,7 +71,7 @@ class JaxSocialNavConfig(NamedTuple):
 
 
 class JaxSocialNavState(NamedTuple):
-    """Full model state/action plus the shared navigation task; no duplicate pose."""
+    """Robot and crowd-navigation state."""
     robot_state: jnp.ndarray
     robot_vel: jnp.ndarray
     robot_action: jnp.ndarray
@@ -90,15 +90,10 @@ class JaxSocialNavState(NamedTuple):
 
 
 class JaxSocialNav:
-    """Independent analytic navigation with explicit configuration and state.
-
-    Robot dynamics are shared; initialization, task logic and observations are local.
-    Acceleration- and thrust-controlled rewards remain undefined for RL.
-    """
+    """Analytic robot dynamics with shared crowd navigation and rewards."""
 
     @classmethod
     def config_from_omegaconf(cls, config, *, robot=None) -> JaxSocialNavConfig:
-        """Parse navigation settings, reusing a supplied configured robot when given."""
         def get(cfg, name, default=None):
             if isinstance(cfg, dict):
                 return cfg.get(name, default)
@@ -206,7 +201,7 @@ class JaxSocialNav:
         )
 
     def reset_fn(self, env_cfg, key, num_envs):
-        """Initialize a batch from one root key or explicit per-environment keys."""
+        """Reset from a root key or per-episode keys."""
         if key.shape == (2,):
             key = jax.random.split(key, int(num_envs))
         elif key.shape != (num_envs, 2):
@@ -214,9 +209,10 @@ class JaxSocialNav:
         return jax.vmap(lambda rng: self._reset_one(env_cfg, rng))(key)
 
     def step_fn(self, env_cfg, state: JaxSocialNavState, action, key):
-        """Advance robot, crowd, boundaries and task; return the new state."""
+        """Advance robot, obstacles and navigation outcomes."""
         cfg, rng = env_cfg, key
         def advance_one(x, u):
+            u = jnp.asarray(u, dtype=x.dtype)
             if cfg.integration_steps == 1:
                 result = cfg.robot.step(x, u, cfg.dt)
                 valid = cfg.robot.check_state_limits(result.state, cfg.state_tolerance)
@@ -236,21 +232,10 @@ class JaxSocialNav:
         bounded_state = self._clip_robot_to_outer_bounds(cfg, moved_state)
         dist_to_goal, min_clearance = self.compute_distances(cfg, bounded_state)
 
+        reward_motion = robot_action
         if cfg.robot_type not in {"single_integrator", "unicycle"}:
-            done, success, collision, timeout, next_step, violation = self.navigation_done(
-                cfg, bounded_state, dist_to_goal, min_clearance)
-            lengths = bounded_state.episode_lengths + 1
-            next_state = bounded_state._replace(
-                step_count=next_step, prev_dist_to_goal=dist_to_goal.astype(jnp.float32),
-                episode_lengths=jnp.where(done, 0, lengths))
-            metrics = dict(success=success, collision=collision, timeout=timeout,
-                min_clearance=min_clearance, goal_distance=dist_to_goal,
-                boundary_violation=violation, episode_length=lengths,
-                boundary_correction=bounded_state.robot_state[:, :2]-moved_state.robot_state[:, :2],
-                physical_state_limit=physical_state_limit, applied_action=robot_action)
-            # These model rewards have not been defined for RL; never reinterpret
-            # their accelerations or thrust-rate inputs as a planar [v, omega].
-            return next_state, None, done, metrics
+            reward_motion = jax.vmap(cfg.robot.reward_motion)(
+                bounded_state.robot_state, robot_action).astype(jnp.float32)
 
         action = jnp.asarray(action, dtype=jnp.float32)
         omega_delta = jnp.zeros_like(action[:, 1])
@@ -268,7 +253,7 @@ class JaxSocialNav:
             bounded_state,
             dist_to_goal,
             min_clearance,
-            robot_action,
+            reward_motion,
             omega_delta_penalty,
         )
         completed_returns = bounded_state.episode_returns + reward
@@ -289,8 +274,9 @@ class JaxSocialNav:
             "min_clearance": min_clearance.astype(jnp.float32),
             "goal_distance": dist_to_goal.astype(jnp.float32),
             "boundary_violation": boundary_violation.astype(jnp.float32),
-            "robot_raw_omega": jnp.asarray(action[:, 1], dtype=jnp.float32),
-            "robot_applied_omega": robot_action[:, 1].astype(jnp.float32),
+            "robot_raw_omega": (action[:, 1] if cfg.robot_type in {"single_integrator", "unicycle"}
+                                else reward_motion[:, 1]).astype(jnp.float32),
+            "robot_applied_omega": reward_motion[:, 1].astype(jnp.float32),
             "robot_omega_delta": jnp.abs(omega_delta).astype(jnp.float32),
             "robot_omega_delta_penalty": omega_delta_penalty.astype(jnp.float32),
             "episode_return": completed_returns.astype(jnp.float32),
@@ -299,14 +285,15 @@ class JaxSocialNav:
         return next_state, reward.astype(jnp.float32), done.astype(jnp.float32), metrics
 
     def observe_fn(self, env_cfg, state, hparams=None):
-        """Build policy observations, adapting fixed slots when the model requires it."""
-        if hparams is not None:
-            obs_frame_dim = int(getattr(hparams, "obs_frame_dim", 0))
-            if obs_frame_dim >= 6 and (obs_frame_dim - 6) % 6 == 0:
-                model_humans = (obs_frame_dim - 6) // 6
-                if 0 < model_humans != int(env_cfg.num_humans):
-                    return self._fixed_slot_policy_obs_from_state(env_cfg, state, model_humans)
-        return self._fixed_order_policy_obs_from_state(env_cfg, state)
+        """Build policy observations with the requested human slots."""
+        model_humans = int(getattr(hparams, "num_humans", env_cfg.num_humans))
+        if model_humans != int(env_cfg.num_humans):
+            observation = self._fixed_slot_policy_obs_from_state(env_cfg, state, model_humans)
+        else:
+            observation = self._fixed_order_policy_obs_from_state(env_cfg, state)
+        if env_cfg.robot_type in {"double_integrator", "humanoid", "quadrotor"}:
+            observation = jnp.concatenate([observation, state.robot_state.astype(jnp.float32)], axis=1)
+        return observation
 
     def snapshot_fn(self, state):
         return state
@@ -381,7 +368,6 @@ class JaxSocialNav:
 
     def navigation_done(self, cfg: JaxSocialNavConfig, state: JaxSocialNavState,
                         dist_to_goal, min_clearance):
-        """Navigation outcomes independent of robot controls and reward shaping."""
         next_step = state.step_count + 1
         collision = min_clearance < 0.0
         success = dist_to_goal < cfg.goal_tolerance
@@ -434,7 +420,7 @@ class JaxSocialNav:
 
     @staticmethod
     def planar_state(cfg, state):
-        """Build a temporary [x,y,yaw] view for existing navigation and rendering tools."""
+        """Project the robot state to [x, y, yaw] for navigation and rendering."""
         return state._replace(robot_state=jax.vmap(cfg.robot.planar_pose)(state.robot_state))
 
     def _fixed_order_policy_obs_from_state(self, cfg: JaxSocialNavConfig, state: JaxSocialNavState):

@@ -13,10 +13,10 @@ import math
 import jax
 import jax.numpy as jnp
 
-from model.ppo_base import normalize_robot_type
+from model.actor_critic import normalize_robot_type
 from model import actor_critic
 from model import cvar_qp
-from model.ppo_base import (
+from model.actor_critic import (
     activation,
     cfg_get,
     dense,

@@ -1,4 +1,4 @@
-"""JAX deterministic CBF actor with a shared MLP encoder and no graph network."""
+"""MLP BarrierNet policy with learned nominal inputs, CBF gains and distances."""
 
 from __future__ import annotations
 
@@ -17,10 +17,10 @@ import math
 import jax
 import jax.numpy as jnp
 
-from model.ppo_base import normalize_robot_type
+from model.actor_critic import normalize_robot_type
 from model import actor_critic
 from model import cbf_qp
-from model.ppo_base import (
+from model.actor_critic import (
     activation,
     cfg_get,
     dense,
@@ -62,14 +62,22 @@ class BarrierNetMLPHParams:
     position_scale: float
     velocity_scale: float
     qp_obs_top_k: int
+    robot: object = None
+    robot_state_dim: int = 0
+    cbf_order: int = 1
+    control_dt: float = 0.1
+
+    @property
+    def robot_feature_dim(self):
+        return self.history_len * max(self.robot_state_dim-2, 0)
 
     @property
     def encoder_input_dim(self):
-        processed_frame_dim = 5 + 6 * int(self.num_humans)
+        processed_frame_dim = 5 + 6 * int(self.num_humans) + max(self.robot_state_dim-2, 0)
         return int(self.history_len) * processed_frame_dim
 
 
-def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
+def hparams_from_config(model_cfg, critic_cfg, act_dim=2, *, robot=None, control_dt=0.1):
     actor_cfg = model_cfg.actor
     require_config_value(model_cfg, "type", "barriernet_mlp", "model")
     require_config_value(
@@ -81,18 +89,27 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
     obs_dim = int(model_cfg.obs_dim)
     if history_len <= 0:
         raise ValueError("barriernet_mlp requires history_len > 0")
-    if obs_frame_dim < 6 or (obs_frame_dim - 6) % 6 != 0:
-        raise ValueError(
-            "barriernet_mlp requires obs_frame_dim = 6 + num_humans * 6"
-        )
     if obs_dim != history_len * obs_frame_dim:
         raise ValueError(
             "barriernet_mlp requires obs_dim = history_len * obs_frame_dim"
         )
-    if int(act_dim) != 2:
-        raise ValueError("barriernet_mlp requires act_dim=2")
+    robot_type = str(model_cfg.robot_type)
+    extended = robot_type in {"double_integrator", "humanoid", "quadrotor"}
+    if not extended:
+        normalize_robot_type(robot_type)
+    if extended and robot_type == "humanoid" and robot is not None and robot.barrier != "distance":
+        raise ValueError("Humanoid RL requires the distance HOCBF")
+    if extended and float(actor_cfg.qp_slack_weight) <= 0:
+        raise ValueError("High-order BarrierNet requires a positive obstacle slack weight")
+    if extended and (robot is None or int(act_dim) != robot.control_dim):
+        raise ValueError("High-order BarrierNet requires its configured Robot and matching action dimension")
+    if not extended and int(act_dim) != 2:
+        raise ValueError("Planar velocity-controlled BarrierNet requires act_dim=2")
+    robot_state_dim = robot.state_dim if extended else 0
+    if obs_frame_dim != 6 + 6*int(model_cfg.num_humans) + robot_state_dim:
+        raise ValueError("Observation frame must contain navigation, explicit human slots, and full robot state")
 
-    num_humans = (obs_frame_dim - 6) // 6
+    num_humans = int(model_cfg.num_humans)
     qp_obs_top_k = min(
         int(cfg_get(actor_cfg, "qp_obs_top_k", 5)), num_humans
     )
@@ -103,7 +120,6 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
     if margin_base < 0.0:
         raise ValueError("model.actor.margin_base must be >= 0")
 
-    # Old resolved configs have no distance head and retain fixed distances.
     learn_r_safe = bool(cfg_get(actor_cfg, "learn_r_safe", False))
     margin_extra_max = float(cfg_get(actor_cfg, "margin_extra_max", 0.0))
     if not math.isfinite(margin_extra_max) or margin_extra_max < 0.0:
@@ -135,9 +151,11 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
 
     return BarrierNetMLPHParams(
         act_dim=int(act_dim),
-        robot_type=normalize_robot_type(
-            cfg_get(model_cfg, "robot_type", "unicycle")
-        ),
+        robot_type=robot_type,
+        robot=robot if extended else None,
+        robot_state_dim=robot_state_dim,
+        control_dt=float(control_dt),
+        cbf_order=(3 if robot_type == "quadrotor" else 2) if extended else 1,
         actor_act=str(cfg_get(actor_cfg, "act", "relu")),
         critic_act=str(cfg_get(critic_cfg, "act", "relu")),
         margin_base=margin_base,
@@ -182,9 +200,10 @@ def init_params_from_config(
     action_low,
     action_high,
     use_init_weights=True,
+    *, robot=None, control_dt=0.1,
 ):
     actor_cfg = model_cfg.actor
-    hparams = hparams_from_config(model_cfg, critic_cfg, act_dim=act_dim)
+    hparams = hparams_from_config(model_cfg, critic_cfg, act_dim=act_dim, robot=robot, control_dt=control_dt)
     hidden_dim = int(cfg_get(actor_cfg, "hidden_dim", 256))
     control_hidden_dim = int(
         cfg_get(actor_cfg, "control_hidden_dim", hidden_dim)
@@ -241,7 +260,7 @@ def init_params_from_config(
         "human_alpha_head": init_linear(
             keys[encoder_end + 4],
             scalar_hidden_dim,
-            hparams.num_humans,
+            hparams.num_humans * hparams.cbf_order,
             sqrt2 * 0.01,
             use_init_weights,
         ),
@@ -251,10 +270,9 @@ def init_params_from_config(
     )
     alpha_bias = math.log(alpha_fraction / (1.0 - alpha_fraction))
     actor["human_alpha_head"]["bias"] = jnp.full(
-        (hparams.num_humans,), alpha_bias, dtype=jnp.float32
+        (hparams.num_humans * hparams.cbf_order,), alpha_bias, dtype=jnp.float32
     )
     if hparams.learn_r_safe:
-        # Derive a new key without shifting any existing actor or critic keys.
         actor["human_rsafe_head"] = init_linear(
             jax.random.fold_in(key, 1), scalar_hidden_dim, hparams.num_humans,
             sqrt2 * 0.01, use_init_weights,
@@ -292,6 +310,8 @@ def _actor_outputs(params, hparams, obs, qp_context=None):
     alpha_logits_all = dense(
         actor_params["human_alpha_head"], human_x
     )
+    if hparams.cbf_order > 1:
+        alpha_logits_all = alpha_logits_all.reshape((obs.shape[0], hparams.num_humans, hparams.cbf_order))
     alpha_all = _learned_alpha(alpha_logits_all, hparams)
     if hparams.learn_r_safe:
         margin_logits = dense(actor_params["human_rsafe_head"], human_x)
@@ -307,7 +327,8 @@ def _actor_outputs(params, hparams, obs, qp_context=None):
     qp_topk_ids = qp_context["qp_topk_ids"]
     alpha_topk = _gather_topk(alpha_all, qp_topk_ids)
     r_safe_topk = _gather_topk(r_safe_all, qp_topk_ids)
-    nominal_xy = _body_to_world(nominal_xy, qp_obs[:, 4])
+    if hparams.robot_state_dim == 0:
+        nominal_xy = _body_to_world(nominal_xy, qp_obs[:, 4])
     safe_xy, slack = cbf_qp.solve_slack_qp(
         params,
         hparams,
@@ -315,6 +336,7 @@ def _actor_outputs(params, hparams, obs, qp_context=None):
         nominal_xy,
         alpha_topk,
         r_safe_topk,
+        robot_state=qp_context.get("robot_state"),
     )
     return (
         latent,
@@ -387,6 +409,7 @@ def get_action_and_value(
                 r_safe,
                 safe_xy,
                 slack,
+                robot_state=None if qp_context is None else qp_context.get("robot_state"),
             )
         else:
             diagnostics = cbf_qp.lightweight_diagnostics(
@@ -397,6 +420,7 @@ def get_action_and_value(
                 r_safe,
                 safe_xy,
                 slack,
+                robot_state=None if qp_context is None else qp_context.get("robot_state"),
             )
         outputs = outputs + (diagnostics,)
     return outputs

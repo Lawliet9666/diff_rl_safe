@@ -1,4 +1,3 @@
-# Standalone CRAX environment configuration.
 backend: crax_mjx
 scenario: crax_social_nav
 num_envs: 128

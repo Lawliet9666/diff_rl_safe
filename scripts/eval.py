@@ -1,4 +1,4 @@
-"""Evaluate RL checkpoints or a CBF-QP controller and optionally render its episodes."""
+"""Evaluate RL checkpoints or CBF-QP controllers, optionally saving videos."""
 
 from pathlib import Path
 from dataclasses import asdict
@@ -39,7 +39,7 @@ def save_video(path, frames, fps=30):
                "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
                "-r", str(fps), "-i", "-", "-an", "-c:v", "libx264",
                "-preset", "veryfast", "-pix_fmt", "yuv420p", str(path)]
-    # Allow Python's posix_spawn path rather than forking a running JAX process.
+    # Avoid forking a running JAX process.
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                           stderr=subprocess.PIPE, close_fds=False) as encoder:
         try:
@@ -59,7 +59,7 @@ def save_video(path, frames, fps=30):
 
 
 def _prepare_controller(config):
-    """Prepare reusable controller, environment configuration and JIT functions."""
+    """Prepare controller, environment and reusable JIT functions."""
     from controller import make_controller
 
     if not isinstance(config.seed, int) or isinstance(config.seed, bool):
@@ -112,7 +112,7 @@ def _controller_failure_diagnostics(state, nominal, obs, result):
 
 
 def _run_controller_episode(config, *, setup=None):
-    """Reset episode state while reusing prepared environment and control functions."""
+    """Reset and run one controller episode using the prepared setup."""
     import jax
     import jax.numpy as jnp
     from controller.cbf_qp import control_residual, warmup_controller
@@ -147,7 +147,7 @@ def _run_controller_episode(config, *, setup=None):
         nominal.block_until_ready()
         warmup_controller(robot_model, x, nominal, obstacles, cfg.dt,
                           qp_obs_top_k=config.controller.qp_obs_top_k)
-        # Compile the environment step without executing it or advancing its RNG.
+        # Compile without stepping or consuming RNG.
         advance_env.lower(navigation_state, jnp.zeros((1, robot_model.control_dim), dtype=state.dtype),
                           jax.random.PRNGKey(seed)).compile()
         setup["warmed"] = True
@@ -185,7 +185,7 @@ def _run_controller_episode(config, *, setup=None):
                            f"step={k} (zero-based), state={np.asarray(state).tolist()}")
             raise
         action.block_until_ready()
-        # Includes nominal generation, obstacle selection and the QP solve.
+        # Includes nominal generation and QP filtering.
         solve_ms = (time.perf_counter()-start)*1000
         nominal, result = diagnostics["nominal"], diagnostics["qp"]
         obs = obs._replace(mask=diagnostics["obstacle_mask"])
@@ -198,7 +198,7 @@ def _run_controller_episode(config, *, setup=None):
             if robot in {"humanoid", "double_integrator"} and qp_status == "infeasible":
                 infeasible_steps += 1
                 status, reason = qp_status, qp_reason
-                break  # An old acceleration is not a safe fallback.
+                break  # A stale acceleration is not a safe fallback.
             if qp_status != "infeasible" or use_slack:
                 status = "controller_failure" if use_slack else qp_status
                 reason = qp_reason
@@ -288,7 +288,7 @@ def _run_controller_episode(config, *, setup=None):
 
 
 def _render_controller_frame(cfg, history, index, crowd, robot, robot_model):
-    """Only adapt state; all pixels/layout come from the existing RL renderer."""
+    """Adapt controller states to the shared renderer."""
     import jax.numpy as jnp
     from env.jax_env.jax_social_nav import JaxSocialNav
 
@@ -305,8 +305,7 @@ def _render_controller_frame(cfg, history, index, crowd, robot, robot_model):
 
 
 def _save_controller_video(path, cfg, history, crowd, robot, robot_model):
-    # The existing encoder accepts an indexable iterable. Render lazily to avoid
-    # retaining hundreds of full-resolution frames in the controller-only run.
+    # Render lazily to limit memory use.
     class Frames:
         def __getitem__(self, index):
             if index >= len(history["state"]):
@@ -316,10 +315,10 @@ def _save_controller_video(path, cfg, history, crowd, robot, robot_model):
 
 
 def _controller_evaluation_metrics(result):
-    """Use eval metric names for one episode; retain controller failures separately."""
+    """Map controller episode results to shared evaluation metrics."""
     status = result["status"]
     return dict(status=status,
-        # Controller rollouts do not record a comparable RL episode return.
+        # Controller return is not comparable to RL return.
         mean_return=None, std_return=None,
         success_rate=float(status == "success"),
         collision_rate=float(status == "collision"),
@@ -333,7 +332,6 @@ def _controller_evaluation_metrics(result):
 
 
 def evaluate_controller(config, output, *, visualize=False, seeds=None, episodes=1):
-    """Shared controller evaluation entry for Hydra and saved-run evaluation."""
     from utils import configure_jax_platform_for_device, validate_jax_backend_for_device
 
     platform = configure_jax_platform_for_device(config.device)
@@ -429,16 +427,16 @@ class Evaluator:
         if backend not in ("jax", "crax_mjx"):
             raise ValueError(f"Unsupported environment backend {backend!r}; use jax or crax_mjx")
         if self.visualize and self.config.env.get("backend", "jax") == "crax_mjx":
-            # Select a renderer for this evaluation process before importing MuJoCo.
+            # Select renderer before importing MuJoCo.
             os.environ.setdefault("MUJOCO_GL", "osmesa")
         if device:
             self.config.device = device
-        # Device and float64 QP precision must be configured before importing JAX.
+        # Configure device/precision before importing JAX.
         from utils import configure_jax_platform_for_device
         configure_jax_platform_for_device(self.config.device)
 
     def evaluate_one_ckpt(self, checkpoint):
-        from model import get_model_module
+        from model import get_model_module, prepare_robot_policy
         from utils import load_jax_checkpoint
         from env import make_env
         from trainer.evaluation import evaluate_env
@@ -446,9 +444,13 @@ class Evaluator:
         checkpoint = Path(checkpoint)
         params = load_jax_checkpoint(checkpoint)["params"]
         module = get_model_module(self.config.model)
-        hparams = module.hparams_from_config(self.config.model, self.config.model.critic, act_dim=2)
+        robot = prepare_robot_policy(self.config)
         env = make_env(self.config)
-        env_cfg = env.config_from_omegaconf(self.config)
+        env_cfg = env.config_from_omegaconf(self.config, robot=robot)
+        robot_kwargs = (dict(robot=robot, control_dt=env_cfg.dt)
+                        if self.config.model.type in {"barriernet_gnn", "barriernet_mlp"} else {})
+        hparams = module.hparams_from_config(self.config.model, self.config.model.critic,
+                                             act_dim=robot.control_dim, **robot_kwargs)
         video_dir = self.save_dir/f"visualize_{checkpoint.stem}" if self.visualize else None
         return evaluate_env(env, params, hparams, env_cfg, module,
                             episodes=self.episodes, seeds=self.seeds, video_dir=video_dir)

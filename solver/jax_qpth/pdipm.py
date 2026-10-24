@@ -111,11 +111,13 @@ def solve_kkt_factored(kkt_factors, d, G, A, S_LU, rx, rs, rz, ry):
     return dx, ds, dz, dy
 
 
-def get_step(v, dv):
+def get_step(v, dv, safe_step=False):
     a = -v / dv
     global_max = jnp.max(a)
     step_cap = jnp.where(global_max > 1.0, global_max, 1.0)
-    a = jnp.where(dv > 0.0, step_cap, a)
+    # Zero directions impose no positivity restriction.
+    nondecreasing = dv >= 0.0 if safe_step else dv > 0.0
+    a = jnp.where(nondecreasing, step_cap, a)
     return jnp.min(a, axis=1)
 
 
@@ -135,7 +137,7 @@ def residuals(Q, p, G, h, A, b, x, s, z, y):
     return rx, rz, ry, mu, pri_resid, dual_resid, resids
 
 
-def forward(Q, p, G, h, A, b, eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20):
+def forward(Q, p, G, h, A, b, eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20, safe_step=False):
     if maxIter <= 0:
         raise ValueError("maxIter must be > 0")
     n_batch, nineq, _nz = G.shape
@@ -211,7 +213,7 @@ def forward(Q, p, G, h, A, b, eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20
 
         dx_aff, ds_aff, dz_aff, dy_aff = solve_kkt_factored(kkt_factors, d, G, A, S_LU, rx, z, rz, ry)
         alpha_aff = jnp.minimum(
-            jnp.minimum(get_step(z, dz_aff), get_step(s, ds_aff)),
+            jnp.minimum(get_step(z, dz_aff, safe_step), get_step(s, ds_aff, safe_step)),
             jnp.ones((n_batch,), dtype=dtype),
         )
         alpha_aff = alpha_aff[:, None]
@@ -229,7 +231,7 @@ def forward(Q, p, G, h, A, b, eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20
         dz = dz_aff + dz_cor
         dy = dy_aff + dy_cor
         alpha = jnp.minimum(
-            0.999 * jnp.minimum(get_step(z, dz), get_step(s, ds)),
+            0.999 * jnp.minimum(get_step(z, dz, safe_step), get_step(s, ds, safe_step)),
             jnp.ones((n_batch,), dtype=dtype),
         )
         alpha = alpha[:, None]

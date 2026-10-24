@@ -1,4 +1,4 @@
-"""Shared QP objective, slack assembly, bounds and diagnostic reductions."""
+"""Shared QP objectives, slack assembly, input bounds and diagnostics."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def _unicycle_qp_objective(hparams, obs, nominal_xy):
     return q, p
 
 
-def _solve_slack_qp(params, hparams, obs, q, p, g, h_qp):
+def _solve_slack_qp(params, hparams, obs, q, p, g, h_qp, *, hard_g=None, hard_h=None, control_transform=None):
     batch = obs.shape[0]
     dtype = obs.dtype
     slack_dim = g.shape[1]
@@ -63,6 +63,11 @@ def _solve_slack_qp(params, hparams, obs, q, p, g, h_qp):
         [h_qp, jnp.zeros((batch, slack_dim), dtype=dtype)], axis=1
     )
 
+    if hard_g is not None:
+        hard_pad = jnp.zeros((batch, hard_g.shape[1], slack_dim), dtype=dtype)
+        g_qp = jnp.concatenate([g_qp, jnp.concatenate([hard_g, hard_pad], axis=2)], axis=1)
+        h_qp_full = jnp.concatenate([h_qp_full, hard_h], axis=1)
+
     total_dim = q_qp.shape[1]
     bound_eye = jnp.eye(hparams.act_dim, dtype=dtype)
     bound_pad = jnp.zeros(
@@ -84,14 +89,31 @@ def _solve_slack_qp(params, hparams, obs, q, p, g, h_qp):
     g_qp = jnp.concatenate([g_qp, bound_g], axis=1)
     h_qp_full = jnp.concatenate([h_qp_full, bound_h], axis=1)
 
+    transform = None
+    if control_transform is not None:
+        # Exact variable/row scaling for mixed-unit QPs.
+        transform = jnp.zeros_like(q_qp)
+        transform = transform.at[:, :hparams.act_dim, :hparams.act_dim].set(control_transform)
+        transform = transform.at[:, hparams.act_dim:, hparams.act_dim:].set(
+            slack_eye/jnp.sqrt(2.*hparams.qp_slack_weight))
+        q_qp = jnp.swapaxes(transform, 1, 2) @ q_qp @ transform
+        p_qp = (jnp.swapaxes(transform, 1, 2) @ p_qp[..., None]).squeeze(-1)
+        g_qp = g_qp @ transform
+        row_scale = jnp.maximum(jnp.linalg.norm(g_qp, axis=2), 1.)
+        g_qp = g_qp/row_scale[..., None]
+        h_qp_full = h_qp_full/row_scale
+
     qp_dtype = jnp.float64
     empty = jnp.empty((0,), dtype=qp_dtype)
     solution = QPFunction(
         eps=hparams.qp_eps,
         verbose=hparams.qp_verbose,
-        notImprovedLim=hparams.qp_not_improved_lim,
+        # Use the full iteration budget for stiff HOCBF problems.
+        notImprovedLim=(hparams.qp_max_iter if control_transform is not None
+                        else hparams.qp_not_improved_lim),
         maxIter=hparams.qp_max_iter,
         check_Q_spd=hparams.qp_check_q_spd,
+        safe_step=control_transform is not None,
     )(
         q_qp.astype(qp_dtype),
         p_qp.astype(qp_dtype),
@@ -100,6 +122,8 @@ def _solve_slack_qp(params, hparams, obs, q, p, g, h_qp):
         empty,
         empty,
     )
+    if transform is not None:
+        solution = (transform @ solution[..., None]).squeeze(-1)
     action = solution[:, : hparams.act_dim].astype(dtype)
     slack = solution[
         :, hparams.act_dim : hparams.act_dim + slack_dim

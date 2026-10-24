@@ -1,7 +1,4 @@
-"""DODGER planar model: [x, y, yaw, v_forward, v_lateral], [a_f, a_l, yaw_rate].
-
-This ideal velocity-tracking model does not simulate joints or balance.
-"""
+"""DODGER reduced model: state [x, y, yaw, vf, vl], input [af, al, yaw_rate]."""
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from functools import partial
@@ -26,7 +23,7 @@ def _parabolic_value(z, w, radius, cfg):
 
 @dataclass(frozen=True)
 class DistanceCBFParams:
-    kappa: tuple  # Linear class-K rates [kappa_1, kappa_2].
+    kappa: tuple  # HOCBF rates [kappa_1, kappa_2].
 
     def __post_init__(self):
         if len(self.kappa) != 2 or not all(math.isfinite(v) and v > 0 for v in self.kappa):
@@ -35,7 +32,7 @@ class DistanceCBFParams:
 
 @dataclass(frozen=True)
 class ParabolicCBFParams:
-    kappa: tuple  # Linear class-K rate [kappa_1].
+    kappa: tuple  # CBF rate [kappa_1].
     parabolic_gain: float
     clearance_gain: float
     speed_epsilon: float
@@ -58,26 +55,21 @@ class HumanoidRobot(Robot):
     state_dim: ClassVar[int] = 5
     control_dim: ClassVar[int] = 3
 
-    # Collision and navigation.
     radius: float
     margin: float
     goal_tolerance: float
 
-    # Nominal tracking.
     position_gain: float
     velocity_gain: float
     heading_gain: float
 
-    # CBF choice, shape and decay.
     barrier: str
     cbf: DistanceCBFParams | ParabolicCBFParams
 
-    # QP tracking weights.
     weights: tuple
 
     @classmethod
     def from_config(cls, config):
-        """Extract this robot's parameters from the complete Hydra configuration."""
         r = config.robot
         section = config.controller.humanoid
         barrier = section.get("barrier") if isinstance(section, Mapping) else None
@@ -140,7 +132,7 @@ class HumanoidRobot(Robot):
         return jnp.column_stack([self.rotation(state), jnp.array([-velocity[1], velocity[0]])])
 
     def step(self, state, action, dt):
-        """Midpoint world translation; exact held-input body velocities and yaw."""
+        """Midpoint translation with exact held-input body velocities and yaw."""
         midpoint = state.at[2].add(action[2]*dt/2).at[3:5].add(action[:2]*dt/2)
         next_state = state.at[:2].add(self.world_velocity(midpoint)*dt)
         next_state = next_state.at[2].set(angle_normalize(state[2]+action[2]*dt))
@@ -166,26 +158,22 @@ class HumanoidRobot(Robot):
         return state[:3]
 
     def control_output_matrix(self, state):
-        """Physical input tracking, matching the paper's shared QP objective."""
+        """Track physical inputs."""
         return jnp.eye(3)
 
     def barrier_domain_valid(self, state, obstacles):
-        """The parabolic barrier is defined strictly outside inflated obstacles."""
+        """Parabolic CBF requires strict separation from inflated obstacles."""
         if self.barrier == "distance":
             return jnp.array(True)
         radius = self.radius + obstacles.radii + self.margin
         q = jnp.sum((state[:2]-obstacles.centers)**2, axis=1) - radius**2
         return jnp.all((obstacles.mask <= .5) | (q > 0))
 
-    def distance_barrier(self, state, obstacles):
-        """Return h, h_dot, dh_dot_dx_g and h_ddot_drift.
-
-        dh_dot_dx_g = (d h_dot / d state) @ g(state).
-        h_ddot = dh_dot_dx_g@u+h_ddot_drift.
-        """
+    def distance_barrier(self, state, obstacles, *, r_safe=None):
+        """Return (h, h_dot, A, drift), where h_ddot = A@u + drift."""
         z = state[:2]-obstacles.centers
         w = self.world_velocity(state)-obstacles.velocities
-        radius = self.radius + obstacles.radii + self.margin
+        radius = self.radius + obstacles.radii + self.margin if r_safe is None else r_safe
         B = self.acceleration_map(state)
         h = jnp.sum(z*z, axis=1)-radius**2
         h_dot = 2*jnp.sum(z*w, axis=1)
@@ -194,16 +182,12 @@ class HumanoidRobot(Robot):
         return h, h_dot, dh_dot_dx_g, h_ddot_drift
 
     def parabolic_barrier(self, state, obstacles):
-        """Return h, squared-clearance q, dh_dx_g and h_dot_drift.
-
-        dh_dz and dh_dw are gradients with respect to relative position/velocity.
-        h_dot = dh_dx_g@u+h_dot_drift.
-        """
+        """Return (h, squared_clearance, A, drift), where h_dot = A@u + drift."""
         z = state[:2]-obstacles.centers
         w = self.world_velocity(state)-obstacles.velocities
         radius = self.radius + obstacles.radii + self.margin
         B = self.acceleration_map(state)
-        # Give inactive padding a valid point before differentiating the square root.
+        # Keep sqrt derivatives finite for inactive rows.
         dummy = jnp.stack([radius+1., jnp.zeros_like(radius)], axis=1)
         z = jnp.where((obstacles.mask > .5)[:, None], z, dummy)
         w = jnp.where((obstacles.mask > .5)[:, None], w, 0.)
@@ -216,12 +200,12 @@ class HumanoidRobot(Robot):
         return h, q, dh_dx_g, h_dot_drift
 
     @partial(jax.jit, static_argnames=("self",))
-    def cbf_constraints(self, state, obstacles, dt):
-        """Assemble distance/parabolic obstacle CBFs and next-step velocity bounds."""
+    def cbf_constraints(self, state, obstacles, dt, *, kappa=None, r_safe=None):
+        """Obstacle CBFs and next-step body-velocity limits."""
         check_obstacle_shapes(obstacles)
         if self.barrier == "distance":
-            h, h_dot, A, h_ddot_drift = self.distance_barrier(state, obstacles)
-            kappa1, kappa2 = self.cbf.kappa
+            h, h_dot, A, h_ddot_drift = self.distance_barrier(state, obstacles, r_safe=r_safe)
+            kappa1, kappa2 = self.cbf.kappa if kappa is None else jnp.moveaxis(kappa, -1, 0)
             b = h_ddot_drift+(kappa1+kappa2)*h_dot+kappa1*kappa2*h
             domain = jnp.stack([h, h_dot+kappa1*h], axis=1)
         elif self.barrier == "parabolic":
@@ -231,7 +215,7 @@ class HumanoidRobot(Robot):
         else:
             raise ValueError("humanoid barrier must be distance or parabolic")
         obstacle_rows = masked_rows(A, b, domain, obstacles.mask)
-        # Bound the ideal model's next body-velocity command without integrator clipping.
+        # Next-step body-velocity limits.
         margin = self.velocity_margin(state)
         velocity_rows = Constraints(
             dt*jnp.array([[1., 0., 0.], [-1., 0., 0.], [0., 1., 0.], [0., -1., 0.]]),
@@ -251,3 +235,7 @@ class HumanoidRobot(Robot):
         acceleration = self.velocity_gain*(desired-state[3:5])
         acceleration -= omega*jnp.array([-state[4], state[3]])
         return jnp.concatenate([acceleration, jnp.array([omega])])
+
+    def reward_motion(self, state, action):
+        """Return body forward speed and yaw rate."""
+        return jnp.stack([state[3], action[2]])

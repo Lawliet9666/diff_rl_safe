@@ -1,4 +1,4 @@
-"""Observation geometry and nearest-obstacle context shared by policies."""
+"""Policy observation geometry and nearest-obstacle selection."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def _body_to_world(vectors, theta):
 
 def _select_qp_topk(current_obs, human_ids, hparams):
     batch_size = current_obs.shape[0]
-    blocks = current_obs[:, 6:].reshape(
+    blocks = current_obs[:, 6:6 + 6*hparams.num_humans].reshape(
         (batch_size, hparams.num_humans, 6)
     )
     mask = jnp.clip(blocks[:, :, 5], 0.0, 1.0) > 0.5
@@ -50,8 +50,8 @@ def _gather_topk(values, qp_topk_ids):
     return values[batch_idx, qp_topk_ids.astype(jnp.int32)]
 
 
-def build_qp_context(obs, hparams):
-    """Select active nearest obstacles from the latest observation frame."""
+def build_qp_context(obs, hparams, *, robot_state=None):
+    """Select nearest obstacles and retain the supplied robot-state precision."""
     frames = jnp.asarray(obs, dtype=jnp.float32).reshape(
         (obs.shape[0], hparams.history_len, hparams.obs_frame_dim)
     )
@@ -61,4 +61,15 @@ def build_qp_context(obs, hparams):
         (current_obs.shape[0], hparams.num_humans),
     )
     qp_obs, ids = _select_qp_topk(current_obs, human_ids, hparams)
-    return {"qp_obs": qp_obs, "qp_topk_ids": ids.astype(jnp.int32)}
+    context = {"qp_obs": qp_obs, "qp_topk_ids": ids.astype(jnp.int32)}
+    if getattr(hparams, "robot_state_dim", 0) and robot_state is not None:
+        if robot_state.shape != (obs.shape[0], hparams.robot_state_dim):
+            raise ValueError("robot_state shape does not match the configured Robot")
+        context["robot_state"] = robot_state  # Preserve dynamics precision.
+    return context
+
+
+def robot_features(frames, hparams):
+    """Robot-state features excluding absolute x/y, already encoded by navigation."""
+    start = 6 + 6*hparams.num_humans
+    return frames[..., start+2:] if hparams.robot_state_dim else frames[..., :0]

@@ -1,8 +1,4 @@
-"""Planar double integrator: state [p_x, p_y, v_x, v_y], input [a_x, a_y].
-
-Positions, velocities and accelerations are expressed in the world frame.
-Integration preserves the commanded acceleration; limits are checked separately.
-"""
+"""World-frame double integrator: state [px, py, vx, vy], input [ax, ay]."""
 from dataclasses import dataclass
 from functools import partial
 import math
@@ -22,14 +18,13 @@ class DoubleIntegratorRobot(Robot):
     goal_tolerance: float
     position_gain: float
     velocity_gain: float
-    kappa: tuple  # Linear class-K rates [kappa_1, kappa_2].
+    kappa: tuple  # HOCBF rates [kappa_1, kappa_2].
     weights: tuple
     state_dim: ClassVar[int] = 4
     control_dim: ClassVar[int] = 2
 
     @classmethod
     def from_config(cls, config):
-        """Read physical, navigation and CBF-QP parameters from Hydra."""
         parameters = _control_parameters(
             config.controller.double_integrator,
             ("position_gain", "velocity_gain", "kappa", "weights"),
@@ -61,7 +56,7 @@ class DoubleIntegratorRobot(Robot):
         return jnp.concatenate([state[2:], jnp.asarray(action, dtype=state.dtype)])
 
     def step(self, state, action, dt):
-        """Exact zero-order-hold integration for a constant acceleration input."""
+        """Exact integration under constant acceleration."""
         action = jnp.asarray(action, dtype=state.dtype)
         position = state[:2] + state[2:]*dt + .5*action*dt**2
         velocity = state[2:] + action*dt
@@ -76,29 +71,29 @@ class DoubleIntegratorRobot(Robot):
         return -limits, limits
 
     def planar_pose(self, state):
-        """The holonomic point model has no heading; use zero for its projection."""
+        """Return [x, y, 0]; this model has no heading."""
         return jnp.concatenate([state[:2], jnp.zeros_like(state[:1])])
 
     def control_output_matrix(self, state):
-        """Track world-frame acceleration with the common QP objective."""
+        """Track world-frame acceleration."""
         return jnp.eye(2, dtype=state.dtype)
 
-    def distance_barrier(self, state, obstacles):
-        """Distance derivatives with constant obstacle velocity during prediction."""
+    def distance_barrier(self, state, obstacles, *, r_safe=None):
+        """Distance derivatives assuming constant obstacle velocity."""
         relative = state[:2] - obstacles.centers
         velocity = state[2:] - obstacles.velocities
-        radius = self.radius + obstacles.radii + self.margin
+        radius = self.radius + obstacles.radii + self.margin if r_safe is None else r_safe
         h = jnp.sum(relative**2, axis=1) - radius**2
         h_dot = 2*jnp.sum(relative*velocity, axis=1)
         h_ddot_drift = 2*jnp.sum(velocity**2, axis=1)
         return h, h_dot, 2*relative, h_ddot_drift
 
     @partial(jax.jit, static_argnames=("self",))
-    def cbf_constraints(self, state, obstacles, dt):
-        """Second-order obstacle CBFs, evaluated at control instants."""
+    def cbf_constraints(self, state, obstacles, dt, *, kappa=None, r_safe=None):
+        """Second-order obstacle HOCBF constraints."""
         check_obstacle_shapes(obstacles)
-        h, h_dot, A, drift = self.distance_barrier(state, obstacles)
-        kappa1, kappa2 = self.kappa
+        h, h_dot, A, drift = self.distance_barrier(state, obstacles, r_safe=r_safe)
+        kappa1, kappa2 = self.kappa if kappa is None else jnp.moveaxis(kappa, -1, 0)
         b = drift + (kappa1+kappa2)*h_dot + kappa1*kappa2*h
         domain = jnp.stack([h, h_dot+kappa1*h], axis=1)
         return masked_rows(A, b, domain, obstacles.mask)
@@ -107,3 +102,7 @@ class DoubleIntegratorRobot(Robot):
         desired = self.position_gain*(goal-state[:2])
         desired = jnp.where(jnp.linalg.norm(goal-state[:2]) < self.goal_tolerance, 0., desired)
         return self.velocity_gain*(desired-state[2:])
+
+    def reward_motion(self, state, action):
+        """Return speed and zero yaw rate."""
+        return jnp.array([jnp.linalg.norm(state[2:]), 0.], dtype=state.dtype)

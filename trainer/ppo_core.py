@@ -56,7 +56,7 @@ def compute_brax_gae(rewards, values, dones, next_values, gamma, lam):
 
 
 def timeout_bootstrap_from_config(config):
-    """Keep historical behavior when loading configs without the new switch."""
+    """Read timeout bootstrapping; absent settings retain the backend default."""
     legacy_default = config.env.get("backend", "jax") == "crax_mjx"
     value = config.trainer.get("timeout_bootstrap", legacy_default)
     if not isinstance(value, bool):
@@ -65,7 +65,7 @@ def timeout_bootstrap_from_config(config):
 
 
 def compute_timeout_gae(rewards, values, terminated, truncated, next_values, gamma, lam):
-    """Brax targets with final-observation bootstrap and separate episode ends."""
+    """Brax GAE with final-observation bootstrap for timeouts."""
     rewards, values, next_values = (jnp.asarray(value, jnp.float32)
                                     for value in (rewards, values, next_values))
     gamma, lam = jnp.asarray(gamma, jnp.float32), jnp.asarray(lam, jnp.float32)
@@ -182,6 +182,7 @@ def brax_ppo_loss(
             qp_context={
                 "qp_obs": batch["qp_obs"],
                 "qp_topk_ids": batch["qp_topk_ids"],
+                **({"robot_state": batch["qp_robot_state"]} if "qp_robot_state" in batch else {}),
             },
         )
     else:
@@ -387,7 +388,7 @@ def make_ppo_update_fn(
             return (epoch_params, epoch_opt_state, epoch_rng, stopped | kl_stop), metrics
 
         def skip_epoch(carry):
-            # Infer the real metric structure without executing an optimizer step.
+            # Infer metric shapes without an optimizer update.
             metric_shapes = jax.eval_shape(run_epoch, carry)[1]
             metrics = jax.tree_util.tree_map(
                 lambda value: jnp.zeros(value.shape, value.dtype), metric_shapes

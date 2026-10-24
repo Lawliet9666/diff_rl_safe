@@ -28,7 +28,7 @@ def _check_q_spd(Q):
         raise RuntimeError("Q is not SPD.")
 
 
-def solve_qp(Q, p, G, h, A, b, eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20, check_Q_spd=True):
+def solve_qp(Q, p, G, h, A, b, eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20, check_Q_spd=True, safe_step=False):
     expanded = expand_qp_params(Q, p, G, h, A, b)
     if expanded.A.shape[1] == 0 and expanded.G.shape[1] == 0:
         raise AssertionError("at least one equality or inequality constraint is required")
@@ -45,11 +45,12 @@ def solve_qp(Q, p, G, h, A, b, eps=1e-12, verbose=0, notImprovedLim=3, maxIter=2
         verbose=verbose,
         notImprovedLim=notImprovedLim,
         maxIter=maxIter,
+        safe_step=safe_step,
     )
 
 
-def QPFunction(eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20, check_Q_spd=True):
-    """Return a qpth-like differentiable dense QP solve function."""
+def QPFunction(eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20, check_Q_spd=True, safe_step=False):
+    """Differentiable dense QP; safe_step ignores zero Newton directions."""
 
     @jax.custom_vjp
     def _solve(Q, p, G, h, A, b):
@@ -64,6 +65,7 @@ def QPFunction(eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20, check_Q_spd=T
             verbose=verbose,
             notImprovedLim=notImprovedLim,
             maxIter=maxIter,
+            safe_step=safe_step,
             check_Q_spd=check_Q_spd,
         )[0]
 
@@ -82,6 +84,7 @@ def QPFunction(eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20, check_Q_spd=T
             verbose=verbose,
             notImprovedLim=notImprovedLim,
             maxIter=maxIter,
+            safe_step=safe_step,
         )
         expanded_values = (expanded.Q, expanded.p, expanded.G, expanded.h, expanded.A, expanded.b)
         expanded_flags = (

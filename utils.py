@@ -1,4 +1,4 @@
-"""Shared device configuration and model checkpoint utilities."""
+"""Device configuration and checkpoint utilities."""
 
 from __future__ import annotations
 

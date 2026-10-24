@@ -1,4 +1,4 @@
-"""Learned safety scalars shared across MLP and GNN variants."""
+"""Learned CBF gains, risk budgets and safety distances."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ def _learned_alpha(alpha_logits, hparams):
 
 def _fixed_safe_distances(current_obs, hparams):
     batch_size = current_obs.shape[0]
-    blocks = current_obs[:, 6:].reshape(
+    blocks = current_obs[:, 6:6 + 6*hparams.num_humans].reshape(
         (batch_size, hparams.num_humans, 6)
     )
     robot_radius = current_obs[:, 5:6]
@@ -54,7 +54,7 @@ def _uniform_beta_budget(mask, hparams):
 
 def _safe_distances_from_margin_logits(current_obs, margin_logits, hparams):
     batch_size = current_obs.shape[0]
-    blocks = current_obs[:, 6:].reshape((batch_size, hparams.num_humans, 6))
+    blocks = current_obs[:, 6:6 + 6*hparams.num_humans].reshape((batch_size, hparams.num_humans, 6))
     robot_radius = current_obs[:, 5:6]
     human_radii = blocks[:, :, 4]
     margin_base = jnp.asarray(hparams.margin_base, dtype=current_obs.dtype)

@@ -1,4 +1,4 @@
-"""Build robot parameters and a ready-to-use common CBF-QP filter."""
+"""CBF-QP controller factory."""
 from dataclasses import fields
 from functools import partial
 import math
@@ -21,7 +21,7 @@ def _required_section(node, names, label):
 
 
 def make_controller(config):
-    """Return (robot, solver, action_fn), binding settings only for action calls."""
+    """Return (robot, solver, action_fn)."""
     if config.controller.type != "cbf_qp":
         raise ValueError(f"unsupported controller type: {config.controller.type!r}")
     top_k = config.controller.qp_obs_top_k

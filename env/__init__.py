@@ -1,4 +1,4 @@
-"""Navigation environments with a shared reset/step/observe interface."""
+"""Common reset/step/observe environment interface."""
 
 
 def make_env(config):

@@ -1,4 +1,4 @@
-"""Planar velocity model with the original three-coordinate storage layout."""
+"""Planar velocity model with state [x, y, 0]."""
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -15,7 +15,6 @@ class SingleIntegratorRobot(Robot):
 
     @classmethod
     def from_config(cls, config):
-        """Read this model's parameters from the complete Hydra configuration."""
         return cls(v_max=config.robot.v_max)
 
     def dynamics(self, state, action):
@@ -35,7 +34,7 @@ class SingleIntegratorRobot(Robot):
         return jnp.asarray(pose, dtype=jnp.float32)
 
     def input_bounds(self):
-        # The step also enforces the original Euclidean speed limit.
+        # step() also enforces the Euclidean speed limit.
         limits = jnp.full(2, self.v_max)
         return -limits, limits
 

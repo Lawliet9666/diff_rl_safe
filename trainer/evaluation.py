@@ -1,4 +1,4 @@
-"""Shared deterministic evaluation through the navigation environment interface."""
+"""Shared deterministic navigation evaluation."""
 from pathlib import Path
 
 import jax
@@ -12,7 +12,7 @@ DEFAULT_EVAL_SEEDS = tuple(range(100, 1001, 100))
 
 
 def episode_outcomes(done, success, collision):
-    """Return boolean (success, collision, timeout), with collision priority."""
+    """Return success/collision/timeout masks, prioritizing collisions."""
     ended = jnp.asarray(done) > 0.5
     collision = ended & (jnp.asarray(collision) > 0.5)
     success = ended & (jnp.asarray(success) > 0.5) & ~collision
@@ -64,8 +64,9 @@ def _make_rollout(env, module, hp, cfg, capture):
     def transition(params, state, history, key):
         obs = history.reshape(history.shape[0], -1)
         if use_qp:
-            context = module.build_qp_context(obs, hp)
-            # Zero policy noise preserves the deterministic mean/action mapping.
+            context_kwargs = dict(robot_state=state.robot_state) if getattr(hp, "robot_state_dim", 0) else {}
+            context = module.build_qp_context(obs, hp, **context_kwargs)
+            # Evaluate the deterministic policy mean.
             action, *_, diagnostics = module.get_action_and_value(
                 params, hp, obs, noise=jnp.zeros((obs.shape[0], hp.act_dim), jnp.float32),
                 return_diagnostics=True, qp_context=context)
@@ -83,8 +84,11 @@ def _make_rollout(env, module, hp, cfg, capture):
             if name in diagnostics:
                 value = diagnostics[name]
                 if value.ndim > 1:
-                    mask = context["qp_obs"][..., 6:].reshape(value.shape + (6,))[..., 5]
-                    value = jnp.sum(value * mask, axis=-1) / jnp.maximum(mask.sum(axis=-1), 1.)
+                    mask = context["qp_obs"][..., 6:].reshape((value.shape[0], -1, 6))[..., 5]
+                    if value.ndim == 3:
+                        mask = jnp.broadcast_to(mask[..., None], value.shape)
+                    axes = tuple(range(1, value.ndim))
+                    value = jnp.sum(value * mask, axis=axes) / jnp.maximum(mask.sum(axis=axes), 1.)
                 info[name] = value
         return proposed, reward, done, info, ids
 
@@ -104,7 +108,7 @@ def _make_rollout(env, module, hp, cfg, capture):
                        contact_max=zero, key=key, step=jnp.asarray(0, jnp.int32))
 
         if capture is not None:
-            ids = (module.build_qp_context(history.reshape(size, -1), hp)["qp_topk_ids"]
+            ids = (module.build_qp_context(history.reshape(size, -1), hp, **(dict(robot_state=state.robot_state) if getattr(hp, "robot_state_dim", 0) else {}))["qp_topk_ids"]
                    if use_qp else jnp.zeros((size, 0), jnp.int32))
             jax.debug.callback(capture, env.snapshot_fn(state), history, zero,
                                false, false, false, ~false, ids, zero, ordered=True)
@@ -184,7 +188,7 @@ def _summarize(result, seeds, dt):
 
 def evaluate_env(env, params, hparams, env_cfg, model_module, *,
                  episodes=1, seeds=None, video_dir=None, rollout_callback=None):
-    """Evaluate fixed-seed episodes through reset/step/observe; never reset on done."""
+    """Evaluate fixed-seed episodes without resetting completed environments."""
     seeds = eval_seed_values(episodes, seeds)
     traces = [[] for _ in seeds] if video_dir is not None else None
 

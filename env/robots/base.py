@@ -1,4 +1,4 @@
-"""Shared robot configuration, JAX constraint tools and stateless robot contract."""
+"""Robot interface and shared CBF constraint types."""
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import NamedTuple
@@ -18,11 +18,9 @@ def angle_normalize(angle):
 
 
 class Obstacles(NamedTuple):
-    """Single scene: centers/velocities [N,2], radii/mask [N].
+    """centers/velocities [N,2], radii/mask [N]; velocities are world-frame.
 
-    Velocities are world-frame and held constant in the barrier prediction.
-    Masked slots may contain arbitrary finite values; they add no constraint.
-    """
+    Obstacle velocities are constant over the CBF prediction; masked rows are inactive."""
     centers: Array
     velocities: Array
     radii: Array
@@ -30,7 +28,7 @@ class Obstacles(NamedTuple):
 
 
 class Constraints(NamedTuple):
-    """A u + b >= 0; domain contains h and recursive HOCBF initial values."""
+    """A@u+b >= 0; domain stores h and recursive HOCBF initial conditions."""
     A: Array
     b: Array
     domain: Array
@@ -46,7 +44,7 @@ def check_obstacle_shapes(obstacles):
 
 def masked_rows(A, b, domain, mask):
     active = mask > 0.5
-    # A strictly feasible 0*u+1>=0 row avoids a degenerate masked equality.
+    # Inactive rows use 0*u+1>=0 to avoid degenerate equalities.
     return Constraints(jnp.where(active[:, None], A, 0.0),
                        jnp.where(active, b, 1.0),
                        jnp.where(active[:, None], domain, 1.0).reshape(-1))
@@ -58,7 +56,7 @@ def join_constraints(*blocks):
 
 
 def _hocbf(h, h_dot, h_ddot, dh_ddot_dx_g, h_dddot_drift, kappa):
-    # Recursive psi_i = d(psi_{i-1})/dt + kappa_i*psi_{i-1}; psi_0 = h.
+    # psi_i = d(psi_{i-1})/dt + kappa_i*psi_{i-1}, psi_0 = h.
     kappa1, kappa2, kappa3 = kappa
     psi1 = h_dot+kappa1*h
     psi2 = h_ddot+(kappa1+kappa2)*h_dot+kappa1*kappa2*h
@@ -69,7 +67,7 @@ def _hocbf(h, h_dot, h_ddot, dh_ddot_dx_g, h_dddot_drift, kappa):
 
 
 def _control_parameters(section, names, label, *, selected_cbf=None):
-    """Flatten loaded controller parameters, visiting only the selected CBF group."""
+    """Read nominal, selected CBF and QP parameter groups."""
     groups = ("nominal", "cbf", "qp")
     if not isinstance(section, Mapping):
         raise ValueError(f"{label} must be a mapping")
@@ -113,7 +111,7 @@ class Robot(ABC):
 
     @abstractmethod
     def dynamics(self, state, action):
-        """Continuous-time derivative for one robot state."""
+        """Continuous-time state derivative."""
         raise NotImplementedError
 
     @abstractmethod
@@ -123,34 +121,38 @@ class Robot(ABC):
 
     @abstractmethod
     def initial_state(self, pose):
-        """Create the complete model state from a sampled [x, y, yaw] pose."""
+        """Build the model state from [x, y, yaw]."""
         raise NotImplementedError
 
     def check_state_limits(self, state, tolerance=1e-6):
-        """Return whether the state is finite and satisfies physical state limits."""
+        """Check finite values and physical state limits."""
         return jnp.all(jnp.isfinite(state))
 
     @abstractmethod
     def input_bounds(self):
-        """Componentwise physical input bounds, as (lower, upper)."""
+        """Return componentwise physical input bounds (lower, upper)."""
         raise NotImplementedError
 
     @abstractmethod
     def planar_pose(self, state):
-        """Return the [x, y, yaw] projection used by the crowd and renderer."""
+        """Return [x, y, yaw] for crowd navigation and rendering."""
         raise NotImplementedError
 
     def cbf_constraints(self, state, obstacles, dt):
-        """Return A, b and initial domain conditions for A@u+b >= 0."""
+        """Return A, b and initial-domain values for A@u+b >= 0."""
         raise NotImplementedError(
             f"CBF constraints are not implemented for {type(self).__name__}")
 
+    def reward_motion(self, state, action):
+        """Return actual [forward speed, yaw rate] for navigation rewards."""
+        raise NotImplementedError(f"Reward motion is not implemented for {type(self).__name__}")
+
     def nominal_control(self, state, goal):
-        """Return a goal-tracking reference without applying a safety filter."""
+        """Goal-tracking reference before safety filtering."""
         raise NotImplementedError(
             f"Nominal control is not implemented for {type(self).__name__}")
 
     def control_output_matrix(self, state):
-        """Map physical control to the motion output tracked by the controller."""
+        """Map physical input to the tracked motion output."""
         raise NotImplementedError(
             f"Control output mapping is not implemented for {type(self).__name__}")

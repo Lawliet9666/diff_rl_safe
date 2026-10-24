@@ -1,4 +1,4 @@
-"""Select a Robot class; Hydra supplies the complete configuration."""
+"""Configured robot models."""
 from .base import Robot, RobotStep, angle_normalize
 from .single_integrator import SingleIntegratorRobot
 from .double_integrator import DoubleIntegratorRobot
@@ -8,7 +8,6 @@ from .humanoid import HumanoidRobot
 
 
 def make_robot(config):
-    """Dispatch by robot type; each model parses its own configuration block."""
     name = str(config.robot.type).strip().lower()
     if name == "single_integrator":
         model = SingleIntegratorRobot

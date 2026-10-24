@@ -1,4 +1,4 @@
-"""Original two-dimensional JAX SocialNav renderer."""
+"""2D social-navigation renderer."""
 import numpy as np
 
 
@@ -7,7 +7,7 @@ def _scalar(value):
 
 
 def _draw_robot(ax, position, yaw, radius, kind, color):
-    """Draw a heading-aware marker inside the unchanged circular footprint."""
+    """Draw the robot footprint and heading."""
     from matplotlib.patches import Circle, Ellipse, Polygon, Rectangle
     from matplotlib.transforms import Affine2D
 
@@ -62,7 +62,6 @@ def render_jax_social_nav_frame(
     *,
     robot_type=None,
 ):
-    """Render one JAX SocialNav state as a Matplotlib frame."""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.collections import LineCollection
     from matplotlib.colors import LinearSegmentedColormap, Normalize, to_rgba

@@ -14,8 +14,7 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 import wandb
 
-from model.ppo_base import normalize_robot_type
-from model import get_model_module
+from model import get_model_module, prepare_robot_policy
 from utils import (
     format_jax_device_runtime_info,
     jax_device_runtime_info,
@@ -51,7 +50,7 @@ def to_dict(cfg, name):
 
 
 class PPOTrainer:
-    """Shared PPO trainer with a selectable navigation environment."""
+    """Shared PPO trainer for navigation environments."""
 
     def __init__(self, config: DictConfig):
         self.model_module = get_model_module(config.model)
@@ -135,30 +134,21 @@ class PPOTrainer:
         return PACKAGE_ROOT / path
 
     def setup_env(self):
+        robot = prepare_robot_policy(self.config)
+        self.env = make_env(self.config)
+        self.jax_env_cfg = self.env.config_from_omegaconf(self.config, robot=robot)
+        self.robot = robot
+        self.env_act_dim = robot.control_dim
+        self.action_low, self.action_high = (np.asarray(x, np.float32) for x in robot.input_bounds())
         self.obs_dim = int(self.config.model.obs_dim)
-        self.env_act_dim = int(self.config.env.act_dim)
-        if self.env_act_dim != 2:
-            raise ValueError("JAX env expects env.act_dim=2")
-
-        robot_type = normalize_robot_type(getattr(self.config.robot, "type", "unicycle"))
-        v_max = float(self.config.robot.v_max)
-        if robot_type == "single_integrator":
-            self.action_low = np.asarray([-v_max, -v_max], dtype=np.float32)
-            self.action_high = np.asarray([v_max, v_max], dtype=np.float32)
-        else:
-            omega_max = float(self.config.robot.omega_max)
-            self.action_low = np.asarray([-v_max, -omega_max], dtype=np.float32)
-            self.action_high = np.asarray([v_max, omega_max], dtype=np.float32)
-
         self.history_len = int(self.config.model.history_len)
         self.obs_frame_dim = int(self.config.model.obs_frame_dim)
-        expected_frame_dim = 6 + int(self.config.env.humans.num_humans) * 6
-        if self.obs_frame_dim != expected_frame_dim:
-            raise ValueError("model.obs_frame_dim must equal 6 + env.humans.num_humans * 6")
-        if self.obs_dim != self.history_len * self.obs_frame_dim:
-            raise ValueError("model.obs_dim must equal model.history_len * model.obs_frame_dim")
-
-        self.env = make_env(self.config)
+        extra = robot.state_dim if self.config.robot.type in {"double_integrator", "humanoid", "quadrotor"} else 0
+        expected_frame_dim = 6 + int(self.config.env.humans.num_humans)*6 + extra
+        if self.obs_frame_dim != expected_frame_dim or self.obs_dim != self.history_len*self.obs_frame_dim:
+            raise ValueError("Policy observation dimensions do not match the configured environment and Robot")
+        self.robot_model_kwargs = (dict(robot=robot, control_dt=self.jax_env_cfg.dt)
+                                   if self.config.model.type in {"barriernet_gnn", "barriernet_mlp"} else {})
         self.rollout_collector = make_rollout_collector(
             self.model_module,
             use_qp=hasattr(self.model_module, "build_qp_context"),
@@ -180,6 +170,7 @@ class PPOTrainer:
             self.config.model,
             self.config.model.critic,
             act_dim=self.policy_action_dim,
+            **self.robot_model_kwargs,
         )
         rng = jax.random.PRNGKey(int(self.config.seed))
         rng, init_key = jax.random.split(rng)
@@ -191,6 +182,7 @@ class PPOTrainer:
             action_low=self.action_low,
             action_high=self.action_high,
             use_init_weights=bool(getattr(self.config.trainer, "use_init_weights", True)),
+            **self.robot_model_kwargs,
         )
         opt_state = init_ppo_opt_state(
             params,
@@ -202,7 +194,6 @@ class PPOTrainer:
         self.env_state = None
         self.global_step = 0
         self.current_lr = float(self.config.trainer.lr)
-        self.jax_env_cfg = self.env.config_from_omegaconf(self.config)
         self.jitted_train_step = self._make_jitted_train_step()
         self.lr_schedule = self._normalize_lr_schedule(getattr(self.config.trainer, "learning_rate_schedule", "linear"))
         self.lr_min = float(getattr(self.config.trainer, "learning_rate_schedule_min_lr", 0.0))
@@ -375,6 +366,8 @@ class PPOTrainer:
         if "qp_obs" in batch and "qp_topk_ids" in batch:
             update_batch["qp_obs"] = jnp.asarray(batch["qp_obs"], dtype=jnp.float32)
             update_batch["qp_topk_ids"] = jnp.asarray(batch["qp_topk_ids"], dtype=jnp.int32)
+        if "qp_robot_state" in batch:
+            update_batch["qp_robot_state"] = batch["qp_robot_state"]  # Preserve dynamics precision.
         return update_batch
 
     @staticmethod

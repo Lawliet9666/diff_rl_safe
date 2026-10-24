@@ -1,8 +1,7 @@
 total_timesteps: 20000000
 num_envs: ${oc.select:env.num_envs,128}
 
-# Bootstrap from the final observation at the episode limit; false restores
-# the legacy treatment of the limit as terminal. Both modes still reset.
+# Bootstrap timeout values from the final observation.
 timeout_bootstrap: true
 
 gamma: 0.99

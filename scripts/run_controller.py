@@ -1,4 +1,4 @@
-"""Hydra controller-only entry point, following scripts/run_ppo_base.py."""
+"""Hydra entry point for controller evaluation."""
 from pathlib import Path
 import argparse
 import sys

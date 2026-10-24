@@ -1,4 +1,4 @@
-"""Unicycle equations and the original SocialNav Euler/clipping convention."""
+"""Unicycle dynamics with Euler integration and input clipping."""
 from dataclasses import dataclass
 from functools import partial
 import math
@@ -17,24 +17,20 @@ class UnicycleRobot(Robot):
     state_dim: ClassVar[int] = 3
     control_dim: ClassVar[int] = 2
 
-    # Collision and navigation.
     radius: float
     margin: float
     goal_tolerance: float
 
-    # Nominal tracking; lookahead is shared with the CBF and QP.
     lookahead: float
     position_gain: float
 
-    # Linear class-K rate: alpha_1(s) = kappa[0]*s.
+    # alpha_1(h) = kappa[0]*h.
     kappa: tuple
 
-    # QP tracking weights.
     weights: tuple
 
     @classmethod
     def from_config(cls, config):
-        """Extract this robot's parameters from the complete Hydra configuration."""
         r = config.robot
         parameters = _control_parameters(
             config.controller.unicycle, ("lookahead", "position_gain", "kappa", "weights"),
@@ -83,20 +79,17 @@ class UnicycleRobot(Robot):
         return state
 
     def control_output_matrix(self, state):
-        """J maps [v, omega] to the world velocity of the lookahead point."""
+        """Map [v, omega] to the world velocity of the lookahead point."""
         c, s = jnp.cos(state[2]), jnp.sin(state[2])
         ell = self.lookahead
         return jnp.array([[c, -ell*s], [s, ell*c]])
 
     def barrier(self, state, obstacles):
-        """Return h, dh_dx_g and obstacle_motion; h_dot = dh_dx_g@u-obstacle_motion.
-
-        dh_dx_g is the state gradient of h multiplied by the input map g.
-        """
+        """Return (h, A, obstacle_motion), where h_dot = A@u - obstacle_motion."""
         heading = jnp.array([jnp.cos(state[2]), jnp.sin(state[2])])
         q = state[:2]+self.lookahead*heading
         rel = q-obstacles.centers
-        # Inflating by lookahead also separates the actual robot disk.
+        # Include lookahead to protect the robot disk.
         distance = self.radius+obstacles.radii+self.margin+self.lookahead
         h = jnp.sum(rel*rel, axis=-1)-distance**2
         dh_dx_g = 2*rel@self.control_output_matrix(state)
@@ -105,14 +98,14 @@ class UnicycleRobot(Robot):
 
     @partial(jax.jit, static_argnames=("self",))
     def cbf_constraints(self, state, obstacles, dt):
-        """First-order obstacle CBFs for the unicycle lookahead point."""
+        """First-order CBFs at the unicycle lookahead point."""
         check_obstacle_shapes(obstacles)
         h, dh_dx_g, obstacle_motion = self.barrier(state, obstacles)
         b = self.kappa[0]*h-obstacle_motion
         return masked_rows(dh_dx_g, b, h[:, None], obstacles.mask)
 
     def nominal_control(self, state, goal):
-        """Represent the old planar go-to-goal velocity in physical input coordinates."""
+        """Convert the goal-tracking world velocity to physical inputs."""
         delta = goal-state[:2]
         velocity = self.position_gain*delta
         speed = jnp.linalg.norm(velocity)

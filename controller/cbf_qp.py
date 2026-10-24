@@ -1,4 +1,4 @@
-"""Shared CPU OSQP safety filtering over robot-provided CBF constraints."""
+"""CPU OSQP safety filters for robot CBF constraints."""
 from typing import NamedTuple
 from dataclasses import dataclass
 from functools import partial
@@ -15,7 +15,7 @@ from env.robots.base import check_obstacle_shapes
 
 
 def select_obstacles(position, obstacles, top_k):
-    """Restrict QP visibility while preserving original scene indices and shapes."""
+    """Select nearest obstacles without changing scene indices or array shapes."""
     if top_k is None:
         return obstacles
     if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
@@ -32,7 +32,7 @@ class SolverConfig:
     eps_abs: float = 1e-9
     eps_rel: float = 1e-9
     max_iter: int = 10000
-    adaptive_rho_interval: int = 25  # Fixed iterations between rho updates.
+    adaptive_rho_interval: int = 25
     feasibility_tolerance: float = 1e-6
     polishing: bool = False
     verbose: bool = False
@@ -49,19 +49,19 @@ class SolverConfig:
 
 
 class ControlResult(NamedTuple):
-    action: jax.Array          # NaN only for confirmed primal infeasibility; never executed.
+    action: jax.Array          # NaN on primal infeasibility.
     candidate: jax.Array
-    residual: jax.Array        # Original CBF/input residuals, without relaxation.
-    kkt_residual: jax.Array    # Scaled primal, dual and complementarity residuals.
-    valid: bool               # Solved QP satisfies its own constraints and KKT checks.
-    initial_safe: bool         # All h/psi initial conditions hold.
+    residual: jax.Array        # Unrelaxed CBF/input residuals.
+    kkt_residual: jax.Array    # Primal, dual and complementarity residuals.
+    valid: bool               # QP feasibility and KKT checks.
+    initial_safe: bool         # h/psi initial conditions hold.
     correction_norm: float
     solver_status: str
     iterations: int
 
 
 def _tracking_qp_data(nominal, constraints, low, high, weights, output_matrix):
-    """Validate physical data and build the scaled nominal-tracking objective."""
+    """Validate and scale the physical tracking QP."""
     if not jax.config.x64_enabled:
         raise ValueError("CBF-QP requires JAX_ENABLE_X64=true before importing JAX")
     nominal, low, high, weights = [np.asarray(x, dtype=np.float64)
@@ -88,7 +88,7 @@ def _tracking_qp_data(nominal, constraints, low, high, weights, output_matrix):
 
 
 def _solve_qp_data(nominal, A, b, P, scale, domain, solver):
-    """Solve and independently check a scaled QP; all physical rows use A z+b>=0."""
+    """Solve the scaled QP and check feasibility/KKT residuals."""
     tolerance = solver.feasibility_tolerance
     d = nominal.size
     try:
@@ -148,11 +148,7 @@ def _solve_qp_data(nominal, A, b, P, scale, domain, solver):
 
 def solve_qp(nominal, constraints, low, high, weights, *,
              output_matrix, solver=SolverConfig()):
-    """Hard CPU QP with the original physical input limits and tracking cost.
-
-    Neither JIT-compatible nor differentiable. With output_matrix=M, minimize
-    0.5*||M@(u-nominal)||_W^2 using solver.feasibility_tolerance for validation.
-    """
+    """Minimize 0.5*||M@(u-nominal)||_W^2 with hard constraints (CPU OSQP)."""
     nominal, low, high, cbf_A, cbf_b, P, scale = _tracking_qp_data(
         nominal, constraints, low, high, weights, output_matrix)
     d = nominal.size
@@ -169,12 +165,10 @@ def validate_slack_weight(weight):
 
 def solve_slack_qp(nominal, constraints, low, high, weights, *, soft_mask,
                    slack_weight, output_matrix, solver=SolverConfig()):
-    """Minimize tracking cost + rho/2*||delta||^2 with A*u+b+E*delta>=0.
+    """CPU QP with cost 0.5*||M@(u-nominal)||_W^2 + rho/2*||delta||^2.
 
-    Only rows selected by soft_mask receive nonnegative, unbounded slacks.
-    Returned slack entries retain the original constraint-row ordering.
-    valid checks the relaxed QP; residual still reports the original conditions.
-    """
+    Only soft_mask rows receive slacks, in constraint order.
+    residual excludes slack; valid checks the relaxed QP."""
     validate_slack_weight(slack_weight)
     if slack_weight == 0:
         raise ValueError("solve_slack_qp requires a positive slack_weight")
@@ -195,7 +189,7 @@ def solve_slack_qp(nominal, constraints, low, high, weights, *, soft_mask,
         [np.zeros((k, d)), np.eye(k)],
     ])
     b = np.concatenate([cbf_b, -low, high, np.zeros(k)])
-    # delta = z_delta/sqrt(rho): condition the cost without changing its units.
+    # delta = z_delta/sqrt(rho) conditions the cost.
     scale = np.concatenate([control_scale, np.full(k, 1./math.sqrt(slack_weight))])
     P = np.zeros((d+k, d+k))
     P[:d, :d] = tracking_P
@@ -220,14 +214,14 @@ def _control_output_matrix(robot, state):
 
 
 def control_residual(robot, state, action, obstacles, dt):
-    """Evaluate the actual applied input, including a requested fallback input."""
+    """Check CBF and input residuals for the applied action."""
     constraints = robot.cbf_constraints(state, obstacles, dt)
     low, high = robot.input_bounds()
     return jnp.concatenate([constraints.A@action+constraints.b, action-low, high-action])
 
 
 def _validate_controller_inputs(robot, state, nominal, obstacles, dt):
-    """Reject malformed/nonfinite data while allowing finite unsafe states and references."""
+    """Validate shapes and finite values; unsafe states are allowed."""
     if not math.isfinite(dt) or dt <= 0:
         raise ValueError("dt must be finite and positive")
     if np.shape(state) != (robot.state_dim,):
@@ -244,7 +238,6 @@ def _validate_controller_inputs(robot, state, nominal, obstacles, dt):
 
 
 def _solve_controller_qp(robot, state, nominal, obstacles, dt, *, solver, slack_weight):
-    """Prepare shared QP inputs, then select hard or relaxed obstacle constraints."""
     if isinstance(robot, HumanoidRobot) and not bool(robot.barrier_domain_valid(state, obstacles)):
         raise ValueError("parabolic CBF requires strict separation from inflated obstacles")
     low, high = robot.input_bounds()
@@ -260,7 +253,6 @@ def _solve_controller_qp(robot, state, nominal, obstacles, dt, *, solver, slack_
 
 
 def solve_cbf_qp(robot, state, nominal, obstacles, dt, *, solver=SolverConfig()):
-    """Apply a hard CBF-QP; invalid data and numerical failures raise."""
     _validate_controller_inputs(robot, state, nominal, obstacles, dt)
     result, _ = _solve_controller_qp(robot, state, nominal, obstacles, dt,
                                      solver=solver, slack_weight=0.0)
@@ -268,7 +260,7 @@ def solve_cbf_qp(robot, state, nominal, obstacles, dt, *, solver=SolverConfig())
 
 
 def warmup_controller(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None):
-    """Warm JAX CBF/output computations without creating or solving an OSQP problem."""
+    """Compile CBF/output computations without solving a QP."""
     _validate_controller_inputs(robot, state, nominal, obstacles, dt)
     obstacles = select_obstacles(state[:2], obstacles, qp_obs_top_k)
     if isinstance(robot, HumanoidRobot) and not bool(robot.barrier_domain_valid(state, obstacles)):
@@ -279,16 +271,11 @@ def warmup_controller(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None
 
 def generate_action(robot, state, nominal, obstacles, dt, *, solver=SolverConfig(),
                     slack_weight=0.0, qp_obs_top_k=None):
-    """Filter a supplied nominal physical input; zero selects the hard QP.
+    """Non-differentiable CPU OSQP filter for a nominal physical input [control_dim].
 
-    nominal has robot.control_dim entries in the robot input units.
-    Pass the full obstacle scene; qp_obs_top_k=None uses all valid obstacles.
-    Diagnostics include obstacle_mask in the original scene order and shape.
-    Slack currently relaxes only unicycle obstacle constraints. CBF calculations
-    are JIT-compiled; the CPU OSQP solve is not differentiable.
-    Invalid data and numerical failures raise. Confirmed primal infeasibility
-    returns qp.valid=False with a NaN action. Inspect qp.initial_safe separately.
-    """
+    slack_weight=0 is hard; obstacle slack is supported for unicycle only.
+    Full-scene input and returned obstacle_mask retain scene ordering.
+    Numerical errors raise; infeasibility returns qp.valid=False and a NaN action."""
     validate_slack_weight(slack_weight)
     if slack_weight > 0 and not isinstance(robot, UnicycleRobot):
         raise ValueError("positive slack_weight currently supports unicycle only")

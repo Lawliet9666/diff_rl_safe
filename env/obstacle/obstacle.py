@@ -245,7 +245,7 @@ def human_step(cfg, state, actions):
 
 
 def advance_obstacles(cfg, state, rng):
-    """Advance the crowd after the caller has updated the robot state."""
+    """Update obstacles after robot motion."""
     gmm_rng = rng
     if cfg.end_goal_changing or cfg.random_goal_changing:
         goal_rng, gmm_rng = jax.random.split(rng)

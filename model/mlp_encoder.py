@@ -1,11 +1,11 @@
-"""Shared MLP observation encoder and critic helpers."""
+"""Shared MLP encoder and critic functions."""
 
 from __future__ import annotations
 
 import math
 import jax.numpy as jnp
-from model.observation import _world_to_body
-from model.ppo_base import activation, dense, init_linear, mlp
+from model.observation import _world_to_body, robot_features
+from model.actor_critic import activation, dense, init_linear, mlp
 
 
 def _init_encoder(keys, hparams, use_init_weights):
@@ -50,7 +50,7 @@ def _preprocess_obs(obs, hparams):
     )
     robot_radius = frames[:, :, 5:6] / hparams.position_scale
 
-    human_blocks = frames[:, :, 6:].reshape(
+    human_blocks = frames[:, :, 6:6+6*hparams.num_humans].reshape(
         (frames.shape[0], hparams.history_len, hparams.num_humans, 6)
     )
     human_mask = jnp.clip(human_blocks[:, :, :, 5:6], 0.0, 1.0)
@@ -81,6 +81,8 @@ def _preprocess_obs(obs, hparams):
         ],
         axis=-1,
     )
+    if getattr(hparams, "robot_state_dim", 0):
+        processed_frames = jnp.concatenate([processed_frames, robot_features(frames, hparams)], axis=-1)
     return processed_frames.reshape((frames.shape[0], -1))
 
 

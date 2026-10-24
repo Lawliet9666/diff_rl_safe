@@ -1,8 +1,4 @@
-"""Functional CRAX/MJX Point with the original crowd-navigation task.
-
-Only scene construction uses Python. Reset, crowd motion, feedback control,
-physics, rewards and observations are pure JAX functions, suitable for vmap/scan.
-"""
+"""CRAX/MJX social navigation with JAX reset, step and observation functions."""
 from __future__ import annotations
 
 import sys
@@ -27,7 +23,7 @@ class CrowdState(NamedTuple):
     rng: Any
 
 
-# Keep MJX/CRAX array creation float32 while policy/QP computations may use x64.
+# MJX uses float32; policy/QP may use float64.
 class _PhysicsNumpy:
     _constructors = {"array", "asarray", "zeros", "ones", "full", "eye",
                      "empty", "zeros_like", "ones_like", "full_like", "empty_like",
@@ -107,7 +103,7 @@ class CraxSocialNavConfig(NamedTuple):
 
 
 class CraxNavigationState(NamedTuple):
-    """CRAX-owned navigation state accompanying the MJX physics state."""
+    """Navigation state paired with MJX physics."""
     robot_state: jnp.ndarray
     robot_vel: jnp.ndarray
     robot_action: jnp.ndarray
@@ -126,11 +122,10 @@ class CraxNavigationState(NamedTuple):
 
 
 class CraxSocialNav(SafeGoalPoint):
-    """Independent CRAX/MJX physics, initialization, crowd and navigation task."""
+    """CRAX physics with the crowd-navigation task."""
 
     @classmethod
     def config_from_omegaconf(cls, config, *, robot=None) -> CraxSocialNavConfig:
-        """Parse navigation settings, reusing a supplied configured robot when given."""
         def get(cfg, name, default=None):
             if isinstance(cfg, dict):
                 return cfg.get(name, default)
@@ -244,7 +239,6 @@ class CraxSocialNav(SafeGoalPoint):
         if self.tracking_tau <= 0:
             raise ValueError("tracking_time_constant must be positive")
         self.render_size = int(config.env.simulation.render_size)
-        # Importing the explicit extension must succeed; never fall back to boxes.
         box, cyl = mujoco.mjtGeom.mjGEOM_BOX, mujoco.mjtGeom.mjGEOM_CYLINDER
         if _COLLISION_FUNC.get((box, cyl)) is not collisions.box_cylinder:
             raise RuntimeError("CRAX box/cylinder collision extension was not registered")
@@ -281,7 +275,7 @@ class CraxSocialNav(SafeGoalPoint):
 
     def _mocap(self, physics, crowd, positions):
         active = crowd.human_mask[0] > .5
-        # Moving masked geoms outside the scene preserves fixed model topology.
+        # Keep fixed topology by moving masked geoms outside the scene.
         hidden = jnp.stack([1000. + jnp.arange(self.nav_cfg.num_humans) * 2.,
                             jnp.full((self.nav_cfg.num_humans,), 1000.)], axis=-1)
         xy = jnp.where(active[:, None], positions, hidden).astype(jnp.float32)
@@ -291,7 +285,7 @@ class CraxSocialNav(SafeGoalPoint):
         return physics.replace(mocap_pos=pos)
 
     def from_crowd(self, crowd, key):
-        """Initialize physics from an existing task state for parity/scenario checks."""
+        """Initialize physics from an existing navigation state."""
         physics = self._template.replace(qpos=crowd.robot_state[0].astype(jnp.float32),
             qvel=jnp.concatenate([crowd.robot_vel[0], crowd.robot_action[0, 1:2]]).astype(jnp.float32))
         physics = self._mocap(physics, crowd, crowd.human_positions[0])
@@ -306,7 +300,7 @@ class CraxSocialNav(SafeGoalPoint):
         return self.kernels["observe"](state.crowd)[0]
 
     def tracking_control(self, physics, command):
-        """Same inverse-mass speed/turn tracker as the native Point backend."""
+        """Native Point speed/yaw-rate tracking control."""
         yaw = physics.qpos[2]
         heading = jnp.stack([jnp.cos(yaw), jnp.sin(yaw)])
         speed, omega = physics.qvel[:2] @ heading, physics.qvel[2]
@@ -338,12 +332,12 @@ class CraxSocialNav(SafeGoalPoint):
         command = jnp.clip(jnp.asarray(velocity_command, jnp.float32), -self._bounds, self._bounds)
         key, motion_key = jax.random.split(state.rng)
         crowd = state.crowd
-        # Obstacles stay at their previous positions throughout robot physics.
+        # Hold obstacles fixed during robot physics.
         physics = self._mocap(state.physics, crowd, crowd.human_positions[0])
 
         def substep(carry, _):
             physics, clearance, contacted = carry
-            # reset/final forward and the preceding substep already refresh physics.
+            # Physics was refreshed by reset or the previous substep.
             ctrl = self.tracking_control(physics, command)
             physics = self.pipeline_step(physics, ctrl)
             physics = mjx.forward(self.sys, physics)
@@ -377,7 +371,7 @@ class CraxSocialNav(SafeGoalPoint):
         return CrowdState(physics, crowd, key), reward[0], done, metrics
 
     def reset_fn(self, env_cfg, key, num_envs):
-        """Reset a batch from a root key or explicit per-episode keys."""
+        """Reset from a root key or per-episode keys."""
         if key.shape == (2,):
             key = jax.random.split(key, num_envs)
         elif key.shape != (num_envs, 2):
@@ -418,7 +412,6 @@ class CraxSocialNav(SafeGoalPoint):
 
     def navigation_done(self, cfg: CraxSocialNavConfig, state: CraxNavigationState,
                         dist_to_goal, min_clearance):
-        """Navigation outcomes independent of robot controls and reward shaping."""
         next_step = state.step_count + 1
         collision = min_clearance < 0.0
         success = dist_to_goal < cfg.goal_tolerance
@@ -470,7 +463,7 @@ class CraxSocialNav(SafeGoalPoint):
         return cfg.workspace_low + unit * (cfg.workspace_high - cfg.workspace_low)
 
     def _planar_state(self, cfg, state):
-        """Build a temporary [x,y,yaw] view for existing navigation and rendering tools."""
+        """Project the robot state to [x, y, yaw] for navigation and rendering."""
         return state._replace(robot_state=jax.vmap(cfg.robot.planar_pose)(state.robot_state))
 
     def _fixed_order_policy_obs_from_state(self, cfg: CraxSocialNavConfig, state: CraxNavigationState):
@@ -862,7 +855,7 @@ class CraxSocialNav(SafeGoalPoint):
         return next_positions, clipped
 
     def _advance_obstacles(self, cfg, state, rng):
-        """Advance the crowd after the caller has updated the robot state."""
+        """Update obstacles after robot motion."""
         gmm_rng = rng
         if cfg.end_goal_changing or cfg.random_goal_changing:
             goal_rng, gmm_rng = jax.random.split(rng)

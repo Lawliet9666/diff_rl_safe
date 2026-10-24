@@ -9,8 +9,11 @@ from trainer.ppo_core import flat_time_batch
 
 
 def _topk_mask(values, qp_obs):
-    human_blocks = qp_obs[..., 6:].reshape(values.shape + (6,))
-    return jnp.clip(human_blocks[..., 5], 0.0, 1.0).astype(values.dtype)
+    human_blocks = qp_obs[..., 6:].reshape((*qp_obs.shape[:-1], -1, 6))
+    mask = jnp.clip(human_blocks[..., 5], 0.0, 1.0).astype(values.dtype)
+    if values.ndim > mask.ndim:
+        mask = jnp.broadcast_to(mask[..., None], values.shape)
+    return mask
 
 
 def _masked_topk_sum_count(values, qp_obs):
@@ -175,7 +178,8 @@ def make_rollout_collector(model_module, use_qp, *, step_fn, reset_fn,
             policy_obs = history.reshape((batch_size, -1))
             noise = jax.random.normal(noise_key, (batch_size, act_dim), dtype=jnp.float32)
             if use_qp:
-                qp_context = model_module.build_qp_context(policy_obs, hparams)
+                context_kwargs = dict(robot_state=state.robot_state) if getattr(hparams, "robot_state_dim", 0) else {}
+                qp_context = model_module.build_qp_context(policy_obs, hparams, **context_kwargs)
                 env_action, logp, _entropy, value, policy_action, qp_diagnostics = (
                     model_module.get_action_and_value(
                         params,
@@ -239,6 +243,8 @@ def make_rollout_collector(model_module, use_qp, *, step_fn, reset_fn,
                     "qp_correction": qp_diagnostics["qp_correction"],
                     "r_safe": qp_diagnostics["r_safe"],
                 }
+                if "robot_state" in qp_context:
+                    transition["qp_robot_state"] = qp_context["robot_state"]
                 if "beta" in qp_diagnostics:
                     transition["beta"] = qp_diagnostics["beta"]
                 if "alpha" in qp_diagnostics:
@@ -320,6 +326,8 @@ def make_rollout_collector(model_module, use_qp, *, step_fn, reset_fn,
                 "global_step": jnp.asarray(global_step, dtype=jnp.int32) + int(steps_per_env) * batch_size,
                 **summary,
             }
+        if "qp_robot_state" in transitions:
+            batch["qp_robot_state"] = flat_time_batch(transitions["qp_robot_state"])
         if timeout_aware:
             batch.update({key: transitions[key] for key in ("terminated", "truncated", "next_values")})
         batch.update({key: jnp.mean(value) for key, value in transitions.items() if key.startswith("control/")})

@@ -1,4 +1,4 @@
-"""Render recorded MJX arrays with native MuJoCo; no second simulation."""
+"""Render recorded MJX states with MuJoCo."""
 import ctypes
 import os
 from pathlib import Path
