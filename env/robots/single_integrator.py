@@ -1,22 +1,38 @@
 """Planar velocity model with state [x, y, 0]."""
 from dataclasses import dataclass
+import math
 from typing import ClassVar
 
 import jax.numpy as jnp
 
-from .base import Robot, RobotStep
+from .base import Robot, RobotStep, check_obstacle_shapes, masked_rows, _control_parameters
 
 
 @dataclass(frozen=True)
 class SingleIntegratorRobot(Robot):
     v_max: float
+    radius: float
+    margin: float
+    kappa: tuple
+    weights: tuple
     state_dim: ClassVar[int] = 3
     control_dim: ClassVar[int] = 2
     policy_feature_dim: ClassVar[int] = 2
 
     @classmethod
     def from_config(cls, config):
-        return cls(v_max=config.robot.v_max)
+        values = _control_parameters(config.controller.single_integrator, ("kappa", "weights"),
+                                     "controller.single_integrator")
+        return cls(v_max=config.robot.v_max, radius=config.robot.radius,
+                   margin=float(config.env.safety_margin),
+                   kappa=tuple(values['kappa']), weights=tuple(values['weights']))
+
+    def __post_init__(self):
+        if (len(self.kappa) != 1 or len(self.weights) != 2
+                or not all(math.isfinite(v) and v > 0 for v in
+                           (self.v_max, self.radius, *self.kappa, *self.weights))
+                or not math.isfinite(self.margin) or self.margin < 0):
+            raise ValueError("invalid single-integrator CBF parameters")
 
     def dynamics(self, state, action):
         return jnp.array([action[0], action[1], 0.])
@@ -45,3 +61,16 @@ class SingleIntegratorRobot(Robot):
 
     def planar_pose(self, state):
         return state
+
+    def control_output_matrix(self, state):
+        """Track world-frame planar velocity."""
+        return jnp.eye(2, dtype=state.dtype)
+
+    def cbf_constraints(self, state, obstacles, dt):
+        """First-order distance CBFs for the physical input [vx, vy]."""
+        check_obstacle_shapes(obstacles)
+        relative = state[:2]-obstacles.centers
+        radius = self.radius+obstacles.radii+self.margin
+        h = jnp.sum(relative**2, axis=1)-radius**2
+        b = self.kappa[0]*h-2*jnp.sum(relative*obstacles.velocities, axis=1)
+        return masked_rows(2*relative, b, h[:, None], obstacles.mask)

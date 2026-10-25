@@ -12,6 +12,13 @@ solver:
   verbose: false
 
 # Class-K rates: alpha_i(s) = kappa_i*s [1/s].
+single_integrator:
+  nominal: {}
+  cbf:
+    kappa: [2.0]  # h_dot + kappa_1*h >= 0
+  qp:
+    weights: [1.0, 1.0]  # World velocity x/y.
+
 unicycle:
   lookahead: 0.2  # m; tracking-point offset
   nominal:

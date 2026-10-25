@@ -31,3 +31,14 @@ eval_interval: 100
 eval_freq_timesteps: 0
 eval_episodes: 20
 max_checkpoints: 10
+
+# External fixed-CBF filter for ordinary PPO; also enabled during evaluation.
+safety_filter:
+  enabled: false
+  qp_obs_top_k: 5  # null: all; positive integer: nearest active obstacles.
+  slack_weight: 10.0  # Obstacle rows only; 0 selects hard constraints.
+  speed_facets: 16  # Single-integrator speed disk inner approximation only.
+  max_iter: 40
+  eps: 1.0e-12
+  feasibility_tolerance: 1.0e-6  # Original physical constraints.
+  kkt_tolerance: 1.0e-6  # Whitened QP stationarity/complementarity.

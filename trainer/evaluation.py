@@ -57,11 +57,13 @@ def _select_active(active, old_tree, new_tree):
     return jax.tree_util.tree_map(select, old_tree, new_tree)
 
 
-def _make_rollout(env, module, hp, cfg, capture):
+def _make_rollout(env, module, hp, cfg, capture, safety_filter=None):
     use_qp = hasattr(module, "build_qp_context")
+    if safety_filter is not None and use_qp:
+        raise ValueError("external safety filter cannot wrap a policy with an internal QP")
     step_fn, observe_fn = env.step_fn, env.observe_fn
 
-    def transition(params, state, history, key):
+    def transition(params, state, history, key, active):
         obs = history.reshape(history.shape[0], -1)
         if use_qp:
             context_kwargs = dict(robot_state=state.robot_state) if getattr(hp, "robot_state_dim", 0) else {}
@@ -76,7 +78,14 @@ def _make_rollout(env, module, hp, cfg, capture):
                                        module.policy_action_to_env_action)
             action, diagnostics = action_fn(obs)
             ids = jnp.zeros((obs.shape[0], 0), jnp.int32)
+        if safety_filter is not None:
+            action, diagnostics = safety_filter(state, action, active=active)
+            ids = diagnostics['qp_ids']
         proposed, reward, done, metrics = step_fn(cfg, state, action, key)
+        if safety_filter is not None:
+            # Finished episodes are ignored by the evaluation accumulator.
+            safety_filter.check_applied(jnp.where(active[:, None], action, proposed.robot_action),
+                                        proposed.robot_action)
         info = {name: metrics[name] for name in ("success", "collision", "min_clearance")}
         if "physical_contact" in metrics:
             info["physical_contact"] = metrics["physical_contact"]
@@ -90,6 +99,7 @@ def _make_rollout(env, module, hp, cfg, capture):
                     axes = tuple(range(1, value.ndim))
                     value = jnp.sum(value * mask, axis=axes) / jnp.maximum(mask.sum(axis=axes), 1.)
                 info[name] = value
+        info.update({name: value for name, value in diagnostics.items() if name.startswith('filter/')})
         return proposed, reward, done, info, ids
 
     def run(params, state, history):
@@ -97,19 +107,21 @@ def _make_rollout(env, module, hp, cfg, capture):
         zero = jnp.zeros(size, jnp.float32)
         false = jnp.zeros(size, bool)
         key = jax.random.PRNGKey(0)
-        info_shapes = jax.eval_shape(transition, params, state, history, key)[3]
+        info_shapes = jax.eval_shape(transition, params, state, history, key, ~false)[3]
         extra_names = tuple(name for name in info_shapes
                             if name not in {"success", "collision", "min_clearance"})
         initial = dict(state=state, history=history, done=false, returns=zero,
                        success=false, collision=false, timeout=false,
                        lengths=jnp.zeros(size, jnp.int32),
                        min_clearance=jnp.full(size, jnp.inf, jnp.float32),
-                       extras={name: zero for name in extra_names},
+                       extras={name: jnp.zeros(size, info_shapes[name].dtype) for name in extra_names},
                        contact_max=zero, key=key, step=jnp.asarray(0, jnp.int32))
 
         if capture is not None:
             ids = (module.build_qp_context(history.reshape(size, -1), hp, **(dict(robot_state=state.robot_state) if getattr(hp, "robot_state_dim", 0) else {}))["qp_topk_ids"]
                    if use_qp else jnp.zeros((size, 0), jnp.int32))
+            if safety_filter is not None:
+                ids = safety_filter.select_obstacles(state)[1]
             jax.debug.callback(capture, env.snapshot_fn(state), history, zero,
                                false, false, false, ~false, ids, zero, ordered=True)
 
@@ -119,7 +131,7 @@ def _make_rollout(env, module, hp, cfg, capture):
         def body(carry):
             key, step_key = jax.random.split(carry["key"])
             proposed, reward, done, info, ids = transition(
-                params, carry["state"], carry["history"], step_key)
+                params, carry["state"], carry["history"], step_key, ~carry["done"])
             active = ~carry["done"]
             success, collision, timeout = episode_outcomes(
                 active & (done > .5), info["success"], info["collision"])
@@ -142,7 +154,9 @@ def _make_rollout(env, module, hp, cfg, capture):
                 lengths=carry["lengths"] + active.astype(jnp.int32),
                 min_clearance=jnp.minimum(carry["min_clearance"],
                                          jnp.where(active, info["min_clearance"], jnp.inf)),
-                extras={name: carry["extras"][name] + jnp.where(active, info[name], 0.)
+                extras={name: (jnp.maximum(carry["extras"][name], jnp.where(active, info[name], 0.))
+                               if name.startswith('filter/') and name.endswith('_max') else
+                               carry["extras"][name] + jnp.where(active, info[name], 0.))
                         for name in extra_names},
                 contact_max=contact, key=key, step=carry["step"] + 1)
 
@@ -167,7 +181,8 @@ def _summarize(result, seeds, dt):
                    mean_min_clearance=mean_clearance, std_min_clearance=std_clearance)
     metrics.update(paper_metric_summary(result["success"], lengths, clearance, dt))
     total_steps = max(int(lengths.sum()), 1)
-    metrics.update({name: float(value.sum() / total_steps)
+    metrics.update({name: float(value.max() if name.startswith('filter/') and name.endswith('_max')
+                                else value.sum() / total_steps)
                     for name, value in result["extras"].items()})
     if "physical_contact" in result["extras"]:
         metrics["physical_contact_rate"] = float(np.mean(result["contact_max"]))
@@ -178,7 +193,8 @@ def _summarize(result, seeds, dt):
                          for name in ("success", "collision", "timeout")})
         record["return"] = float(returns[index])
         record["min_clearance"] = float(clearance[index]) if np.isfinite(clearance[index]) else None
-        record.update({name: float(values[index] / max(int(lengths[index]), 1))
+        record.update({name: float(values[index] if name.startswith('filter/') and name.endswith('_max')
+                                   else values[index] / max(int(lengths[index]), 1))
                        for name, values in result["extras"].items()})
         if "physical_contact" in result["extras"]:
             record["physical_contact"] = float(result["contact_max"][index])
@@ -187,7 +203,7 @@ def _summarize(result, seeds, dt):
 
 
 def evaluate_env(env, params, hparams, env_cfg, model_module, *,
-                 episodes=1, seeds=None, video_dir=None, rollout_callback=None):
+                 episodes=1, seeds=None, video_dir=None, rollout_callback=None, safety_filter=None):
     """Evaluate fixed-seed episodes without resetting completed environments."""
     seeds = eval_seed_values(episodes, seeds)
     traces = [[] for _ in seeds] if video_dir is not None else None
@@ -209,13 +225,13 @@ def evaluate_env(env, params, hparams, env_cfg, model_module, *,
     callback = capture if traces is not None or rollout_callback is not None else None
     if callback is None:
         cache = getattr(env, "_evaluation_cache", {})
-        cache_key = (model_module.__name__, repr(hparams), repr(env_cfg))
+        cache_key = (model_module.__name__, repr(hparams), repr(env_cfg), repr(safety_filter))
         if cache_key not in cache:
-            cache[cache_key] = _make_rollout(env, model_module, hparams, env_cfg, None)
+            cache[cache_key] = _make_rollout(env, model_module, hparams, env_cfg, None, safety_filter)
             env._evaluation_cache = cache
         run = cache[cache_key]
     else:
-        run = _make_rollout(env, model_module, hparams, env_cfg, callback)
+        run = _make_rollout(env, model_module, hparams, env_cfg, callback, safety_filter)
     keys = jax.vmap(jax.random.PRNGKey)(seeds)
     state = env.reset_fn(env_cfg, keys, len(seeds))
     frame = env.observe_fn(env_cfg, state, hparams)

@@ -30,6 +30,7 @@ from trainer.ppo_core import (
     tree_all_finite,
 )
 from env import make_env
+from controller.safety_filter import make_safety_filter
 from trainer.evaluation import evaluate_env
 from trainer.ppo_rollout import make_rollout_collector
 
@@ -119,6 +120,8 @@ class PPOTrainer:
         )
         if float(trainer.ent_coef) > 0.0:
             run_name += f"-ent{trainer.ent_coef}"
+        if self.config.trainer.safety_filter.enabled:
+            run_name += "-safetyfilter"
         run_name += "-braxppo"
         lr_schedule = str(getattr(trainer, "learning_rate_schedule", "linear")).strip().lower()
         if lr_schedule == "adaptive_kl":
@@ -151,13 +154,14 @@ class PPOTrainer:
                                    {"barriernet_gnn", "barriernet_mlp", "ppo_mlp", "ppo_gnn"} else {})
         if self.config.model.type in {"barriernet_gnn", "barriernet_mlp"}:
             self.robot_model_kwargs["control_dt"] = self.jax_env_cfg.dt
+        self.safety_filter = make_safety_filter(self.config, self.jax_env_cfg)
         self.rollout_collector = make_rollout_collector(
             self.model_module,
-            use_qp=hasattr(self.model_module, "build_qp_context"),
             step_fn=self.env.step_fn,
             reset_fn=self.env.reset_fn,
             observe_fn=self.env.observe_fn,
             timeout_aware=self.timeout_bootstrap,
+            safety_filter=self.safety_filter,
         )
 
     def setup_model_and_optimizer(self):
@@ -424,7 +428,7 @@ class PPOTrainer:
             "robot_omega_delta_max": batch["robot_omega_delta_max"],
             "robot_omega_delta_penalty_mean": batch["robot_omega_delta_penalty_mean"],
             **{key: batch[key] for key in diagnostic_keys},
-            **{key: value for key, value in batch.items() if key.startswith("control/")},
+            **{key: value for key, value in batch.items() if key.startswith(("control/", "filter/"))},
             "rollout_batch_finite": PPOTrainer._finite_if_enabled(run_finite_check, batch),
             "gae_finite": PPOTrainer._finite_if_enabled(
                 run_finite_check,
@@ -450,7 +454,7 @@ class PPOTrainer:
             "robot_omega_delta_max": float(summary["robot_omega_delta_max"]),
             "robot_omega_delta_penalty_mean": float(summary["robot_omega_delta_penalty_mean"]),
         }
-        metrics.update({key: float(value) for key, value in summary.items() if key.startswith("control/")})
+        metrics.update({key: float(value) for key, value in summary.items() if key.startswith(("control/", "filter/"))})
         if "qp_slack_sum" in summary:
             metrics.update({
                 "qp_slack_mean": PPOTrainer._summary_mean(summary, "qp_slack"),
@@ -591,7 +595,7 @@ class PPOTrainer:
             if "physical_contact_rate" in eval_metrics:
                 log_dict["eval/physical_contact_rate"] = eval_metrics["physical_contact_rate"]
 
-        log_dict.update({key: value for key, value in train_metrics.items() if key.startswith("control/")})
+        log_dict.update({key: value for key, value in train_metrics.items() if key.startswith(("control/", "filter/"))})
         wandb_log = {key: value for key, value in log_dict.items() if not key.startswith("train/")}
         if completed > 0 and periodic_log:
             wandb_log.update({key: value for key, value in log_dict.items() if key.startswith("train/")})
@@ -606,7 +610,7 @@ class PPOTrainer:
         episodes = int(self.config.trainer.eval_episodes if episodes is None else episodes)
         return evaluate_env(
             self.env, self.params, self.jax_hparams,
-            self.jax_env_cfg, self.model_module, episodes=episodes,
+            self.jax_env_cfg, self.model_module, episodes=episodes, safety_filter=self.safety_filter,
         )
 
     def _assert_finite_eval_metrics(self, eval_metrics, update, global_step):

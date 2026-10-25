@@ -45,7 +45,7 @@ def _beta_budget_error_max(beta, qp_obs, beta_budget):
     return jnp.max(jnp.abs(beta_totals - target))
 
 
-def _rollout_summary(transitions, use_qp, beta_budget=None):
+def _rollout_summary(transitions, has_policy_qp, beta_budget=None):
     completed = jnp.isfinite(transitions["completed_return"])
     completed_returns = jnp.where(completed, transitions["completed_return"], 0.0)
     completed_ppo_returns = jnp.where(completed, transitions["completed_ppo_return"], 0.0)
@@ -65,7 +65,7 @@ def _rollout_summary(transitions, use_qp, beta_budget=None):
         "robot_omega_delta_max": jnp.max(transitions["robot_omega_delta"]),
         "robot_omega_delta_penalty_mean": jnp.mean(transitions["robot_omega_delta_penalty"]),
     }
-    if use_qp:
+    if has_policy_qp:
         r_safe_sum, r_safe_count = _masked_topk_sum_count(
             transitions["r_safe"], transitions["qp_obs"]
         )
@@ -154,10 +154,12 @@ def _update_ppo_episode_returns(running_returns, reward, done_bool):
     return next_returns.astype(jnp.float32), logged_returns.astype(jnp.float32)
 
 
-def make_rollout_collector(model_module, use_qp, *, step_fn, reset_fn,
-                           observe_fn, timeout_aware=False):
-    """Create a model-specific collector; ``use_qp`` is static before JIT tracing."""
-    use_qp = bool(use_qp)
+def make_rollout_collector(model_module, *, step_fn, reset_fn,
+                           observe_fn, timeout_aware=False, safety_filter=None):
+    """Infer policy-QP support once when creating the collector, before JIT tracing."""
+    has_policy_qp = hasattr(model_module, "build_qp_context")
+    if safety_filter is not None and has_policy_qp:
+        raise ValueError("external safety filter cannot wrap a policy with an internal QP")
 
     def collect(
         params,
@@ -177,7 +179,7 @@ def make_rollout_collector(model_module, use_qp, *, step_fn, reset_fn,
             key, noise_key, env_key, reset_key = jax.random.split(key, 4)
             policy_obs = history.reshape((batch_size, -1))
             noise = jax.random.normal(noise_key, (batch_size, act_dim), dtype=jnp.float32)
-            if use_qp:
+            if has_policy_qp:
                 context_kwargs = dict(robot_state=state.robot_state) if getattr(hparams, "robot_state_dim", 0) else {}
                 qp_context = model_module.build_qp_context(policy_obs, hparams, **context_kwargs)
                 env_action, logp, _entropy, value, policy_action, qp_diagnostics = (
@@ -200,8 +202,13 @@ def make_rollout_collector(model_module, use_qp, *, step_fn, reset_fn,
                     return_policy_action=True,
                 )
 
-            next_state, reward, done, metrics = step_fn(env_cfg, state, env_action, env_key)
-            if use_qp:
+            executed_action = env_action
+            if safety_filter is not None:
+                executed_action, filter_diagnostics = safety_filter(state, env_action)
+            next_state, reward, done, metrics = step_fn(env_cfg, state, executed_action, env_key)
+            if safety_filter is not None:
+                safety_filter.check_applied(executed_action, next_state.robot_action)
+            if has_policy_qp:
                 reward = reward - float(hparams.qp_residual_reward_weight) * qp_diagnostics["qp_slack"]
             done_bool = done > 0.5
             next_ppo_returns, completed_ppo_return = _update_ppo_episode_returns(
@@ -217,7 +224,7 @@ def make_rollout_collector(model_module, use_qp, *, step_fn, reset_fn,
             next_frame = observe_fn(env_cfg, next_state)
             next_history = _update_gnn_obs_history(history, next_frame, done_bool)
 
-            if use_qp:
+            if has_policy_qp:
                 transition = {
                     "obs": policy_obs,
                     "qp_obs": qp_context["qp_obs"],
@@ -276,6 +283,10 @@ def make_rollout_collector(model_module, use_qp, *, step_fn, reset_fn,
                     "robot_omega_delta": metrics["robot_omega_delta"],
                     "robot_omega_delta_penalty": metrics["robot_omega_delta_penalty"],
                 }
+            if safety_filter is not None:
+                transition['executed_act'] = executed_action
+                transition.update({name: value for name, value in filter_diagnostics.items()
+                                   if name.startswith('filter/')})
             if timeout_aware:
                 truncated = metrics.get("truncated", metrics["timeout"])
                 terminated = metrics.get("terminated", jnp.where(truncated > 0.5, 0.0, done))
@@ -294,11 +305,11 @@ def make_rollout_collector(model_module, use_qp, *, step_fn, reset_fn,
         next_value = model_module.critic_value(params, hparams, next_policy_obs)
         beta_budget = (
             float(hparams.beta_max)
-            if use_qp and hasattr(hparams, "beta_max")
+            if has_policy_qp and hasattr(hparams, "beta_max")
             else None
         )
-        summary = _rollout_summary(transitions, use_qp, beta_budget)
-        if use_qp:
+        summary = _rollout_summary(transitions, has_policy_qp, beta_budget)
+        if has_policy_qp:
             batch = {
                 "obs": flat_time_batch(transitions["obs"]),
                 "qp_obs": flat_time_batch(transitions["qp_obs"]),
@@ -326,6 +337,10 @@ def make_rollout_collector(model_module, use_qp, *, step_fn, reset_fn,
                 "global_step": jnp.asarray(global_step, dtype=jnp.int32) + int(steps_per_env) * batch_size,
                 **summary,
             }
+        if safety_filter is not None:
+            batch['executed_act'] = flat_time_batch(transitions['executed_act'])
+            batch.update({name: (jnp.max(value) if name.endswith('_max') else jnp.mean(value))
+                          for name, value in transitions.items() if name.startswith('filter/')})
         if "qp_robot_state" in transitions:
             batch["qp_robot_state"] = flat_time_batch(transitions["qp_robot_state"])
         if timeout_aware:

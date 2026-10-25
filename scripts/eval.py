@@ -440,6 +440,7 @@ class Evaluator:
         from utils import load_jax_checkpoint
         from env import make_env
         from trainer.evaluation import evaluate_env
+        from controller.safety_filter import make_safety_filter
 
         checkpoint = Path(checkpoint)
         params = load_jax_checkpoint(checkpoint)["params"]
@@ -455,7 +456,8 @@ class Evaluator:
                                              act_dim=robot.control_dim, **robot_kwargs)
         video_dir = self.save_dir/f"visualize_{checkpoint.stem}" if self.visualize else None
         return evaluate_env(env, params, hparams, env_cfg, module,
-                            episodes=self.episodes, seeds=self.seeds, video_dir=video_dir)
+                            episodes=self.episodes, seeds=self.seeds, video_dir=video_dir,
+                            safety_filter=make_safety_filter(self.config, env_cfg))
 
     def eval_all_ckpts(self, checkpoint=None):
         if self.is_controller:
