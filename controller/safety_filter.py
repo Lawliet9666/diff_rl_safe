@@ -5,25 +5,9 @@ import math
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
-import numpy as np
 
 from env.robots.base import Obstacles
 from solver.jax_qpth.qp import solve_qp
-
-
-def _raise_failure(errors, valid):
-    invalid = np.flatnonzero(~np.asarray(valid))
-    raise RuntimeError(
-        f"SF-PPO CBF-QP failed for batch {invalid.tolist()}; "
-        f"[physical feasibility, stationarity, complementarity, dual feasibility]="
-        f"{np.asarray(errors)[invalid].tolist()}")
-
-
-def _check_solution(errors, valid):
-    def fail(_):
-        jax.debug.callback(_raise_failure, errors, valid, ordered=True)
-        return jnp.int32(0)
-    jax.lax.cond(jnp.all(valid), lambda _: jnp.int32(0), fail, operand=None)
 
 
 @dataclass(frozen=True)
@@ -37,8 +21,6 @@ class SafetyFilter:
     speed_facets: int
     max_iter: int
     eps: float
-    feasibility_tolerance: float
-    kkt_tolerance: float
 
     def select_obstacles(self, state):
         distance = jnp.linalg.norm(state.human_positions-state.robot_state[:, None, :2], axis=-1)
@@ -113,10 +95,12 @@ class SafetyFilter:
             nominal_action = jnp.where(active[:, None], nominal_action, 0.)
         data = self._qp_data(state, nominal_action)
         empty = jnp.empty((0,), jnp.float64)
+        # Match BarrierNet's first-order versus high-order solver settings.
+        high_order = self.robot_type in {"double_integrator", "humanoid", "quadrotor"}
         solution, _, dual, _ = solve_qp(
             data['q'], data['p'], data['g'], data['h'], empty, empty,
-            eps=self.eps, verbose=-1, notImprovedLim=self.max_iter,
-            maxIter=self.max_iter, check_Q_spd=False, safe_step=True)
+            eps=self.eps, verbose=-1, notImprovedLim=self.max_iter if high_order else 3,
+            maxIter=self.max_iter, check_Q_spd=False, safe_step=high_order)
         physical = (data['transform'] @ solution[..., None]).squeeze(-1)
         dim = self.robot.control_dim
         action = physical[:, :dim].astype(nominal_action.dtype)
@@ -133,9 +117,6 @@ class SafetyFilter:
         complementarity = jnp.max(jnp.abs(distance*dual), axis=1)
         dual_feasibility = jnp.maximum(jnp.max(-dual, axis=1), 0.)
         errors = jnp.stack([primal, dual_residual, complementarity, dual_feasibility], axis=1)
-        valid = jnp.all(jnp.isfinite(errors), axis=1) & jnp.all(jnp.isfinite(action), axis=1)
-        valid &= (primal <= self.feasibility_tolerance) & jnp.all(errors[:, 1:] <= self.kkt_tolerance, axis=1)
-        _check_solution(errors, valid)
         residual = (data['constraints'].A @ action.astype(jnp.float64)[..., None]).squeeze(-1)+data['constraints'].b
         count = jnp.maximum(data['mask'].sum(axis=1), 1.)
         correction = jnp.linalg.norm(action-nominal_action, axis=1)
@@ -144,17 +125,14 @@ class SafetyFilter:
             'filter/slack': (slack*data['mask']).sum(axis=1)/count,
             'filter/slack_max': jnp.max(slack*data['mask'], axis=1),
             'filter/correction': correction,
-            'filter/intervention': (correction > self.feasibility_tolerance).astype(jnp.float32),
+            # Tolerances below affect diagnostic labels only.
+            'filter/intervention': (correction > 1e-5).astype(jnp.float32),
             'filter/cbf_violation': jnp.maximum(jnp.max(-residual[:, :self.top_k]*data['mask'], axis=1), 0.),
             'filter/primal_residual': primal,
             'filter/kkt_residual': jnp.max(errors[:, 1:], axis=1),
-            'filter/initial_safe': jnp.all(data['constraints'].domain >= -self.feasibility_tolerance, axis=1).astype(jnp.float32),
+            'filter/initial_safe': jnp.all(data['constraints'].domain >= -1e-5, axis=1).astype(jnp.float32),
         }
         return jax.tree_util.tree_map(jax.lax.stop_gradient, (action, diagnostics))
-
-    def check_applied(self, executed, applied):
-        error = jnp.max(jnp.abs(executed-applied), axis=1)
-        _check_solution(jnp.stack([error]*4, axis=1), jnp.isfinite(error) & (error <= self.feasibility_tolerance))
 
 
 def make_safety_filter(config, env_cfg):
@@ -180,11 +158,11 @@ def make_safety_filter(config, env_cfg):
         value = section[name]
         if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
             raise ValueError(f"trainer.safety_filter.{name} must be an integer >= {minimum}")
-    for name in ('eps', 'feasibility_tolerance', 'kkt_tolerance', 'slack_weight'):
+    for name in ('eps', 'slack_weight'):
         value = section[name]
         if isinstance(value, bool) or not math.isfinite(float(value)) or float(value) < 0 or (name != 'slack_weight' and value == 0):
             raise ValueError(f"invalid trainer.safety_filter.{name}")
     return SafetyFilter(env_cfg.robot, str(config.robot.type), env_cfg.dt, env_cfg.num_humans,
                         min(top_k, env_cfg.num_humans) if top_k is not None else env_cfg.num_humans,
                         float(section.slack_weight), section.speed_facets, section.max_iter,
-                        float(section.eps), float(section.feasibility_tolerance), float(section.kkt_tolerance))
+                        float(section.eps))

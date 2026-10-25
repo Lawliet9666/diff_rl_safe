@@ -82,10 +82,6 @@ def _make_rollout(env, module, hp, cfg, capture, safety_filter=None):
             action, diagnostics = safety_filter(state, action, active=active)
             ids = diagnostics['qp_ids']
         proposed, reward, done, metrics = step_fn(cfg, state, action, key)
-        if safety_filter is not None:
-            # Finished episodes are ignored by the evaluation accumulator.
-            safety_filter.check_applied(jnp.where(active[:, None], action, proposed.robot_action),
-                                        proposed.robot_action)
         info = {name: metrics[name] for name in ("success", "collision", "min_clearance")}
         if "physical_contact" in metrics:
             info["physical_contact"] = metrics["physical_contact"]

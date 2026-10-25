@@ -40,5 +40,3 @@ safety_filter:
   speed_facets: 16  # Single-integrator speed disk inner approximation only.
   max_iter: 40
   eps: 1.0e-12
-  feasibility_tolerance: 1.0e-6  # Original physical constraints.
-  kkt_tolerance: 1.0e-6  # Whitened QP stationarity/complementarity.

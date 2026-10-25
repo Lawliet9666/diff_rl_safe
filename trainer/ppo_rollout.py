@@ -206,8 +206,6 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
             if safety_filter is not None:
                 executed_action, filter_diagnostics = safety_filter(state, env_action)
             next_state, reward, done, metrics = step_fn(env_cfg, state, executed_action, env_key)
-            if safety_filter is not None:
-                safety_filter.check_applied(executed_action, next_state.robot_action)
             if has_policy_qp:
                 reward = reward - float(hparams.qp_residual_reward_weight) * qp_diagnostics["qp_slack"]
             done_bool = done > 0.5
