@@ -35,9 +35,11 @@ class PPOGNNHParams:
     graph_layers: int
     position_scale: float
     velocity_scale: float
+    robot: object
+    robot_state_dim: int
 
 
-def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
+def hparams_from_config(model_cfg, critic_cfg, act_dim=2, *, robot=None):
     actor_cfg = model_cfg.actor
     require_config_value(model_cfg, "type", "ppo_gnn", "model")
     require_config_value(actor_cfg, "graph_coordinate_frame", "robot_body", "model.actor")
@@ -45,16 +47,34 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
     obs_frame_dim = int(model_cfg.obs_frame_dim)
     if history_len <= 0:
         raise ValueError("ppo_gnn requires history_len > 0")
-    if int(act_dim) != 2:
-        raise ValueError("ppo_gnn requires act_dim=2")
+    robot_type = str(model_cfg.robot_type)
+    extended = robot_type in {"double_integrator", "humanoid", "quadrotor"}
+    if not extended:
+        normalize_robot_type(robot_type)
+    if robot is None or int(act_dim) != robot.control_dim:
+        raise ValueError("PPO-GNN requires its configured Robot and matching action dimension")
+    num_humans = int(model_cfg.num_humans)
+    robot_state_dim = robot.state_dim if extended else 0
+    if num_humans <= 0 or obs_frame_dim != 6 + 6*num_humans + robot_state_dim:
+        raise ValueError("Observation transport must contain navigation, explicit human slots, and full robot state")
+    if int(model_cfg.obs_dim) != history_len * obs_frame_dim:
+        raise ValueError("ppo_gnn requires obs_dim = history_len * obs_frame_dim")
+    if min(int(cfg_get(actor_cfg, name, default)) for name, default in (
+        ("graph_hidden_dim", 64), ("graph_latent_dim", 16), ("graph_layers", 3))) <= 0:
+        raise ValueError("ppo_gnn graph dimensions and layer count must be > 0")
+    if min(float(cfg_get(actor_cfg, name, default)) for name, default in (
+        ("position_scale", 20.0), ("velocity_scale", 1.0))) <= 0:
+        raise ValueError("ppo_gnn position_scale and velocity_scale must be > 0")
     return PPOGNNHParams(
         act_dim=int(act_dim),
-        robot_type=normalize_robot_type(cfg_get(model_cfg, "robot_type", "unicycle")),
+        robot_type=robot_type,
+        robot=robot,
+        robot_state_dim=robot_state_dim,
         actor_act=str(cfg_get(actor_cfg, "act", "relu")),
         critic_act=str(cfg_get(critic_cfg, "act", "relu")),
         history_len=history_len,
         obs_frame_dim=obs_frame_dim,
-        num_humans=max(0, (obs_frame_dim - 6) // 6),
+        num_humans=num_humans,
         graph_hidden_dim=int(cfg_get(actor_cfg, "graph_hidden_dim", 64)),
         graph_latent_dim=int(cfg_get(actor_cfg, "graph_latent_dim", 16)),
         graph_layers=int(cfg_get(actor_cfg, "graph_layers", 3)),
@@ -71,9 +91,10 @@ def init_params_from_config(
     action_low,
     action_high,
     use_init_weights=True,
+    *, robot=None,
 ):
     actor_cfg = model_cfg.actor
-    hparams = hparams_from_config(model_cfg, critic_cfg, act_dim=act_dim)
+    hparams = hparams_from_config(model_cfg, critic_cfg, act_dim=act_dim, robot=robot)
     hidden_dim = int(cfg_get(actor_cfg, "hidden_dim", 256))
     control_hidden_dim = int(cfg_get(actor_cfg, "control_hidden_dim", hidden_dim))
     critic_hidden_dim = int(cfg_get(critic_cfg, "hidden_dim", 256))

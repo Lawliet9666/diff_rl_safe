@@ -448,7 +448,7 @@ class Evaluator:
         env = make_env(self.config)
         env_cfg = env.config_from_omegaconf(self.config, robot=robot)
         robot_kwargs = (dict(robot=robot) if self.config.model.type in
-                        {"barriernet_gnn", "barriernet_mlp", "ppo_mlp"} else {})
+                        {"barriernet_gnn", "barriernet_mlp", "ppo_mlp", "ppo_gnn"} else {})
         if self.config.model.type in {"barriernet_gnn", "barriernet_mlp"}:
             robot_kwargs["control_dt"] = env_cfg.dt
         hparams = module.hparams_from_config(self.config.model, self.config.model.critic,

@@ -96,10 +96,8 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2, *, robot=None, control
         raise ValueError("Humanoid RL requires the distance HOCBF")
     if extended and float(actor_cfg.qp_slack_weight) <= 0:
         raise ValueError("High-order BarrierNet requires a positive obstacle slack weight")
-    if extended and (robot is None or int(act_dim) != robot.control_dim):
-        raise ValueError("High-order BarrierNet requires its configured Robot and matching action dimension")
-    if not extended and int(act_dim) != 2:
-        raise ValueError("Planar velocity-controlled BarrierNet requires act_dim=2")
+    if robot is None or int(act_dim) != robot.control_dim:
+        raise ValueError("BarrierNet-GNN requires its configured Robot and matching action dimension")
     robot_state_dim = robot.state_dim if extended else 0
     if obs_frame_dim != 6 + 6*int(model_cfg.num_humans) + robot_state_dim:
         raise ValueError("Observation frame must contain navigation, explicit human slots, and full robot state")
@@ -128,7 +126,7 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2, *, robot=None, control
     return BarrierNetGNNHParams(
         act_dim=int(act_dim),
         robot_type=robot_type,
-        robot=robot if extended else None,
+        robot=robot,
         robot_state_dim=robot_state_dim,
         control_dt=float(control_dt),
         cbf_order=(3 if robot_type == "quadrotor" else 2) if extended else 1,

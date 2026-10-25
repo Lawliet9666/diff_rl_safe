@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import math
-import jax
 import jax.numpy as jnp
-from model.observation import _world_to_body
+from model.observation import _world_to_body, robot_policy_features
 from model.actor_critic import activation, dense, init_linear, mlp
 
 
@@ -46,19 +45,7 @@ def _preprocess_obs(obs, hparams):
         / hparams.position_scale
     )
     if getattr(hparams, "robot", None) is not None:
-        robot = hparams.robot
-        if hparams.robot_state_dim:
-            robot_states = frames[:, :, 6+6*hparams.num_humans:]
-        else:
-            # Legacy planar transport omits absolute x/y; proprioception does not use them.
-            robot_states = jnp.concatenate([jnp.zeros_like(frames[:, :, :2]),
-                                             frames[:, :, 4:5]], axis=-1)
-        robot_values = jax.vmap(lambda x, v: robot.policy_features(
-            x, v, position_scale=hparams.position_scale,
-            velocity_scale=hparams.velocity_scale))(
-                robot_states.reshape((-1, robot.state_dim)),
-                frames[:, :, 2:4].reshape((-1, 2)))
-        robot_values = robot_values.reshape((*frames.shape[:2], robot.policy_feature_dim))
+        robot_values = robot_policy_features(frames, hparams)
     else:
         # DiffCVaR keeps its existing planar feature contract.
         robot_values = _world_to_body(frames[:, :, 2:4], robot_theta) / hparams.velocity_scale

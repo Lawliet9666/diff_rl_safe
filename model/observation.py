@@ -69,7 +69,16 @@ def build_qp_context(obs, hparams, *, robot_state=None):
     return context
 
 
-def robot_features(frames, hparams):
-    """Robot-state features excluding absolute x/y, already encoded by navigation."""
-    start = 6 + 6*hparams.num_humans
-    return frames[..., start+2:] if hparams.robot_state_dim else frames[..., :0]
+def robot_policy_features(frames, hparams):
+    """Normalized Robot proprioception for each [batch, history] observation frame."""
+    robot = hparams.robot
+    if hparams.robot_state_dim:
+        states = frames[..., 6 + 6*hparams.num_humans:]
+    else:
+        # Planar transport omits absolute x/y, which policy_features does not use.
+        states = jnp.concatenate([jnp.zeros_like(frames[..., :2]), frames[..., 4:5]], axis=-1)
+    features = jax.vmap(lambda state, velocity: robot.policy_features(
+        state, velocity, position_scale=hparams.position_scale,
+        velocity_scale=hparams.velocity_scale))(
+            states.reshape((-1, robot.state_dim)), frames[..., 2:4].reshape((-1, 2)))
+    return features.reshape((*frames.shape[:2], robot.policy_feature_dim))

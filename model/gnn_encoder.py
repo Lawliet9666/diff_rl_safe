@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from model.observation import _world_to_body, robot_features
+from model.observation import _world_to_body, robot_policy_features
 
 import math
 
@@ -222,9 +222,9 @@ def _build_spatio_temporal_graph_tensors(hparams, obs_history):
     robot_goal_mask = jnp.ones((batch_size, history_len, 1), dtype=bool)
     node_mask = jnp.concatenate([robot_goal_mask, obstacle_mask, robot_goal_mask], axis=2)
     node_features = node_types
-    if getattr(hparams, "robot_state_dim", 0):
-        # Each historical robot node gets its own state; other entities get zeros.
-        features = robot_features(obs_history, hparams)
+    if getattr(hparams, "robot", None) is not None:
+        # Reuse MLP proprioception at each robot node; other entities get zeros.
+        features = robot_policy_features(obs_history, hparams)
         state_features = jnp.zeros(
             (batch_size, history_len, num_entities, features.shape[-1]), dtype=dtype
         ).at[:, :, 0, :].set(features)
@@ -306,7 +306,8 @@ def init_shared_gnn_actor(
             graph_latent_dim=hparams.graph_latent_dim,
             graph_layers=hparams.graph_layers,
             use_init_weights=use_init_weights,
-            node_feature_dim=3 + max(getattr(hparams, "robot_state_dim", 0) - 2, 0),
+            node_feature_dim=3 + (hparams.robot.policy_feature_dim
+                                  if getattr(hparams, "robot", None) is not None else 0),
         ),
         "fc1": init_linear(keys[1], hparams.graph_latent_dim, hidden_dim, sqrt2, use_init_weights),
         head_name: init_head(keys[2:4], hidden_dim, control_hidden_dim, act_dim, use_init_weights),
