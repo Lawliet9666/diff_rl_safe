@@ -66,6 +66,11 @@ class SingleIntegratorRobot(Robot):
         """Track world-frame planar velocity."""
         return jnp.eye(2, dtype=state.dtype)
 
+    def nominal_control(self, state, goal):
+        """Goal-directed world velocity, capped at the existing speed limit."""
+        delta = goal-state[:2]
+        return delta*jnp.minimum(1., self.v_max/jnp.maximum(jnp.linalg.norm(delta), 1e-9))
+
     def cbf_constraints(self, state, obstacles, dt):
         """First-order distance CBFs for the physical input [vx, vy]."""
         check_obstacle_shapes(obstacles)

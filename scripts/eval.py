@@ -193,17 +193,11 @@ def _run_controller_episode(config, *, setup=None):
         used_fallback = not bool(result.valid)
         if used_fallback:
             failures += 1
-            qp_status, qp_reason, failure = _controller_failure_diagnostics(state, nominal, obs, result)
+            _, _, failure = _controller_failure_diagnostics(state, nominal, obs, result)
             failure["step"] = k
-            if robot in {"humanoid", "double_integrator"} and qp_status == "infeasible":
-                infeasible_steps += 1
-                status, reason = qp_status, qp_reason
-                break  # A stale acceleration is not a safe fallback.
-            if qp_status != "infeasible" or use_slack:
-                status = "controller_failure" if use_slack else qp_status
-                reason = qp_reason
-                break
             infeasible_steps += 1
+            # Explicit simulation fallback for every robot and hard/slack QP.
+            # Holding an input is not a safety guarantee; retain checks and diagnostics.
             action = previous_action
         if k == 0 and not bool(result.initial_safe):
             status, reason = "invalid_initial_state", "initial h/psi safety conditions are not satisfied"

@@ -10,7 +10,7 @@ import numpy as np
 import osqp
 from scipy import sparse
 
-from env.robots import UnicycleRobot, HumanoidRobot
+from env.robots import SingleIntegratorRobot, HumanoidRobot
 from env.robots.base import check_obstacle_shapes
 
 
@@ -213,9 +213,23 @@ def _control_output_matrix(robot, state):
     return robot.control_output_matrix(state)
 
 
+@partial(jax.jit, static_argnames=("robot",))
+def _controller_constraints(robot, state, obstacles, dt):
+    constraints = robot.cbf_constraints(state, obstacles, dt)
+    if isinstance(robot, SingleIntegratorRobot):
+        # Match SF-PPO's 16-facet inner speed polygon; keep step() rescaling inactive.
+        angles = jnp.arange(16)*2*jnp.pi/16
+        normals = jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)
+        bound = robot.v_max*math.cos(math.pi/16)*(1.-1e-7)
+        constraints = constraints._replace(
+            A=jnp.concatenate([constraints.A, -normals]),
+            b=jnp.concatenate([constraints.b, jnp.full(16, bound)]))
+    return constraints
+
+
 def control_residual(robot, state, action, obstacles, dt):
     """Check CBF and input residuals for the applied action."""
-    constraints = robot.cbf_constraints(state, obstacles, dt)
+    constraints = _controller_constraints(robot, state, obstacles, dt)
     low, high = robot.input_bounds()
     return jnp.concatenate([constraints.A@action+constraints.b, action-low, high-action])
 
@@ -241,15 +255,20 @@ def _solve_controller_qp(robot, state, nominal, obstacles, dt, *, solver, slack_
     if isinstance(robot, HumanoidRobot) and not bool(robot.barrier_domain_valid(state, obstacles)):
         raise ValueError("parabolic CBF requires strict separation from inflated obstacles")
     low, high = robot.input_bounds()
-    constraints = robot.cbf_constraints(state, obstacles, dt)
+    constraints = _controller_constraints(robot, state, obstacles, dt)
     weights = jnp.asarray(robot.weights)
     options = dict(solver=solver,
                    output_matrix=_control_output_matrix(robot, state))
     if slack_weight == 0:
         result = solve_qp(nominal, constraints, low, high, weights, **options)
         return result, jnp.zeros_like(obstacles.mask)
-    return solve_slack_qp(nominal, constraints, low, high, weights,
-                          soft_mask=obstacles.mask, slack_weight=slack_weight, **options)
+    # Leading rows are obstacles; appended state/speed constraints stay hard.
+    soft_mask = jnp.pad(obstacles.mask, (0, constraints.A.shape[0]-obstacles.mask.size))
+    result, slack = solve_slack_qp(nominal, constraints, low, high, weights,
+                                 soft_mask=soft_mask, slack_weight=slack_weight, **options)
+    # An infeasibility certificate is not a slack solution for the held input.
+    applied_slack = slack[:obstacles.mask.size] if result.valid else jnp.zeros_like(obstacles.mask)
+    return result, applied_slack
 
 
 def solve_cbf_qp(robot, state, nominal, obstacles, dt, *, solver=SolverConfig()):
@@ -265,7 +284,7 @@ def warmup_controller(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None
     obstacles = select_obstacles(state[:2], obstacles, qp_obs_top_k)
     if isinstance(robot, HumanoidRobot) and not bool(robot.barrier_domain_valid(state, obstacles)):
         raise ValueError("parabolic CBF requires strict separation from inflated obstacles")
-    jax.block_until_ready((robot.cbf_constraints(state, obstacles, dt),
+    jax.block_until_ready((_controller_constraints(robot, state, obstacles, dt),
                            _control_output_matrix(robot, state)))
 
 
@@ -273,12 +292,10 @@ def generate_action(robot, state, nominal, obstacles, dt, *, solver=SolverConfig
                     slack_weight=0.0, qp_obs_top_k=None):
     """Non-differentiable CPU OSQP filter for a nominal physical input [control_dim].
 
-    slack_weight=0 is hard; obstacle slack is supported for unicycle only.
+    slack_weight=0 is hard; positive weights relax active obstacle rows only.
     Full-scene input and returned obstacle_mask retain scene ordering.
     Numerical errors raise; infeasibility returns qp.valid=False and a NaN action."""
     validate_slack_weight(slack_weight)
-    if slack_weight > 0 and not isinstance(robot, UnicycleRobot):
-        raise ValueError("positive slack_weight currently supports unicycle only")
     _validate_controller_inputs(robot, state, nominal, obstacles, dt)
     obstacles = select_obstacles(state[:2], obstacles, qp_obs_top_k)
     result, slack = _solve_controller_qp(robot, state, nominal, obstacles, dt,

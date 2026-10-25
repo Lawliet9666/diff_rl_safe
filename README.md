@@ -76,7 +76,7 @@ Use `WANDB_MODE=disabled` to disable W&B logging.
 ## Evaluation
 
 Use `controller.slack_weight=0` for hard CBF-QP, or a positive weight for obstacle
-slack (unicycle only). Re-evaluate a saved controller run:
+slack for all five robot models. Re-evaluate a saved controller run:
 
 ```bash
 RUN_DIR="outputs/controllers/<robot>_<scenario>_seed<seed>/<timestamp>"
