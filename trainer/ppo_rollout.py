@@ -5,7 +5,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from trainer.ppo_core import flat_time_batch
+from trainer.ppo_core import flat_time_batch, _trainable_params, _with_trainable
 
 
 def _topk_mask(values, qp_obs):
@@ -154,12 +154,69 @@ def _update_ppo_episode_returns(running_returns, reward, done_bool):
     return next_returns.astype(jnp.float32), logged_returns.astype(jnp.float32)
 
 
+def _collect_reward_windows(body, initial, params, value_fn, loss_fn, horizon, steps):
+    """Differentiate each window once, detaching its start and sharing its transitions."""
+    def window(carry, length):
+        carry = jax.tree_util.tree_map(jax.lax.stop_gradient, carry)
+
+        def loss(trainable):
+            policy_params = _with_trainable(params, trainable)
+            final, transitions = jax.lax.scan(
+                lambda state, _: body(policy_params, state, None), carry, None, length=length)
+            weighted, raw = loss_fn(transitions, value_fn(final[1]))
+            return weighted, (raw, final, transitions)
+
+        (weighted, (raw, final, transitions)), grads = jax.value_and_grad(
+            loss, has_aux=True)(_trainable_params(params))
+        return final, transitions, grads, weighted, raw
+
+    first_length = min(horizon, steps)
+    carry, first, grads, weighted, raw = window(initial, first_length)
+    pieces = [first]
+    remaining = steps - first_length
+    full_windows, tail = divmod(remaining, horizon)
+
+    def accumulate(carry, _):
+        state, total_grads, total_weighted, total_raw = carry
+        state, transitions, grad, loss, raw_loss = window(state, horizon)
+        total_grads = jax.tree_util.tree_map(jnp.add, total_grads, grad)
+        return (state, total_grads, total_weighted + loss, total_raw + raw_loss), transitions
+
+    if full_windows:
+        (carry, grads, weighted, raw), rest = jax.lax.scan(
+            accumulate, (carry, grads, weighted, raw), None, length=full_windows)
+        pieces.append(jax.tree_util.tree_map(
+            lambda value: value.reshape((-1,) + value.shape[2:]), rest))
+    if tail:
+        carry, last, grad, loss, raw_loss = window(carry, tail)
+        grads = jax.tree_util.tree_map(jnp.add, grads, grad)
+        weighted, raw = weighted + loss, raw + raw_loss
+        pieces.append(last)
+    count = 1 + full_windows + bool(tail)
+    transitions = jax.tree_util.tree_map(lambda *values: jnp.concatenate(values), *pieces)
+    metrics = {
+        "reward_gradients": jax.tree_util.tree_map(lambda grad: jax.lax.stop_gradient(grad / count), grads),
+        "reward_loss/raw": raw / count,
+        "reward_loss/weighted": weighted / count,
+        "reward_loss/return": -raw / count,
+        "reward_loss/windows": jnp.asarray(count, jnp.float32),
+        "reward_loss/shared_steps": jnp.asarray(steps * initial[1].shape[0], jnp.float32),
+        "reward_loss/simulated_steps": jnp.asarray(0., jnp.float32),
+    }
+    return carry, transitions, metrics
+
+
 def make_rollout_collector(model_module, *, step_fn, reset_fn,
-                           observe_fn, timeout_aware=False, safety_filter=None):
+                           observe_fn, timeout_aware=False, safety_filter=None,
+                           reward_loss_fn=None, reward_horizon=8):
     """Infer policy-QP support once when creating the collector, before JIT tracing."""
     has_policy_qp = hasattr(model_module, "build_qp_context")
     if safety_filter is not None and has_policy_qp:
         raise ValueError("external safety filter cannot wrap a policy with an internal QP")
+
+    if reward_loss_fn is not None and (reward_horizon <= 0 or safety_filter is not None):
+        raise ValueError("shared reward loss needs a positive horizon and no external filter")
+    need_timeout_values = timeout_aware or reward_loss_fn is not None
 
     def collect(
         params,
@@ -169,12 +226,16 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
         rng,
         steps_per_env,
         global_step=0,
+        value_params=None,
     ):
+        value_params = params if value_params is None else value_params
+        if reward_loss_fn is not None:
+            value_params = jax.tree_util.tree_map(jax.lax.stop_gradient, value_params)
         nav_state, obs_history, ppo_episode_returns = env_state
         batch_size = int(obs_history.shape[0])
         act_dim = int(hparams.act_dim)
 
-        def body(carry, _unused):
+        def body(policy_params, carry, _unused):
             state, history, running_ppo_returns, key = carry
             key, noise_key, env_key, reset_key = jax.random.split(key, 4)
             policy_obs = history.reshape((batch_size, -1))
@@ -184,7 +245,7 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
                 qp_context = model_module.build_qp_context(policy_obs, hparams, **context_kwargs)
                 env_action, logp, _entropy, value, policy_action, qp_diagnostics = (
                     model_module.get_action_and_value(
-                        params,
+                        policy_params,
                         hparams,
                         policy_obs,
                         noise=noise,
@@ -195,7 +256,7 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
                 )
             else:
                 env_action, logp, _entropy, value, policy_action = model_module.get_action_and_value(
-                    params,
+                    policy_params,
                     hparams,
                     policy_obs,
                     noise=noise,
@@ -216,10 +277,10 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
                 reward,
                 done_bool,
             )
-            if timeout_aware:
+            if need_timeout_values:
                 final_frame = observe_fn(env_cfg, next_state)
                 final_history = _update_gnn_obs_history(history, final_frame, jnp.zeros_like(done_bool))
-                final_value = model_module.critic_value(params, hparams, final_history.reshape(batch_size, -1))
+                final_value = model_module.critic_value(value_params, hparams, final_history.reshape(batch_size, -1))
             next_state = _maybe_reset_done_envs(env_cfg, next_state, reset_key, done_bool, batch_size, reset_fn)
             next_frame = observe_fn(env_cfg, next_state)
             next_history = _update_gnn_obs_history(history, next_frame, done_bool)
@@ -287,7 +348,7 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
                 transition['executed_act'] = executed_action
                 transition.update({name: value for name, value in filter_diagnostics.items()
                                    if name.startswith('filter/')})
-            if timeout_aware:
+            if need_timeout_values:
                 truncated = metrics.get("truncated", metrics["timeout"])
                 terminated = metrics.get("terminated", jnp.where(truncated > 0.5, 0.0, done))
                 transition.update(terminated=terminated, truncated=truncated, next_values=final_value)
@@ -295,14 +356,19 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
                 transition["control/physical_contact"] = metrics["physical_contact"]
             return (next_state, next_history, next_ppo_returns, key), transition
 
-        (next_state, next_history, next_ppo_returns, next_rng), transitions = jax.lax.scan(
-            body,
-            (nav_state, obs_history, ppo_episode_returns, rng),
-            None,
-            length=int(steps_per_env),
-        )
-        next_policy_obs = next_history.reshape((batch_size, -1))
-        next_value = model_module.critic_value(params, hparams, next_policy_obs)
+        def value_fn(history):
+            return model_module.critic_value(value_params, hparams, history.reshape((batch_size, -1)))
+
+        initial = (nav_state, obs_history, ppo_episode_returns, rng)
+        reward_metrics = {}
+        if reward_loss_fn is None:
+            final, transitions = jax.lax.scan(
+                lambda carry, _: body(params, carry, None), initial, None, length=int(steps_per_env))
+        else:
+            final, transitions, reward_metrics = _collect_reward_windows(
+                body, initial, params, value_fn, reward_loss_fn, int(reward_horizon), int(steps_per_env))
+        next_state, next_history, next_ppo_returns, next_rng = final
+        next_value = value_fn(next_history)
         beta_budget = (
             float(hparams.beta_max)
             if has_policy_qp and hasattr(hparams, "beta_max")
@@ -346,6 +412,7 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
         if timeout_aware:
             batch.update({key: transitions[key] for key in ("terminated", "truncated", "next_values")})
         batch.update({key: jnp.mean(value) for key, value in transitions.items() if key.startswith("control/")})
+        batch.update(reward_metrics)
         return batch, (next_state, next_history, next_ppo_returns), next_rng
 
     return collect

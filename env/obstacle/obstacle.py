@@ -3,6 +3,8 @@
 import jax
 import jax.numpy as jnp
 
+from utils import vector_norm
+
 
 def workspace_center_radii(cfg):
     center = 0.5 * (cfg.workspace_low + cfg.workspace_high)
@@ -202,7 +204,7 @@ def social_force_actions(cfg, state):
         robot_neighbor_mask = jnp.zeros_like(mask, dtype=bool)
 
     delta = pos[:, :, None, :] - all_pos[:, None, :, :]
-    dist = jnp.linalg.norm(delta, axis=-1)
+    dist = vector_norm(delta, axis=-1)
     valid_neighbor = mask[:, :, None] & all_mask[:, None, :]
     eye = jnp.eye(cfg.num_humans, dtype=bool)[None, :, :]
     valid_neighbor = valid_neighbor.at[:, :, : cfg.num_humans].set(valid_neighbor[:, :, : cfg.num_humans] & ~eye)

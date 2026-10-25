@@ -251,9 +251,11 @@ def brax_minibatch_update(
     normalize_advantage,
     get_action_and_value_fn,
     optax_tx=None,
+    reward_gradients=None,
+    reward_loss=0.0,
 ):
     def loss_for_update(trainable_params, full_params, loss_hparams, loss_batch, loss_clip, loss_ent_coef, loss_vf_coef, loss_value_clip):
-        return brax_ppo_loss(
+        loss, metrics = brax_ppo_loss(
             trainable_params,
             full_params,
             loss_hparams,
@@ -265,6 +267,7 @@ def brax_minibatch_update(
             normalize_advantage,
             get_action_and_value_fn,
         )
+        return loss, metrics
 
     trainable = _trainable_params(params)
     (objective, metrics), grads = jax.value_and_grad(loss_for_update, has_aux=True)(
@@ -277,6 +280,9 @@ def brax_minibatch_update(
         vf_coef,
         value_clip,
     )
+    if reward_gradients is not None:
+        grads = jax.tree_util.tree_map(jnp.add, grads, reward_gradients)
+        objective = objective + reward_loss
     new_trainable, new_trainable_state, combined_grad_norm = optax_optimizer_step(
         trainable,
         grads,
@@ -338,13 +344,14 @@ def make_ppo_update_fn(
         active_count = jnp.maximum(jnp.sum(flat_active.astype(jnp.float32)), jnp.asarray(1.0, dtype=jnp.float32))
         summary = {}
         for key, value in metrics.items():
-            summary[key] = jnp.sum(jnp.where(active, value, jnp.asarray(0.0, dtype=value.dtype))) / active_count
+            total = jnp.sum(jnp.where(active, value, jnp.asarray(0.0, dtype=value.dtype)))
+            summary[key] = total if key == "reward_loss/applied" else total / active_count
         summary["kl_early_stop"] = jnp.any(kl_stop)
         summary["epochs_completed"] = jnp.sum(jnp.any(active, axis=1).astype(jnp.float32))
         summary["target_kl"] = jnp.asarray(target_kl, dtype=jnp.float32)
         return summary
 
-    def update(params, opt_state, batch, rng, lr, clip, ent_coef, max_grad_norm, vf_coef, value_clip):
+    def update(params, opt_state, batch, rng, lr, clip, ent_coef, max_grad_norm, vf_coef, value_clip, reward_gradients=None, reward_loss=0.0):
         batch_size = batch["obs"].shape[0]
         if batch_size % num_minibatches != 0:
             raise ValueError("PPO batch size must divide by num_minibatches")
@@ -352,32 +359,31 @@ def make_ppo_update_fn(
         use_kl_stop = jnp.asarray(use_target_kl_early_stop, dtype=jnp.bool_)
 
         def minibatch_step(carry, minibatch):
-            mb_params, mb_opt_state = carry
-            mb_params, mb_opt_state, metrics = brax_minibatch_update(
-                mb_params,
-                mb_opt_state,
-                hparams,
-                minibatch,
-                lr=lr,
-                clip=clip,
-                ent_coef=ent_coef,
-                max_grad_norm=max_grad_norm,
-                vf_coef=vf_coef,
-                value_clip=value_clip,
-                normalize_advantage=normalize_advantage,
-                get_action_and_value_fn=get_action_and_value_fn,
-                optax_tx=brax_optax_tx,
-            )
-            return (mb_params, mb_opt_state), metrics
+            mb_params, mb_opt_state, pending = carry
+            def update_minibatch(extra_grads=None):
+                return brax_minibatch_update(
+                    mb_params, mb_opt_state, hparams, minibatch,
+                    lr=lr, clip=clip, ent_coef=ent_coef, max_grad_norm=max_grad_norm,
+                    vf_coef=vf_coef, value_clip=value_clip, normalize_advantage=normalize_advantage,
+                    get_action_and_value_fn=get_action_and_value_fn, optax_tx=brax_optax_tx,
+                    reward_gradients=extra_grads, reward_loss=reward_loss)
+
+            if reward_gradients is None:
+                mb_params, mb_opt_state, metrics = update_minibatch()
+            else:
+                mb_params, mb_opt_state, metrics = jax.lax.cond(
+                    pending, lambda: update_minibatch(reward_gradients), lambda: update_minibatch())
+                metrics["reward_loss/applied"] = pending.astype(jnp.float32)
+            return (mb_params, mb_opt_state, jnp.asarray(False)), metrics
 
         def run_epoch(carry):
-            epoch_params, epoch_opt_state, epoch_rng, stopped = carry
+            epoch_params, epoch_opt_state, epoch_rng, stopped, pending = carry
             epoch_rng, perm_key = jax.random.split(epoch_rng)
             permutation = jax.random.permutation(perm_key, batch_size)
             minibatches = jax.tree_util.tree_map(lambda x: _reshape_minibatches(x, permutation), batch)
-            (epoch_params, epoch_opt_state), metrics = jax.lax.scan(
+            (epoch_params, epoch_opt_state, pending), metrics = jax.lax.scan(
                 minibatch_step,
-                (epoch_params, epoch_opt_state),
+                (epoch_params, epoch_opt_state, pending),
                 minibatches,
                 length=num_minibatches,
             )
@@ -385,7 +391,7 @@ def make_ppo_update_fn(
             kl_stop = use_kl_stop & jnp.isfinite(epoch_kl) & (epoch_kl > target_kl_value)
             metrics["epoch_active"] = jnp.ones((num_minibatches,), dtype=jnp.bool_)
             metrics["kl_stop_epoch"] = jnp.full((num_minibatches,), kl_stop, dtype=jnp.bool_)
-            return (epoch_params, epoch_opt_state, epoch_rng, stopped | kl_stop), metrics
+            return (epoch_params, epoch_opt_state, epoch_rng, stopped | kl_stop, pending), metrics
 
         def skip_epoch(carry):
             # Infer metric shapes without an optimizer update.
@@ -399,9 +405,10 @@ def make_ppo_update_fn(
             stopped = carry[3]
             return jax.lax.cond(stopped, skip_epoch, run_epoch, carry)
 
-        (params, opt_state, rng, _stopped), metrics = jax.lax.scan(
+        (params, opt_state, rng, _stopped, _pending), metrics = jax.lax.scan(
             epoch_step,
-            (params, opt_state, rng, jnp.asarray(False, dtype=jnp.bool_)),
+            (params, opt_state, rng, jnp.asarray(False, dtype=jnp.bool_),
+             jnp.asarray(reward_gradients is not None)),
             xs=None,
             length=num_epochs,
         )

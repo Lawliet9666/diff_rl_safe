@@ -1,4 +1,4 @@
-"""Device configuration and checkpoint utilities."""
+"""Numerical, device and checkpoint utilities."""
 
 from __future__ import annotations
 
@@ -196,3 +196,24 @@ def load_jax_checkpoint(path):
     if "params" not in payload or "step" not in payload:
         raise ValueError(f"invalid JAX checkpoint payload in {path}")
     return payload
+
+
+def vector_norm(vectors, axis=-1, keepdims=False):
+    """Original Euclidean norm with a zero subgradient at coincident points."""
+    import jax
+    import jax.numpy as jnp
+
+    @jax.custom_jvp
+    def norm(value):
+        return jnp.linalg.norm(value, axis=axis, keepdims=keepdims)
+
+    @norm.defjvp
+    def norm_jvp(primals, tangents):
+        value, = primals
+        tangent, = tangents
+        length = norm(value)
+        denominator = jnp.where(length == 0, 1.0, length)
+        derivative = jnp.sum(value * tangent, axis=axis, keepdims=keepdims) / denominator
+        return length, derivative
+
+    return norm(vectors)

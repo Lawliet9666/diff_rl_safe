@@ -42,3 +42,8 @@ safety_filter:
   eps: 1.0e-12
   feasibility_tolerance: 1.0e-6  # Original physical constraints.
   kkt_tolerance: 1.0e-6  # Whitened QP stationarity/complementarity.
+
+# Differentiate the existing reward over windows of the shared PPO rollout.
+reward_loss:
+  weight: 0.0
+  horizon: 8

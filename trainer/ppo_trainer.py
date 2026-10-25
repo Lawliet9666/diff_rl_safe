@@ -33,6 +33,7 @@ from env import make_env
 from controller.safety_filter import make_safety_filter
 from trainer.evaluation import evaluate_env
 from trainer.ppo_rollout import make_rollout_collector
+from trainer.reward_loss import make_reward_loss
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -155,6 +156,7 @@ class PPOTrainer:
         if self.config.model.type in {"barriernet_gnn", "barriernet_mlp"}:
             self.robot_model_kwargs["control_dt"] = self.jax_env_cfg.dt
         self.safety_filter = make_safety_filter(self.config, self.jax_env_cfg)
+        reward_loss_fn = make_reward_loss(self.config)
         self.rollout_collector = make_rollout_collector(
             self.model_module,
             step_fn=self.env.step_fn,
@@ -162,6 +164,8 @@ class PPOTrainer:
             observe_fn=self.env.observe_fn,
             timeout_aware=self.timeout_bootstrap,
             safety_filter=self.safety_filter,
+            reward_loss_fn=reward_loss_fn,
+            reward_horizon=self.config.trainer.reward_loss.horizon,
         )
 
     def setup_model_and_optimizer(self):
@@ -222,6 +226,7 @@ class PPOTrainer:
             raise ValueError("trainer.finite_check_interval must be > 0")
 
     def _make_jitted_train_step(self):
+        self.reward_simulated_steps = 0
         ppo_update_fn = make_ppo_update_fn(
             self.jax_hparams,
             normalize_advantage=bool(getattr(self.config.trainer, "normalize_advantages", True)),
@@ -292,7 +297,10 @@ class PPOTrainer:
                 max_grad_norm,
                 vf_coef,
                 value_clip,
+                reward_gradients=batch.get("reward_gradients"),
+                reward_loss=batch.get("reward_loss/weighted", 0.0),
             )
+            metrics.update({key: value for key, value in batch.items() if key.startswith("reward_loss/")})
             post_summary = PPOTrainer._post_update_summary(
                 metrics,
                 new_params,
@@ -500,7 +508,7 @@ class PPOTrainer:
             "opt_state_finite_after_update": PPOTrainer._finite_if_enabled(run_finite_check, opt_state),
         }
 
-    def _log_update(self, global_step, update, ppo_metrics, eval_metrics, train_metrics, sps):
+    def _log_update(self, global_step, update, ppo_metrics, eval_metrics, train_metrics, sps, *, elapsed_seconds=None):
         wandb_interval = int(self.config.wandb_interval)
         if wandb_interval <= 0:
             raise ValueError("wandb_interval must be > 0")
@@ -525,6 +533,14 @@ class PPOTrainer:
             "diagnostics/robot_omega_delta_max": train_metrics["robot_omega_delta_max"],
             "diagnostics/robot_omega_delta_penalty_mean": train_metrics["robot_omega_delta_penalty_mean"],
         }
+        log_dict.update({key: value for key, value in ppo_metrics.items()
+                         if key.startswith("reward_loss/")})
+        if "reward_loss/simulated_steps" in ppo_metrics:
+            self.reward_simulated_steps += int(ppo_metrics["reward_loss/simulated_steps"])
+            log_dict["reward_loss/total_simulated_steps"] = self.reward_simulated_steps
+        log_dict["charts/training_simulation_steps"] = global_step + self.reward_simulated_steps
+        if elapsed_seconds is not None:
+            log_dict["charts/wall_time"] = float(elapsed_seconds)
         if "qp_slack_mean" in train_metrics:
             log_dict.update({
                 "diagnostics/qp_slack_mean": train_metrics["qp_slack_mean"],
@@ -712,9 +728,11 @@ class PPOTrainer:
                 else:
                     eval_metrics = None
 
-                sps = int(global_step / max(time.time() - start_time, 1e-6))
+                elapsed_seconds = time.time() - start_time
+                sps = int(global_step / max(elapsed_seconds, 1e-6))
                 self.current_lr = lr_used
-                self._log_update(global_step, update, metric_values, eval_metrics, train_metrics, sps)
+                self._log_update(global_step, update, metric_values, eval_metrics, train_metrics, sps,
+                                 elapsed_seconds=elapsed_seconds)
                 self._update_adaptive_kl_lr(approx_kl)
                 eval_return = eval_metrics["mean_return"] if eval_metrics is not None else float("nan")
                 eval_success = eval_metrics["success_rate"] if eval_metrics is not None else float("nan")

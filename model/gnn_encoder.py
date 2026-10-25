@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from model.observation import _world_to_body, robot_policy_features
+from utils import vector_norm
 
 import math
 
@@ -246,7 +247,7 @@ def _build_spatio_temporal_graph_tensors(hparams, obs_history):
     rel_vel = sender_vel - receiver_vel
     receiver_radius = radii_flat[:, receiver_idx, :]
     sender_radius = radii_flat[:, sender_idx, :]
-    clearance = jnp.linalg.norm(rel_pos, axis=-1, keepdims=True) - receiver_radius - sender_radius
+    clearance = vector_norm(rel_pos, axis=-1, keepdims=True) - receiver_radius - sender_radius
     clearance = jnp.maximum(clearance, 0.0)
     edge_type = jnp.broadcast_to(edge_type_values[None, :, None].astype(dtype), (batch_size, edge_type_values.shape[0], 1))
 
