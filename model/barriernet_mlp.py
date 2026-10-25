@@ -68,12 +68,8 @@ class BarrierNetMLPHParams:
     control_dt: float = 0.1
 
     @property
-    def robot_feature_dim(self):
-        return self.history_len * max(self.robot_state_dim-2, 0)
-
-    @property
     def encoder_input_dim(self):
-        processed_frame_dim = 5 + 6 * int(self.num_humans) + max(self.robot_state_dim-2, 0)
+        processed_frame_dim = 3 + self.robot.policy_feature_dim + 6 * int(self.num_humans)
         return int(self.history_len) * processed_frame_dim
 
 
@@ -101,8 +97,8 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2, *, robot=None, control
         raise ValueError("Humanoid RL requires the distance HOCBF")
     if extended and float(actor_cfg.qp_slack_weight) <= 0:
         raise ValueError("High-order BarrierNet requires a positive obstacle slack weight")
-    if extended and (robot is None or int(act_dim) != robot.control_dim):
-        raise ValueError("High-order BarrierNet requires its configured Robot and matching action dimension")
+    if robot is None or int(act_dim) != robot.control_dim:
+        raise ValueError("BarrierNet-MLP requires its configured Robot and matching action dimension")
     if not extended and int(act_dim) != 2:
         raise ValueError("Planar velocity-controlled BarrierNet requires act_dim=2")
     robot_state_dim = robot.state_dim if extended else 0
@@ -152,7 +148,7 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2, *, robot=None, control
     return BarrierNetMLPHParams(
         act_dim=int(act_dim),
         robot_type=robot_type,
-        robot=robot if extended else None,
+        robot=robot,
         robot_state_dim=robot_state_dim,
         control_dt=float(control_dt),
         cbf_order=(3 if robot_type == "quadrotor" else 2) if extended else 1,

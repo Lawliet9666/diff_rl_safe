@@ -22,6 +22,7 @@ class DoubleIntegratorRobot(Robot):
     weights: tuple
     state_dim: ClassVar[int] = 4
     control_dim: ClassVar[int] = 2
+    policy_feature_dim: ClassVar[int] = 2
 
     @classmethod
     def from_config(cls, config):
@@ -65,6 +66,10 @@ class DoubleIntegratorRobot(Robot):
     def initial_state(self, pose):
         pose = jnp.asarray(pose, dtype=float)
         return jnp.concatenate([pose[:2], jnp.zeros_like(pose[:2])])
+
+    def policy_features(self, state, velocity, *, position_scale, velocity_scale):
+        """World-frame velocity; this model has no heading."""
+        return state[2:4] / velocity_scale
 
     def input_bounds(self):
         limits = jnp.full(2, self.a_max)

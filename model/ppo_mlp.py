@@ -38,14 +38,16 @@ class PPOMLPHParams:
     encoder_layers: int
     position_scale: float
     velocity_scale: float
+    robot: object
+    robot_state_dim: int
 
     @property
     def encoder_input_dim(self):
-        processed_frame_dim = 5 + 6 * int(self.num_humans)
+        processed_frame_dim = 3 + self.robot.policy_feature_dim + 6 * int(self.num_humans)
         return int(self.history_len) * processed_frame_dim
 
 
-def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
+def hparams_from_config(model_cfg, critic_cfg, act_dim=2, *, robot=None):
     actor_cfg = model_cfg.actor
     require_config_value(model_cfg, "type", "ppo_mlp", "model")
     require_config_value(actor_cfg, "coordinate_frame", "robot_body", "model.actor")
@@ -55,13 +57,18 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
     obs_dim = int(model_cfg.obs_dim)
     if history_len <= 0:
         raise ValueError("ppo_mlp requires history_len > 0")
-    if obs_frame_dim < 6 or (obs_frame_dim - 6) % 6 != 0:
-        raise ValueError("ppo_mlp requires obs_frame_dim = 6 + num_humans * 6")
+    robot_type = str(model_cfg.robot_type)
+    extended = robot_type in {"double_integrator", "humanoid", "quadrotor"}
+    if not extended:
+        normalize_robot_type(robot_type)
+    if robot is None or int(act_dim) != robot.control_dim:
+        raise ValueError("PPO-MLP requires its configured Robot and matching action dimension")
+    num_humans = int(model_cfg.num_humans)
+    robot_state_dim = robot.state_dim if extended else 0
+    if num_humans <= 0 or obs_frame_dim != 6 + 6*num_humans + robot_state_dim:
+        raise ValueError("Observation transport must contain navigation, explicit human slots, and full robot state")
     if obs_dim != history_len * obs_frame_dim:
         raise ValueError("ppo_mlp requires obs_dim = history_len * obs_frame_dim")
-    if int(act_dim) != 2:
-        raise ValueError("ppo_mlp requires act_dim=2")
-
     encoder_hidden_dim = int(cfg_get(actor_cfg, "encoder_hidden_dim", 64))
     encoder_latent_dim = int(cfg_get(actor_cfg, "encoder_latent_dim", 16))
     encoder_layers = int(cfg_get(actor_cfg, "encoder_layers", 3))
@@ -74,13 +81,15 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
 
     return PPOMLPHParams(
         act_dim=int(act_dim),
-        robot_type=normalize_robot_type(cfg_get(model_cfg, "robot_type", "unicycle")),
+        robot_type=robot_type,
+        robot=robot,
+        robot_state_dim=robot_state_dim,
         actor_act=str(cfg_get(actor_cfg, "act", "relu")),
         critic_act=str(cfg_get(critic_cfg, "act", "relu")),
         history_len=history_len,
         obs_frame_dim=obs_frame_dim,
         obs_dim=obs_dim,
-        num_humans=(obs_frame_dim - 6) // 6,
+        num_humans=num_humans,
         encoder_hidden_dim=encoder_hidden_dim,
         encoder_latent_dim=encoder_latent_dim,
         encoder_layers=encoder_layers,
@@ -97,9 +106,10 @@ def init_params_from_config(
     action_low,
     action_high,
     use_init_weights=True,
+    *, robot=None,
 ):
     actor_cfg = model_cfg.actor
-    hparams = hparams_from_config(model_cfg, critic_cfg, act_dim=act_dim)
+    hparams = hparams_from_config(model_cfg, critic_cfg, act_dim=act_dim, robot=robot)
     hidden_dim = int(cfg_get(actor_cfg, "hidden_dim", 256))
     control_hidden_dim = int(cfg_get(actor_cfg, "control_hidden_dim", hidden_dim))
     critic_hidden_dim = int(cfg_get(critic_cfg, "hidden_dim", 256))

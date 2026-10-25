@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+import jax
 import jax.numpy as jnp
-from model.observation import _world_to_body, robot_features
+from model.observation import _world_to_body
 from model.actor_critic import activation, dense, init_linear, mlp
 
 
@@ -44,10 +45,23 @@ def _preprocess_obs(obs, hparams):
         _world_to_body(frames[:, :, 0:2], robot_theta)
         / hparams.position_scale
     )
-    robot_vel = (
-        _world_to_body(frames[:, :, 2:4], robot_theta)
-        / hparams.velocity_scale
-    )
+    if getattr(hparams, "robot", None) is not None:
+        robot = hparams.robot
+        if hparams.robot_state_dim:
+            robot_states = frames[:, :, 6+6*hparams.num_humans:]
+        else:
+            # Legacy planar transport omits absolute x/y; proprioception does not use them.
+            robot_states = jnp.concatenate([jnp.zeros_like(frames[:, :, :2]),
+                                             frames[:, :, 4:5]], axis=-1)
+        robot_values = jax.vmap(lambda x, v: robot.policy_features(
+            x, v, position_scale=hparams.position_scale,
+            velocity_scale=hparams.velocity_scale))(
+                robot_states.reshape((-1, robot.state_dim)),
+                frames[:, :, 2:4].reshape((-1, 2)))
+        robot_values = robot_values.reshape((*frames.shape[:2], robot.policy_feature_dim))
+    else:
+        # DiffCVaR keeps its existing planar feature contract.
+        robot_values = _world_to_body(frames[:, :, 2:4], robot_theta) / hparams.velocity_scale
     robot_radius = frames[:, :, 5:6] / hparams.position_scale
 
     human_blocks = frames[:, :, 6:6+6*hparams.num_humans].reshape(
@@ -73,7 +87,7 @@ def _preprocess_obs(obs, hparams):
     processed_frames = jnp.concatenate(
         [
             goal_rel,
-            robot_vel,
+            robot_values,
             robot_radius,
             human_features.reshape(
                 (frames.shape[0], hparams.history_len, -1)
@@ -81,8 +95,6 @@ def _preprocess_obs(obs, hparams):
         ],
         axis=-1,
     )
-    if getattr(hparams, "robot_state_dim", 0):
-        processed_frames = jnp.concatenate([processed_frames, robot_features(frames, hparams)], axis=-1)
     return processed_frames.reshape((frames.shape[0], -1))
 
 

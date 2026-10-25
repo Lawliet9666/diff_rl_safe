@@ -41,11 +41,12 @@ def prepare_robot_policy(config):
     robot_type = str(config.robot.type)
     extended = robot_type in {"double_integrator", "humanoid", "quadrotor"}
     if extended:
-        if config.model.type not in {"barriernet_gnn", "barriernet_mlp"}:
-            raise ValueError("New RL robots require BarrierNet GNN or MLP")
+        if config.model.type not in {"barriernet_gnn", "barriernet_mlp", "ppo_mlp"}:
+            raise ValueError("New RL robots require BarrierNet GNN/MLP or PPO-MLP")
         if config.env.get("backend", "jax") != "jax":
             raise ValueError("New RL robots currently require the JAX environment")
-        if robot_type == "humanoid" and config.controller.humanoid.barrier != "distance":
+        if (robot_type == "humanoid" and config.model.type != "ppo_mlp"
+                and config.controller.humanoid.barrier != "distance"):
             raise ValueError("Humanoid RL currently requires the distance HOCBF")
     robot = make_robot(config)
     with open_dict(config):

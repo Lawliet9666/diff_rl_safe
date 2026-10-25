@@ -447,8 +447,10 @@ class Evaluator:
         robot = prepare_robot_policy(self.config)
         env = make_env(self.config)
         env_cfg = env.config_from_omegaconf(self.config, robot=robot)
-        robot_kwargs = (dict(robot=robot, control_dt=env_cfg.dt)
-                        if self.config.model.type in {"barriernet_gnn", "barriernet_mlp"} else {})
+        robot_kwargs = (dict(robot=robot) if self.config.model.type in
+                        {"barriernet_gnn", "barriernet_mlp", "ppo_mlp"} else {})
+        if self.config.model.type in {"barriernet_gnn", "barriernet_mlp"}:
+            robot_kwargs["control_dt"] = env_cfg.dt
         hparams = module.hparams_from_config(self.config.model, self.config.model.critic,
                                              act_dim=robot.control_dim, **robot_kwargs)
         video_dir = self.save_dir/f"visualize_{checkpoint.stem}" if self.visualize else None

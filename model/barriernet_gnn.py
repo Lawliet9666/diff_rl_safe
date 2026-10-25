@@ -73,10 +73,6 @@ class BarrierNetGNNHParams:
     cbf_order: int = 1
     control_dt: float = 0.1
 
-    @property
-    def robot_feature_dim(self):
-        return self.history_len * max(self.robot_state_dim-2, 0)
-
 
 def hparams_from_config(model_cfg, critic_cfg, act_dim=2, *, robot=None, control_dt=0.1):
     actor_cfg = model_cfg.actor
@@ -207,7 +203,7 @@ def init_params_from_config(
     )
     actor["human_fc1"] = init_linear(
         keys[4],
-        hparams.graph_latent_dim + hparams.robot_feature_dim,
+        hparams.graph_latent_dim,
         scalar_hidden_dim,
         sqrt2,
         use_init_weights,

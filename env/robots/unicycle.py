@@ -16,6 +16,7 @@ class UnicycleRobot(Robot):
     omega_max: float
     state_dim: ClassVar[int] = 3
     control_dim: ClassVar[int] = 2
+    policy_feature_dim: ClassVar[int] = 2
 
     radius: float
     margin: float
@@ -70,6 +71,13 @@ class UnicycleRobot(Robot):
 
     def initial_state(self, pose):
         return jnp.asarray(pose, dtype=jnp.float32)
+
+    def policy_features(self, state, velocity, *, position_scale, velocity_scale):
+        """Measured planar velocity in the robot's yaw-aligned frame."""
+        c, s = jnp.cos(state[2]), jnp.sin(state[2])
+        body_velocity = jnp.stack([c*velocity[0]+s*velocity[1],
+                                   -s*velocity[0]+c*velocity[1]])
+        return body_velocity / velocity_scale
 
     def input_bounds(self):
         limits = jnp.array([self.v_max, self.omega_max])

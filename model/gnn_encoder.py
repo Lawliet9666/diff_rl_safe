@@ -143,6 +143,8 @@ def init_spatio_temporal_encoder(
     graph_latent_dim=16,
     graph_layers=3,
     use_init_weights=True,
+    *,
+    node_feature_dim=3,
 ):
     obs_frame_dim = int(obs_frame_dim)
     if obs_frame_dim < 6 or (obs_frame_dim - 6) % 6 != 0:
@@ -152,7 +154,9 @@ def init_spatio_temporal_encoder(
         raise ValueError("graph_layers must be > 0")
     keys = jax.random.split(key, graph_layers)
     layers = []
-    node_dim = 3
+    node_dim = int(node_feature_dim)
+    if node_dim < 3:
+        raise ValueError("node_feature_dim must include the three node-type features")
     for layer_key in keys:
         layers.append(
             init_reference_attention_layer(
@@ -217,7 +221,15 @@ def _build_spatio_temporal_graph_tensors(hparams, obs_history):
 
     robot_goal_mask = jnp.ones((batch_size, history_len, 1), dtype=bool)
     node_mask = jnp.concatenate([robot_goal_mask, obstacle_mask, robot_goal_mask], axis=2)
-    nodes = node_types.reshape((batch_size, total_nodes, 3))
+    node_features = node_types
+    if getattr(hparams, "robot_state_dim", 0):
+        # Each historical robot node gets its own state; other entities get zeros.
+        features = robot_features(obs_history, hparams)
+        state_features = jnp.zeros(
+            (batch_size, history_len, num_entities, features.shape[-1]), dtype=dtype
+        ).at[:, :, 0, :].set(features)
+        node_features = jnp.concatenate([node_types, state_features], axis=-1)
+    nodes = node_features.reshape((batch_size, total_nodes, node_features.shape[-1]))
     node_mask_flat = node_mask.reshape((batch_size, total_nodes))
     nodes = nodes * node_mask_flat[..., None].astype(dtype)
 
@@ -265,13 +277,6 @@ def spatio_temporal_graph_encode(params, hparams, obs_history, return_human_late
     nodes, edges, node_mask, receiver_idx, sender_idx = _build_spatio_temporal_graph_tensors(hparams, obs_history)
     for layer in params["layers"]:
         nodes = reference_attention_layer_sparse(layer, nodes, edges, node_mask, receiver_idx, sender_idx, act_name="relu")
-    if getattr(hparams, "robot_state_dim", 0):
-        robot_latent, human_latents = _current_outputs(nodes, hparams, True)
-        features = robot_features(obs_history, hparams).reshape((nodes.shape[0], -1))
-        robot_latent = jnp.concatenate([robot_latent, features], axis=-1)
-        human_features = jnp.broadcast_to(features[:, None, :], (*human_latents.shape[:2], features.shape[-1]))
-        human_latents = jnp.concatenate([human_latents, human_features], axis=-1)
-        return (robot_latent, human_latents) if return_human_latents else robot_latent
     return _current_outputs(nodes, hparams, return_human_latents)
 
 
@@ -301,8 +306,9 @@ def init_shared_gnn_actor(
             graph_latent_dim=hparams.graph_latent_dim,
             graph_layers=hparams.graph_layers,
             use_init_weights=use_init_weights,
+            node_feature_dim=3 + max(getattr(hparams, "robot_state_dim", 0) - 2, 0),
         ),
-        "fc1": init_linear(keys[1], hparams.graph_latent_dim + getattr(hparams, "robot_feature_dim", 0), hidden_dim, sqrt2, use_init_weights),
+        "fc1": init_linear(keys[1], hparams.graph_latent_dim, hidden_dim, sqrt2, use_init_weights),
         head_name: init_head(keys[2:4], hidden_dim, control_hidden_dim, act_dim, use_init_weights),
     }
 
@@ -310,7 +316,7 @@ def init_shared_gnn_actor(
 def init_shared_gnn_critic(keys, hparams, hidden_dim, hidden_dim2, use_init_weights):
     sqrt2 = math.sqrt(2.0)
     return {
-        "fc1": init_linear(keys[0], hparams.graph_latent_dim + getattr(hparams, "robot_feature_dim", 0), hidden_dim, sqrt2, use_init_weights),
+        "fc1": init_linear(keys[0], hparams.graph_latent_dim, hidden_dim, sqrt2, use_init_weights),
         "fc21": init_linear(keys[1], hidden_dim, hidden_dim2, sqrt2, use_init_weights),
         "fc31": init_linear(keys[2], hidden_dim2, 1, 1.0, use_init_weights),
     }

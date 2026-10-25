@@ -54,6 +54,7 @@ class HumanoidRobot(Robot):
     omega_max: float
     state_dim: ClassVar[int] = 5
     control_dim: ClassVar[int] = 3
+    policy_feature_dim: ClassVar[int] = 2
 
     radius: float
     margin: float
@@ -145,6 +146,10 @@ class HumanoidRobot(Robot):
     def check_state_limits(self, state, tolerance=1e-6):
         return (jnp.all(jnp.isfinite(state))
                 & jnp.all(self.velocity_margin(state) >= -tolerance))
+
+    def policy_features(self, state, velocity, *, position_scale, velocity_scale):
+        """Body-frame forward/lateral velocities, without a duplicate world velocity."""
+        return state[3:5] / velocity_scale
 
     def input_bounds(self):
         limits = jnp.array([self.af_max, self.al_max, self.omega_max])

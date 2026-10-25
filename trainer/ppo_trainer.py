@@ -147,8 +147,10 @@ class PPOTrainer:
         expected_frame_dim = 6 + int(self.config.env.humans.num_humans)*6 + extra
         if self.obs_frame_dim != expected_frame_dim or self.obs_dim != self.history_len*self.obs_frame_dim:
             raise ValueError("Policy observation dimensions do not match the configured environment and Robot")
-        self.robot_model_kwargs = (dict(robot=robot, control_dt=self.jax_env_cfg.dt)
-                                   if self.config.model.type in {"barriernet_gnn", "barriernet_mlp"} else {})
+        self.robot_model_kwargs = (dict(robot=robot) if self.config.model.type in
+                                   {"barriernet_gnn", "barriernet_mlp", "ppo_mlp"} else {})
+        if self.config.model.type in {"barriernet_gnn", "barriernet_mlp"}:
+            self.robot_model_kwargs["control_dt"] = self.jax_env_cfg.dt
         self.rollout_collector = make_rollout_collector(
             self.model_module,
             use_qp=hasattr(self.model_module, "build_qp_context"),

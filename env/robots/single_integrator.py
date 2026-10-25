@@ -12,6 +12,7 @@ class SingleIntegratorRobot(Robot):
     v_max: float
     state_dim: ClassVar[int] = 3
     control_dim: ClassVar[int] = 2
+    policy_feature_dim: ClassVar[int] = 2
 
     @classmethod
     def from_config(cls, config):
@@ -32,6 +33,10 @@ class SingleIntegratorRobot(Robot):
 
     def initial_state(self, pose):
         return jnp.asarray(pose, dtype=jnp.float32)
+
+    def policy_features(self, state, velocity, *, position_scale, velocity_scale):
+        """Measured planar velocity in the model's world-aligned frame."""
+        return velocity / velocity_scale
 
     def input_bounds(self):
         # step() also enforces the Euclidean speed limit.

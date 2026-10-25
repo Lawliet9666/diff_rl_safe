@@ -38,6 +38,7 @@ class QuadrotorRobot(Robot):
     thrust_rate_max: float
     state_dim: ClassVar[int] = 16
     control_dim: ClassVar[int] = 4
+    policy_feature_dim: ClassVar[int] = 14
 
     radius: float
     margin: float
@@ -138,6 +139,17 @@ class QuadrotorRobot(Robot):
                             state[14]-math.cos(self.tilt_max),
                             state[15]-self.thrust_min, self.thrust_max-state[15]])
         return jnp.all(jnp.isfinite(state)) & jnp.all(limits >= -tolerance)
+
+    def policy_features(self, state, velocity, *, position_scale, velocity_scale):
+        """[height, yaw-frame velocity(3), tilt rotation(9), thrust/hover thrust]."""
+        p, v, R, T = unpack(state)
+        yaw = self.planar_pose(state)[2]
+        c, s = jnp.cos(yaw), jnp.sin(yaw)
+        world_to_yaw = jnp.array([[c, s, 0.], [-s, c, 0.], [0., 0., 1.]], dtype=state.dtype)
+        return jnp.concatenate([p[2:3] / position_scale,
+                                (world_to_yaw @ v) / velocity_scale,
+                                (world_to_yaw @ R).reshape(-1),
+                                jnp.atleast_1d(T / (self.mass*self.gravity))])
 
     def input_bounds(self):
         limits = jnp.array([self.omega_max]*3+[self.thrust_rate_max])

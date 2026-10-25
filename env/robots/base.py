@@ -108,6 +108,7 @@ def _control_parameters(section, names, label, *, selected_cbf=None):
 class Robot(ABC):
     state_dim: int
     control_dim: int
+    policy_feature_dim: int
 
     @abstractmethod
     def dynamics(self, state, action):
@@ -136,6 +137,15 @@ class Robot(ABC):
     @abstractmethod
     def planar_pose(self, state):
         """Return [x, y, yaw] for crowd navigation and rendering."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def policy_features(self, state, velocity, *, position_scale, velocity_scale):
+        """Normalized proprioception, excluding absolute x/y and navigation geometry.
+
+        ``velocity`` is the measured world-frame planar velocity for models whose
+        state does not store it. Heading is used as a frame, not repeated as a feature.
+        """
         raise NotImplementedError
 
     def cbf_constraints(self, state, obstacles, dt):
