@@ -29,13 +29,11 @@ def make_controller(config):
         raise ValueError("controller.qp_obs_top_k must be null or a positive integer")
     weight = config.controller.slack_weight
     validate_slack_weight(weight)
-    if weight > 0 and config.robot.type != "unicycle":
-        raise ValueError("positive slack_weight currently supports unicycle only")
     dt = float(config.env.dt)
     if not math.isfinite(dt) or dt <= 0:
         raise ValueError("env.dt must be positive")
-    if config.robot.type not in {"unicycle", "double_integrator", "quadrotor", "humanoid"}:
-        raise ValueError("controller robot must be unicycle, double_integrator, quadrotor or humanoid")
+    if config.robot.type not in {"single_integrator", "unicycle", "double_integrator", "quadrotor", "humanoid"}:
+        raise ValueError("controller robot must be single_integrator, unicycle, double_integrator, quadrotor or humanoid")
     robot = make_robot(config)
     values = _required_section(config.controller.solver,
                                [field.name for field in fields(SolverConfig)], "controller.solver")

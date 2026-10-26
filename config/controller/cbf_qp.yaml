@@ -1,5 +1,5 @@
 type: cbf_qp
-slack_weight: 0.0  # 0: hard; >0: obstacle slack (unicycle only).
+slack_weight: 0.0  # 0: hard; >0: obstacle slack for every robot; physical limits stay hard.
 qp_obs_top_k: null  # null: all; k>0: nearest k obstacles.
 
 solver:

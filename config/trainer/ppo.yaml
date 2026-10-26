@@ -40,3 +40,8 @@ safety_filter:
   speed_facets: 16  # Single-integrator speed disk inner approximation only.
   max_iter: 40
   eps: 1.0e-12
+
+# Differentiate the existing reward over windows of the shared PPO rollout.
+reward_loss:
+  weight: 0.0
+  horizon: 8
