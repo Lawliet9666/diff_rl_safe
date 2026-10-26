@@ -77,5 +77,8 @@ export PYTHONUNBUFFERED=1
 export TMPDIR="/scratch/users/xinyiwang/tmp/${SLURM_JOB_ID}"
 mkdir -p "$TMPDIR"
 
-bash scripts/run_gpu.sh all all
+# CBF evaluation results already exist; run the remaining RL experiments.
+for method in ppo ppo_filter barriernet barriernet_sim; do
+    bash scripts/run_gpu.sh "$method" all
+done
 SLURM
