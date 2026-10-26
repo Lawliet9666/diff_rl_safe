@@ -31,6 +31,9 @@ CHECK_PYTHON
 # First launch prompts for your W&B API key; later launches reuse the login.
 wandb login
 
+# Slurm opens the log before the batch script starts.
+mkdir -p outputs/log
+
 sbatch <<'SLURM'
 #!/bin/bash -l
 #SBATCH --job-name=diffrl-all
@@ -44,7 +47,7 @@ sbatch <<'SLURM'
 #SBATCH --gres=gpu:6000:1
 #SBATCH --time=3-00:00:00
 #SBATCH --chdir=/projects/scale-lab/xinyiwang/CODE/diff_rl_safe
-#SBATCH --output=/projects/scale-lab/xinyiwang/CODE/diff_rl_safe/slurm-%j.out
+#SBATCH --output=/projects/scale-lab/xinyiwang/CODE/diff_rl_safe/outputs/log/slurm-%j.out
 
 set -eo pipefail
 module load miniconda3/current
@@ -69,7 +72,7 @@ print(f"Python: {sys.executable}; JAX: {jax.__version__}", flush=True)
 CHECK_PYTHON
 
 export WANDB_MODE=online
-export WANDB_ENTITY=xinywa
+export WANDB_ENTITY=xinywa_umich
 export WANDB_PROJECT=diff_rl_safe
 export RUN_NAME="matilda_${SLURM_JOB_ID}"
 export CPU_THREADS="$SLURM_CPUS_PER_TASK"
