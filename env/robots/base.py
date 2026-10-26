@@ -165,6 +165,14 @@ class Robot(ABC):
         raise NotImplementedError(
             f"CBF constraints are not implemented for {type(self).__name__}")
 
+    def control_constraints(self, state, obstacles, dt):
+        """Complete non-box QP constraints, with obstacle rows first."""
+        return self.cbf_constraints(state, obstacles, dt)
+
+    def validate_cbf_domain(self, state, obstacles):
+        """Reject undefined barrier formulas; no additional restriction by default."""
+        return None
+
     def reward_motion(self, state, action):
         """Return actual [forward speed, yaw rate] for navigation rewards."""
         raise NotImplementedError(f"Reward motion is not implemented for {type(self).__name__}")

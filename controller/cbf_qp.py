@@ -10,7 +10,6 @@ import numpy as np
 import osqp
 from scipy import sparse
 
-from env.robots import SingleIntegratorRobot, HumanoidRobot
 from env.robots.base import check_obstacle_shapes
 
 
@@ -215,16 +214,7 @@ def _control_output_matrix(robot, state):
 
 @partial(jax.jit, static_argnames=("robot",))
 def _controller_constraints(robot, state, obstacles, dt):
-    constraints = robot.cbf_constraints(state, obstacles, dt)
-    if isinstance(robot, SingleIntegratorRobot):
-        # Match SF-PPO's 16-facet inner speed polygon; keep step() rescaling inactive.
-        angles = jnp.arange(16)*2*jnp.pi/16
-        normals = jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)
-        bound = robot.v_max*math.cos(math.pi/16)*(1.-1e-7)
-        constraints = constraints._replace(
-            A=jnp.concatenate([constraints.A, -normals]),
-            b=jnp.concatenate([constraints.b, jnp.full(16, bound)]))
-    return constraints
+    return robot.control_constraints(state, obstacles, dt)
 
 
 def control_residual(robot, state, action, obstacles, dt):
@@ -252,8 +242,7 @@ def _validate_controller_inputs(robot, state, nominal, obstacles, dt):
 
 
 def _solve_controller_qp(robot, state, nominal, obstacles, dt, *, solver, slack_weight):
-    if isinstance(robot, HumanoidRobot) and not bool(robot.barrier_domain_valid(state, obstacles)):
-        raise ValueError("parabolic CBF requires strict separation from inflated obstacles")
+    robot.validate_cbf_domain(state, obstacles)
     low, high = robot.input_bounds()
     constraints = _controller_constraints(robot, state, obstacles, dt)
     weights = jnp.asarray(robot.weights)
@@ -282,8 +271,7 @@ def warmup_controller(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None
     """Compile CBF/output computations without solving a QP."""
     _validate_controller_inputs(robot, state, nominal, obstacles, dt)
     obstacles = select_obstacles(state[:2], obstacles, qp_obs_top_k)
-    if isinstance(robot, HumanoidRobot) and not bool(robot.barrier_domain_valid(state, obstacles)):
-        raise ValueError("parabolic CBF requires strict separation from inflated obstacles")
+    robot.validate_cbf_domain(state, obstacles)
     jax.block_until_ready((_controller_constraints(robot, state, obstacles, dt),
                            _control_output_matrix(robot, state)))
 

@@ -169,13 +169,13 @@ class HumanoidRobot(Robot):
         """Track physical inputs."""
         return jnp.eye(3)
 
-    def barrier_domain_valid(self, state, obstacles):
+    def validate_cbf_domain(self, state, obstacles):
         """Parabolic CBF requires strict separation from inflated obstacles."""
-        if self.barrier == "distance":
-            return jnp.array(True)
-        radius = self.radius + obstacles.radii + self.margin
-        q = jnp.sum((state[:2]-obstacles.centers)**2, axis=1) - radius**2
-        return jnp.all((obstacles.mask <= .5) | (q > 0))
+        if self.barrier == "parabolic":
+            radius = self.radius + obstacles.radii + self.margin
+            q = jnp.sum((state[:2]-obstacles.centers)**2, axis=1) - radius**2
+            if not bool(jnp.all((obstacles.mask <= .5) | (q > 0))):
+                raise ValueError("parabolic CBF requires strict separation from inflated obstacles")
 
     def distance_barrier(self, state, obstacles, *, r_safe=None):
         """Return (h, h_dot, A, drift), where h_ddot = A@u + drift."""
