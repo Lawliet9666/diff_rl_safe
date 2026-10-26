@@ -82,6 +82,6 @@ mkdir -p "$TMPDIR"
 
 # CBF evaluation results already exist; run the remaining RL experiments.
 for method in ppo ppo_filter barriernet barriernet_sim; do
-    bash scripts/run_gpu.sh "$method" all
+    bash scripts/run_gpu.sh "$method" all trainer.num_envs=64 trainer.timesteps_per_batch=8192 trainer.num_minibatches=32 trainer.n_updates_per_iteration=4
 done
 SLURM

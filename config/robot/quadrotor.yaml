@@ -13,7 +13,7 @@ thrust_rate_max: 20.0  # N/s
 
 # State limits.
 # Enforced by state CBFs.
-v_max: 1.5  # m/s; full 3D speed magnitude
+v_max: 1.0  # m/s; full 3D speed magnitude
 thrust_min: 2.0  # N
 thrust_max: 20.0  # N
 tilt_max: 0.7853981633974483  # rad (45 deg)
@@ -31,7 +31,7 @@ goal_min_distance: 6.0  # m
 
 # Reward scales.
 reward:
-  progress_speed_scale: 1.5  # m/s; progress clipping
+  progress_speed_scale: ${robot.v_max}  # m/s; progress clipping
   potential_factor: 3.0
   back_factor: 0.1
   spin_factor: 4.5

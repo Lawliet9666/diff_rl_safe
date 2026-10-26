@@ -8,7 +8,7 @@ a_max: 2.0  # m/s^2
 
 # State limits.
 # Total planar speed; QP uses a 16-facet inner approximation.
-v_max: 1.5  # m/s
+v_max: 1.0  # m/s
 
 # Navigation.
 goal_tolerance: 0.6  # m
@@ -16,7 +16,7 @@ goal_min_distance: 6.0  # m
 
 # Reward scales.
 reward:
-  progress_speed_scale: 1.5  # m/s; progress clipping
+  progress_speed_scale: ${robot.v_max}  # m/s; progress clipping
   potential_factor: 3.0
   back_factor: 0.1
   spin_factor: 4.5
