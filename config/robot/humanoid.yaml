@@ -10,7 +10,7 @@ omega_max: 1.57  # rad/s
 
 # State limits.
 # Total planar speed plus next-step body-velocity bounds.
-v_max: 1.0  # m/s; magnitude
+v_max: 1.2  # m/s; magnitude
 vf_min: -1.0  # m/s
 vf_max: 1.0  # m/s
 vl_min: -1.0  # m/s

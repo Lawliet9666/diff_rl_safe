@@ -8,7 +8,7 @@ a_max: 2.0  # m/s^2
 
 # State limits.
 # Total planar speed; QP uses a 16-facet inner approximation.
-v_max: 1.0  # m/s
+v_max: 1.2  # m/s
 
 # Navigation.
 goal_tolerance: 0.6  # m

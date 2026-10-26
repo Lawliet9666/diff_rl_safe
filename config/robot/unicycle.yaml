@@ -4,7 +4,7 @@ radius: 0.3  # m
 
 # Input limits.
 # u = [v, omega], body forward speed and yaw rate.
-v_max: 1.0  # m/s
+v_max: 1.2  # m/s
 omega_max: 1.57  # rad/s
 
 # Navigation.

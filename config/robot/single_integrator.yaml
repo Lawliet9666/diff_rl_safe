@@ -4,7 +4,7 @@ radius: 0.3  # m
 
 # Input limits.
 # u = [v_x, v_y], world frame; Euclidean speed bound.
-v_max: 1.0  # m/s; Euclidean norm
+v_max: 1.2  # m/s; Euclidean norm
 
 # Navigation.
 goal_tolerance: 0.3  # m

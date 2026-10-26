@@ -13,7 +13,7 @@ thrust_rate_max: 20.0  # N/s
 
 # State limits.
 # Enforced by state CBFs.
-v_max: 1.0  # m/s; full 3D speed magnitude
+v_max: 1.2  # m/s; full 3D speed magnitude
 thrust_min: 2.0  # N
 thrust_max: 20.0  # N
 tilt_max: 0.7853981633974483  # rad (45 deg)
