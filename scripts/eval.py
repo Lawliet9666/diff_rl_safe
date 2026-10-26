@@ -237,10 +237,10 @@ def _run_controller_episode(config, *, setup=None):
         if bool(metrics["physical_state_limit"]):
             status = "state_limit"
             if robot == "double_integrator":
-                reason = "double-integrator state became nonfinite during integration"
+                reason = "double-integrator speed limit exceeded or state became nonfinite during integration"
             else:
-                reason = ("humanoid body velocity limit exceeded during integration" if robot == "humanoid"
-                          else "quadrotor altitude, tilt or thrust limit exceeded during integration")
+                reason = ("humanoid total speed or body velocity limit exceeded during integration" if robot == "humanoid"
+                          else "quadrotor speed, altitude, tilt or thrust limit exceeded during integration")
             break
         if bool(done[0]):
             status = "success" if bool(metrics["success"][0]) else "timeout"

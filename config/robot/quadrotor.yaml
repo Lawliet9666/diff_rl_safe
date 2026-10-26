@@ -8,11 +8,12 @@ radius: 0.3  # m
 
 # Input limits.
 # u = [omega_x, omega_y, omega_z, dT/dt]; body-frame rates.
-omega_max: 2.0  # rad/s; per axis
+omega_max: 1.57  # rad/s; per body axis and world yaw rate
 thrust_rate_max: 20.0  # N/s
 
 # State limits.
 # Enforced by state CBFs.
+v_max: 1.5  # m/s; full 3D speed magnitude
 thrust_min: 2.0  # N
 thrust_max: 20.0  # N
 tilt_max: 0.7853981633974483  # rad (45 deg)

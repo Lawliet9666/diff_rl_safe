@@ -37,6 +37,7 @@ quadrotor:
     acceleration_limits: [2.0, 2.0, 2.0]  # Nominal acceleration clipping.
   cbf:
     kappa: [1.5, 1.5, 1.5]  # Obstacle/altitude HOCBF rates.
+    kappa_speed: [4.0, 4.0]  # Total-speed HOCBF rates.
     kappa_thrust: 4.0  # Thrust CBF rate.
     kappa_tilt: 4.0  # Tilt CBF rate.
   qp:

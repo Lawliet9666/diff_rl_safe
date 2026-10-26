@@ -6,10 +6,11 @@ radius: 0.3  # m
 # u = [a_f, a_l, omega], body frame.
 af_max: 4.0  # m/s^2
 al_max: 2.0  # m/s^2
-omega_max: 1.0  # rad/s
+omega_max: 1.57  # rad/s
 
 # State limits.
-# Next-step body-velocity bounds.
+# Total planar speed plus next-step body-velocity bounds.
+v_max: 1.5  # m/s; magnitude
 vf_min: -1.0  # m/s
 vf_max: 1.5  # m/s
 vl_min: -1.0  # m/s

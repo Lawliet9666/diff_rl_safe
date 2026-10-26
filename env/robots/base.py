@@ -2,6 +2,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import NamedTuple
+import math
 
 from jax import Array
 import jax.numpy as jnp
@@ -53,6 +54,17 @@ def masked_rows(A, b, domain, mask):
 def join_constraints(*blocks):
     return Constraints(*(jnp.concatenate([b[i] for b in blocks], axis=0)
                          for i in range(3)))
+
+
+
+def planar_speed_constraints(velocity, dt, v_max, control_dim):
+    """Hard next-step speed disk, using a 16-facet inscribed polygon."""
+    angles = jnp.arange(16, dtype=velocity.dtype)*2*jnp.pi/16
+    normals = jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)
+    bound = v_max*math.cos(math.pi/16)*(1.-1e-7)
+    margin = bound-normals@velocity
+    A = -dt*jnp.pad(normals, ((0, 0), (0, control_dim-2)))
+    return Constraints(A, margin, margin)
 
 
 def _hocbf(h, h_dot, h_ddot, dh_ddot_dx_g, h_dddot_drift, kappa):

@@ -9,7 +9,8 @@ import jax
 import jax.numpy as jnp
 
 from .base import (Robot, RobotStep, angle_normalize, Constraints,
-                   check_obstacle_shapes, masked_rows, join_constraints, _control_parameters)
+                   check_obstacle_shapes, masked_rows, join_constraints,
+                   planar_speed_constraints, _control_parameters)
 
 
 def _parabolic_value(z, w, radius, cfg):
@@ -52,6 +53,7 @@ class HumanoidRobot(Robot):
     af_max: float
     al_max: float
     omega_max: float
+    v_max: float
     state_dim: ClassVar[int] = 5
     control_dim: ClassVar[int] = 3
     policy_feature_dim: ClassVar[int] = 2
@@ -89,7 +91,7 @@ class HumanoidRobot(Robot):
         parameters["cbf"] = cbf_type(**{name: parameters.pop(name) for name in cbf_names})
         parameters.update(vf_min=r.vf_min, vf_max=r.vf_max, vl_min=r.vl_min,
                           vl_max=r.vl_max, af_max=r.af_max, al_max=r.al_max,
-                          omega_max=r.omega_max, radius=r.radius,
+                          omega_max=r.omega_max, v_max=r.v_max, radius=r.radius,
                           margin=float(config.env.safety_margin),
                           goal_tolerance=float(config.env.robot_goal.tolerance))
         parameters["weights"] = tuple(parameters["weights"])
@@ -97,10 +99,10 @@ class HumanoidRobot(Robot):
 
     def __post_init__(self):
         values = (self.vf_min, self.vf_max, self.vl_min, self.vl_max,
-                  self.af_max, self.al_max, self.omega_max)
+                  self.af_max, self.al_max, self.omega_max, self.v_max)
         if (not all(math.isfinite(v) for v in values)
                 or not self.vf_min < 0 < self.vf_max or not self.vl_min < 0 < self.vl_max
-                or min(self.af_max, self.al_max, self.omega_max) <= 0):
+                or min(self.af_max, self.al_max, self.omega_max, self.v_max) <= 0):
             raise ValueError("invalid humanoid velocity or input limits")
 
         valid_cbf = ((self.barrier == "distance" and isinstance(self.cbf, DistanceCBFParams))
@@ -145,7 +147,8 @@ class HumanoidRobot(Robot):
 
     def check_state_limits(self, state, tolerance=1e-6):
         return (jnp.all(jnp.isfinite(state))
-                & jnp.all(self.velocity_margin(state) >= -tolerance))
+                & jnp.all(self.velocity_margin(state) >= -tolerance)
+                & (jnp.linalg.norm(state[3:5]) <= self.v_max+tolerance))
 
     def policy_features(self, state, velocity, *, position_scale, velocity_scale):
         """Body-frame forward/lateral velocities, without a duplicate world velocity."""
@@ -225,13 +228,15 @@ class HumanoidRobot(Robot):
         velocity_rows = Constraints(
             dt*jnp.array([[1., 0., 0.], [-1., 0., 0.], [0., 1., 0.], [0., -1., 0.]]),
             margin, margin)
-        return join_constraints(obstacle_rows, velocity_rows)
+        speed_rows = planar_speed_constraints(state[3:5], dt, self.v_max, self.control_dim)
+        return join_constraints(obstacle_rows, velocity_rows, speed_rows)
 
     def nominal_control(self, state, goal):
         delta = goal-state[:2]
         desired = self.rotation(state).T @ (self.position_gain*delta)
         desired = jnp.clip(desired, jnp.array([self.vf_min, self.vl_min]),
                            jnp.array([self.vf_max, self.vl_max]))
+        desired *= jnp.minimum(1., self.v_max/jnp.maximum(jnp.linalg.norm(desired), 1e-12))
         near_goal = jnp.linalg.norm(delta) < self.goal_tolerance
         desired = jnp.where(near_goal, 0., desired)
         yaw_error = angle_normalize(jnp.arctan2(delta[1], delta[0])-state[2])

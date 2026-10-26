@@ -99,7 +99,8 @@ def _solve_slack_qp(params, hparams, obs, q, p, g, h_qp, *, hard_g=None, hard_h=
         q_qp = jnp.swapaxes(transform, 1, 2) @ q_qp @ transform
         p_qp = (jnp.swapaxes(transform, 1, 2) @ p_qp[..., None]).squeeze(-1)
         g_qp = g_qp @ transform
-        row_scale = jnp.maximum(jnp.linalg.norm(g_qp, axis=2), 1.)
+        # Clamp before sqrt so zero constraint rows have finite state gradients.
+        row_scale = jnp.sqrt(jnp.maximum(jnp.sum(g_qp*g_qp, axis=2), 1.))
         g_qp = g_qp/row_scale[..., None]
         h_qp_full = h_qp_full/row_scale
 

@@ -7,12 +7,14 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 
-from .base import Robot, RobotStep, check_obstacle_shapes, masked_rows, _control_parameters
+from .base import (Robot, RobotStep, check_obstacle_shapes, masked_rows,
+                   join_constraints, planar_speed_constraints, _control_parameters)
 
 
 @dataclass(frozen=True)
 class DoubleIntegratorRobot(Robot):
     a_max: float
+    v_max: float
     radius: float
     margin: float
     goal_tolerance: float
@@ -30,7 +32,7 @@ class DoubleIntegratorRobot(Robot):
             config.controller.double_integrator,
             ("position_gain", "velocity_gain", "kappa", "weights"),
             "controller.double_integrator")
-        parameters.update(a_max=config.robot.a_max,
+        parameters.update(a_max=config.robot.a_max, v_max=config.robot.v_max,
                           radius=config.robot.radius, margin=float(config.env.safety_margin),
                           goal_tolerance=float(config.env.robot_goal.tolerance))
         for name in ("kappa", "weights"):
@@ -40,12 +42,12 @@ class DoubleIntegratorRobot(Robot):
     def __post_init__(self):
         if not math.isfinite(self.a_max) or self.a_max <= 0:
             raise ValueError("double-integrator acceleration limit must be finite and positive")
-        values = (self.radius, self.goal_tolerance, self.position_gain,
+        values = (self.v_max, self.radius, self.goal_tolerance, self.position_gain,
                   self.velocity_gain, *self.kappa, *self.weights)
         if (len(self.kappa) != 2 or len(self.weights) != 2
                 or not all(math.isfinite(value) and value > 0 for value in values)
                 or not math.isfinite(self.margin) or self.margin < 0):
-            raise ValueError("invalid double-integrator CBF gains or weights")
+            raise ValueError("invalid double-integrator speed limit, CBF gains or weights")
 
     def control_affine(self, state):
         f = jnp.concatenate([state[2:], jnp.zeros_like(state[2:])])
@@ -66,6 +68,14 @@ class DoubleIntegratorRobot(Robot):
     def initial_state(self, pose):
         pose = jnp.asarray(pose, dtype=float)
         return jnp.concatenate([pose[:2], jnp.zeros_like(pose[:2])])
+
+    def check_state_limits(self, state, tolerance=1e-6):
+        return (jnp.all(jnp.isfinite(state))
+                & (jnp.linalg.norm(state[2:]) <= self.v_max+tolerance))
+
+    def velocity_constraints(self, state, dt):
+        """16-facet inner approximation of ||v + dt*a||_2 <= v_max."""
+        return planar_speed_constraints(state[2:], dt, self.v_max, self.control_dim)
 
     def policy_features(self, state, velocity, *, position_scale, velocity_scale):
         """World-frame velocity; this model has no heading."""
@@ -95,16 +105,18 @@ class DoubleIntegratorRobot(Robot):
 
     @partial(jax.jit, static_argnames=("self",))
     def cbf_constraints(self, state, obstacles, dt, *, kappa=None, r_safe=None):
-        """Second-order obstacle HOCBF constraints."""
+        """Obstacle HOCBFs followed by hard next-step speed limits."""
         check_obstacle_shapes(obstacles)
         h, h_dot, A, drift = self.distance_barrier(state, obstacles, r_safe=r_safe)
         kappa1, kappa2 = self.kappa if kappa is None else jnp.moveaxis(kappa, -1, 0)
         b = drift + (kappa1+kappa2)*h_dot + kappa1*kappa2*h
         domain = jnp.stack([h, h_dot+kappa1*h], axis=1)
-        return masked_rows(A, b, domain, obstacles.mask)
+        obstacle_rows = masked_rows(A, b, domain, obstacles.mask)
+        return join_constraints(obstacle_rows, self.velocity_constraints(state, dt))
 
     def nominal_control(self, state, goal):
         desired = self.position_gain*(goal-state[:2])
+        desired *= jnp.minimum(1., self.v_max/jnp.maximum(jnp.linalg.norm(desired), 1e-12))
         desired = jnp.where(jnp.linalg.norm(goal-state[:2]) < self.goal_tolerance, 0., desired)
         return self.velocity_gain*(desired-state[2:])
 
