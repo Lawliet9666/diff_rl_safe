@@ -1,6 +1,6 @@
 type: cbf_qp
-slack_weight: 0.0  # 0: hard; >0: obstacle slack for every robot; physical limits stay hard.
-qp_obs_top_k: null  # null: all; k>0: nearest k obstacles.
+slack_weight: 10.0  # 0: hard; >0: obstacle slack for every robot; physical limits stay hard.
+qp_obs_top_k: 5  # null: all; k>0: nearest k obstacles.
 
 solver:
   eps_abs: 1.0e-9
@@ -13,7 +13,8 @@ solver:
 
 # Class-K rates: alpha_i(s) = kappa_i*s [1/s].
 single_integrator:
-  nominal: {}
+  nominal:
+    position_gain: 1.0
   cbf:
     kappa: [2.0]  # h_dot + kappa_1*h >= 0
   qp:
@@ -31,10 +32,9 @@ unicycle:
 quadrotor:
   nominal:
     position_gain: 1.0
-    velocity_gain: 1.8
+    velocity_gain: 2.0
     attitude_gain: 4.0
     thrust_tracking_gain: 4.0
-    acceleration_limits: [2.0, 2.0, 2.0]  # Nominal acceleration clipping.
   cbf:
     kappa: [1.5, 1.5, 1.5]  # Obstacle/altitude HOCBF rates.
     kappa_speed: [4.0, 4.0]  # Total-speed HOCBF rates.
@@ -50,6 +50,7 @@ humanoid:
     velocity_gain: 2.0
     heading_gain: 2.0
   cbf:
+    kappa_speed: 4.0  # Shared first-order total-speed CBF rate.
     distance:
       kappa: [1.5, 1.5]  # Distance HOCBF rates.
     parabolic:
@@ -66,5 +67,6 @@ double_integrator:
     velocity_gain: 2.0
   cbf:
     kappa: [1.5, 1.5]  # Distance HOCBF rates.
+    kappa_speed: 4.0  # h_v_dot + kappa_speed*h_v >= 0 [1/s].
   qp:
     weights: [1.0, 1.0]  # a_x, a_y.

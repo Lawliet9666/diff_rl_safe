@@ -8,7 +8,7 @@ v_max: 1.2  # m/s
 omega_max: 1.57  # rad/s
 
 # Navigation.
-goal_tolerance: 0.6  # m
+goal_tolerance: 0.3  # m
 goal_min_distance: 6.0  # m
 
 # Reward scales.

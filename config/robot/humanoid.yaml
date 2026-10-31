@@ -9,17 +9,13 @@ al_max: 2.0  # m/s^2
 omega_max: 1.57  # rad/s
 
 # State limits.
-# Total planar speed plus next-step body-velocity bounds.
+# Total planar speed; enforced by a continuous-time CBF (check sampled execution).
 v_max: 1.2  # m/s; magnitude
-vf_min: -1.0  # m/s
-vf_max: 1.0  # m/s
-vl_min: -1.0  # m/s
-vl_max: 1.0  # m/s
 
 max_integration_dt: 0.01  # s; robot substep bound
 
 # Navigation.
-goal_tolerance: 0.6  # m
+goal_tolerance: 0.3  # m
 goal_min_distance: 6.0  # m
 
 # Reward scales.

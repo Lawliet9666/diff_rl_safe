@@ -8,7 +8,7 @@ radius: 0.3  # m
 
 # Input limits.
 # u = [omega_x, omega_y, omega_z, dT/dt]; body-frame rates.
-omega_max: 1.57  # rad/s; per body axis and world yaw rate
+omega_max: 1.57  # rad/s; per body axis
 thrust_rate_max: 20.0  # N/s
 
 # State limits.
@@ -26,7 +26,7 @@ altitude: 1.2  # m; hover altitude
 max_integration_dt: 0.005  # s; robot substep bound
 
 # Navigation.
-goal_tolerance: 0.6  # m
+goal_tolerance: 0.3  # m
 goal_min_distance: 6.0  # m
 
 # Reward scales.

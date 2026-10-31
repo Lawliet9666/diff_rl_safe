@@ -5,7 +5,8 @@ from typing import ClassVar
 
 import jax.numpy as jnp
 
-from .base import Robot, RobotStep, check_obstacle_shapes, masked_rows, _control_parameters
+from .base import (Robot, RobotStep, check_obstacle_shapes, masked_rows,
+                   goal_velocity, _control_parameters)
 
 
 @dataclass(frozen=True)
@@ -13,6 +14,8 @@ class SingleIntegratorRobot(Robot):
     v_max: float
     radius: float
     margin: float
+    goal_tolerance: float
+    position_gain: float
     kappa: tuple
     weights: tuple
     state_dim: ClassVar[int] = 3
@@ -21,16 +24,20 @@ class SingleIntegratorRobot(Robot):
 
     @classmethod
     def from_config(cls, config):
-        values = _control_parameters(config.controller.single_integrator, ("kappa", "weights"),
+        values = _control_parameters(config.controller.single_integrator,
+                                     ("position_gain", "kappa", "weights"),
                                      "controller.single_integrator")
         return cls(v_max=config.robot.v_max, radius=config.robot.radius,
                    margin=float(config.env.safety_margin),
+                   goal_tolerance=float(config.env.robot_goal.tolerance),
+                   position_gain=float(values["position_gain"]),
                    kappa=tuple(values['kappa']), weights=tuple(values['weights']))
 
     def __post_init__(self):
         if (len(self.kappa) != 1 or len(self.weights) != 2
                 or not all(math.isfinite(v) and v > 0 for v in
-                           (self.v_max, self.radius, *self.kappa, *self.weights))
+                           (self.v_max, self.radius, self.goal_tolerance, self.position_gain,
+                            *self.kappa, *self.weights))
                 or not math.isfinite(self.margin) or self.margin < 0):
             raise ValueError("invalid single-integrator CBF parameters")
 
@@ -67,9 +74,8 @@ class SingleIntegratorRobot(Robot):
         return jnp.eye(2, dtype=state.dtype)
 
     def nominal_control(self, state, goal):
-        """Goal-directed world velocity, capped at the existing speed limit."""
-        delta = goal-state[:2]
-        return delta*jnp.minimum(1., self.v_max/jnp.maximum(jnp.linalg.norm(delta), 1e-9))
+        return goal_velocity(state[:2], goal, self.position_gain,
+                             self.v_max, self.goal_tolerance)
 
     def cbf_constraints(self, state, obstacles, dt):
         """First-order distance CBFs for the physical input [vx, vy]."""

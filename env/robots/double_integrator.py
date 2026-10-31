@@ -7,8 +7,8 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 
-from .base import (Robot, RobotStep, check_obstacle_shapes, masked_rows,
-                   join_constraints, planar_speed_constraints, _control_parameters)
+from .base import (Robot, RobotStep, Constraints, check_obstacle_shapes, masked_rows,
+                   join_constraints, goal_velocity, _control_parameters)
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,7 @@ class DoubleIntegratorRobot(Robot):
     position_gain: float
     velocity_gain: float
     kappa: tuple  # HOCBF rates [kappa_1, kappa_2].
+    kappa_speed: float  # First-order total-speed CBF rate.
     weights: tuple
     state_dim: ClassVar[int] = 4
     control_dim: ClassVar[int] = 2
@@ -30,7 +31,7 @@ class DoubleIntegratorRobot(Robot):
     def from_config(cls, config):
         parameters = _control_parameters(
             config.controller.double_integrator,
-            ("position_gain", "velocity_gain", "kappa", "weights"),
+            ("position_gain", "velocity_gain", "kappa", "kappa_speed", "weights"),
             "controller.double_integrator")
         parameters.update(a_max=config.robot.a_max, v_max=config.robot.v_max,
                           radius=config.robot.radius, margin=float(config.env.safety_margin),
@@ -43,7 +44,7 @@ class DoubleIntegratorRobot(Robot):
         if not math.isfinite(self.a_max) or self.a_max <= 0:
             raise ValueError("double-integrator acceleration limit must be finite and positive")
         values = (self.v_max, self.radius, self.goal_tolerance, self.position_gain,
-                  self.velocity_gain, *self.kappa, *self.weights)
+                  self.velocity_gain, self.kappa_speed, *self.kappa, *self.weights)
         if (len(self.kappa) != 2 or len(self.weights) != 2
                 or not all(math.isfinite(value) and value > 0 for value in values)
                 or not math.isfinite(self.margin) or self.margin < 0):
@@ -73,9 +74,11 @@ class DoubleIntegratorRobot(Robot):
         return (jnp.all(jnp.isfinite(state))
                 & (jnp.linalg.norm(state[2:]) <= self.v_max+tolerance))
 
-    def velocity_constraints(self, state, dt):
-        """16-facet inner approximation of ||v + dt*a||_2 <= v_max."""
-        return planar_speed_constraints(state[2:], dt, self.v_max, self.control_dim)
+    def velocity_constraints(self, state):
+        """Continuous-time speed CBF; held-step speed bounds need separate checks."""
+        velocity = state[2:]
+        h = self.v_max**2 - velocity @ velocity
+        return Constraints(-2*velocity[None, :], self.kappa_speed*h[None], h[None])
 
     def policy_features(self, state, velocity, *, position_scale, velocity_scale):
         """World-frame velocity; this model has no heading."""
@@ -105,19 +108,18 @@ class DoubleIntegratorRobot(Robot):
 
     @partial(jax.jit, static_argnames=("self",))
     def cbf_constraints(self, state, obstacles, dt, *, kappa=None, r_safe=None):
-        """Obstacle HOCBFs followed by hard next-step speed limits."""
+        """Obstacle HOCBFs followed by a hard continuous-time speed CBF."""
         check_obstacle_shapes(obstacles)
         h, h_dot, A, drift = self.distance_barrier(state, obstacles, r_safe=r_safe)
         kappa1, kappa2 = self.kappa if kappa is None else jnp.moveaxis(kappa, -1, 0)
         b = drift + (kappa1+kappa2)*h_dot + kappa1*kappa2*h
         domain = jnp.stack([h, h_dot+kappa1*h], axis=1)
         obstacle_rows = masked_rows(A, b, domain, obstacles.mask)
-        return join_constraints(obstacle_rows, self.velocity_constraints(state, dt))
+        return join_constraints(obstacle_rows, self.velocity_constraints(state))
 
     def nominal_control(self, state, goal):
-        desired = self.position_gain*(goal-state[:2])
-        desired *= jnp.minimum(1., self.v_max/jnp.maximum(jnp.linalg.norm(desired), 1e-12))
-        desired = jnp.where(jnp.linalg.norm(goal-state[:2]) < self.goal_tolerance, 0., desired)
+        desired = goal_velocity(state[:2], goal, self.position_gain,
+                                self.v_max, self.goal_tolerance)
         return self.velocity_gain*(desired-state[2:])
 
     def reward_motion(self, state, action):

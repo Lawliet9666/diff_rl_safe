@@ -121,14 +121,13 @@ if [[ "$target" == all ]]; then
 fi
 for robot in "${robots[@]}"; do
   if [[ "$method" == cbf ]]; then
-    command=(python scripts/run_controller.py "robot=$robot" device=cuda
-      env.humans.num_humans=30 controller.slack_weight=10.0 controller.qp_obs_top_k=5 "$@")
+    command=(python scripts/run_controller.py "robot=$robot" device=cuda "$@")
     run_environment=("${runtime[@]}")
   else
     run_environment=("${runtime[@]}" "WANDB_MODE=${WANDB_MODE:-online}"
       "RUN_NAME=${RUN_NAME:-gpu}_${method}_${robot}_${stamp}")
     command=(bash scripts/run_ppo.sh device=cuda env=crowd_dyn_var_num_env "robot=$robot"
-      env.humans.num_humans=30 trainer.num_envs=16 trainer.timesteps_per_batch=4096 trainer.total_timesteps=15000000
+      trainer.num_envs=16 trainer.timesteps_per_batch=4096 trainer.total_timesteps=15000000
       "${profile[@]}" "$@")
   fi
   printf '\n[%s] %s\n' "$method" "$robot"

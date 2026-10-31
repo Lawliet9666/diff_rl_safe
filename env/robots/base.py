@@ -18,6 +18,15 @@ def angle_normalize(angle):
     return (angle + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
 
+def goal_velocity(position, goal, position_gain, v_max, goal_tolerance):
+    """Bounded goal velocity, zero inside the navigation goal tolerance."""
+    delta = jnp.asarray(goal, dtype=position.dtype)-position
+    velocity = position_gain*delta
+    speed = jnp.sqrt(jnp.maximum(jnp.sum(velocity**2), 1e-24))
+    velocity *= jnp.minimum(1., v_max/speed)
+    return jnp.where(jnp.sum(delta**2) < goal_tolerance**2, 0., velocity)
+
+
 class Obstacles(NamedTuple):
     """centers/velocities [N,2], radii/mask [N]; velocities are world-frame.
 

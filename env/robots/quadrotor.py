@@ -43,6 +43,7 @@ class QuadrotorRobot(Robot):
 
     radius: float
     margin: float
+    goal_tolerance: float
 
     thrust_min: float
     thrust_max: float
@@ -54,7 +55,6 @@ class QuadrotorRobot(Robot):
     velocity_gain: float
     attitude_gain: float
     thrust_tracking_gain: float
-    acceleration_limits: tuple
 
     # Obstacle/altitude, thrust and tilt CBF rates.
     kappa: tuple
@@ -70,15 +70,16 @@ class QuadrotorRobot(Robot):
         parameters = _control_parameters(
             config.controller.quadrotor,
             ("position_gain", "velocity_gain", "attitude_gain", "thrust_tracking_gain",
-             "acceleration_limits", "kappa", "kappa_speed", "kappa_thrust", "kappa_tilt", "weights"),
+             "kappa", "kappa_speed", "kappa_thrust", "kappa_tilt", "weights"),
             "controller.quadrotor")
         parameters.update(mass=r.mass, gravity=r.gravity, altitude=r.altitude,
                           omega_max=r.omega_max, thrust_rate_max=r.thrust_rate_max, v_max=r.v_max,
                           radius=r.radius, margin=float(config.env.safety_margin),
+                          goal_tolerance=float(config.env.robot_goal.tolerance),
                           thrust_min=r.thrust_min, thrust_max=r.thrust_max,
                           tilt_max=r.tilt_max, altitude_min=r.altitude_min,
                           altitude_max=r.altitude_max)
-        for name in ("kappa", "kappa_speed", "weights", "acceleration_limits"):
+        for name in ("kappa", "kappa_speed", "weights"):
             parameters[name] = tuple(parameters[name])
         return cls(**parameters)
 
@@ -87,10 +88,10 @@ class QuadrotorRobot(Robot):
                      self.omega_max, self.thrust_rate_max, self.kappa_thrust,
                      self.kappa_tilt, self.thrust_min, *self.weights, self.position_gain,
                      self.velocity_gain, self.attitude_gain, self.thrust_tracking_gain,
-                     *self.acceleration_limits)
+                     self.goal_tolerance)
         if (not all(math.isfinite(v) and v > 0 for v in positives)
                 or not math.isfinite(self.margin) or self.margin < 0 or len(self.kappa) != 3
-                or len(self.kappa_speed) != 2 or len(self.weights) != 4 or len(self.acceleration_limits) != 3
+                or len(self.kappa_speed) != 2 or len(self.weights) != 4
                 or not 0 < self.tilt_max < math.pi/2
                 or not self.altitude_min < self.altitude < self.altitude_max
                 or not self.thrust_min < self.mass*self.gravity < self.thrust_max):
@@ -203,14 +204,6 @@ class QuadrotorRobot(Robot):
         return Constraints(A[None, :], jnp.atleast_1d(drift+(k1+k2)*h_dot+k1*k2*h),
                            jnp.stack([h, h_dot+k1*h]))
 
-    def yaw_rate_constraints(self, state):
-        """Bound world yaw rate as well as the body-rate input components."""
-        yaw_map = jax.jacfwd(lambda u: self.reward_motion(state, u)[1])(
-            jnp.zeros(self.control_dim, dtype=state.dtype))
-        return Constraints(jnp.stack([-yaw_map, yaw_map]),
-                           jnp.full(2, self.omega_max, dtype=state.dtype),
-                           jnp.empty(0, dtype=state.dtype))
-
     def state_barriers(self, state):
         """Tilt/thrust h and A, where h_dot = A@u."""
         _, _, R, T = unpack(state)
@@ -223,7 +216,7 @@ class QuadrotorRobot(Robot):
 
     @partial(jax.jit, static_argnames=("self",))
     def cbf_constraints(self, state, obstacles, dt, *, kappa=None, r_safe=None):
-        """Obstacle, altitude, speed, tilt, thrust and yaw-rate constraints."""
+        """Obstacle, altitude, speed, tilt and thrust constraints."""
         check_obstacle_shapes(obstacles)
         rates = self.kappa if kappa is None else jnp.moveaxis(kappa, -1, 0)
         obs = _hocbf(*self.barrier(state, obstacles, r_safe=r_safe), kappa=rates)
@@ -233,18 +226,18 @@ class QuadrotorRobot(Robot):
         b = jnp.array([self.kappa_tilt*h[0], self.kappa_thrust*h[1],
                        self.kappa_thrust*h[2]])
         return join_constraints(obs, altitude, Constraints(dh_dx_g, b, h),
-                                self.speed_constraints(state), self.yaw_rate_constraints(state))
+                                self.speed_constraints(state))
 
     def nominal_control(self, state, goal):
         """Goal-tracking reference before safety filtering."""
         p, v, R, T = unpack(state)
         goal = jnp.concatenate([goal, jnp.array([self.altitude])])
-        desired_velocity = (self.position_gain/self.velocity_gain)*(goal-p)
-        desired_velocity *= jnp.minimum(
-            1., self.v_max/jnp.maximum(jnp.linalg.norm(desired_velocity), 1e-12))
+        desired_velocity = self.position_gain*(goal-p)
+        near_goal = jnp.sum((goal[:2]-p[:2])**2) < self.goal_tolerance**2
+        desired_velocity = desired_velocity.at[:2].set(jnp.where(near_goal, 0., desired_velocity[:2]))
+        speed = jnp.sqrt(jnp.maximum(jnp.sum(desired_velocity**2), 1e-24))
+        desired_velocity *= jnp.minimum(1., self.v_max/speed)
         desired_acc = self.velocity_gain*(desired_velocity-v)
-        limits = jnp.asarray(self.acceleration_limits)
-        desired_acc = jnp.clip(desired_acc, -limits, limits)
         force = self.mass*(desired_acc+jnp.array([0., 0., self.gravity]))
         bdes = force/jnp.maximum(jnp.linalg.norm(force), 1e-9)
         # Align thrust with desired force; yaw is unregulated.

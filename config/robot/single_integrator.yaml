@@ -8,7 +8,7 @@ v_max: 1.2  # m/s; Euclidean norm
 
 # Navigation.
 goal_tolerance: 0.3  # m
-goal_min_distance: 8.0  # m
+goal_min_distance: 6.0  # m
 
 # Reward scales.
 reward:

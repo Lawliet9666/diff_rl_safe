@@ -73,15 +73,14 @@ cpu=(env JAX_PLATFORMS=cpu JAX_ENABLE_X64=1 "OMP_NUM_THREADS=$threads"
   "XLA_FLAGS=${XLA_FLAGS:---xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=$threads}")
 case "$method" in
   cbf)
-    command=(python scripts/run_controller.py "robot=$target" device=cpu
-      env.humans.num_humans=30 controller.slack_weight=10.0 controller.qp_obs_top_k=5 "$@") ;;
+    command=(python scripts/run_controller.py "robot=$target" device=cpu "$@") ;;
   eval)
     command=(python scripts/eval.py --save-dir "$target" --device cpu "$@") ;;
   *)
     cpu+=("RUN_NAME=${RUN_NAME:-cpu_${target}_${method}_$(date +%Y%m%d_%H%M%S)}"
       "WANDB_MODE=${WANDB_MODE:-online}")
     command=(bash scripts/run_ppo.sh device=cpu env=crowd_dyn_var_num_env "robot=$target"
-      env.humans.num_humans=30 trainer.num_envs=4 trainer.timesteps_per_batch=1024 trainer.total_timesteps=15000000
+      trainer.num_envs=4 trainer.timesteps_per_batch=1024 trainer.total_timesteps=15000000
       "${profile[@]}" "$@") ;;
 esac
 

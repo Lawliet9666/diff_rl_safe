@@ -7,7 +7,8 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 
-from .base import Robot, RobotStep, angle_normalize, check_obstacle_shapes, masked_rows, _control_parameters
+from .base import (Robot, RobotStep, angle_normalize, check_obstacle_shapes,
+                   masked_rows, goal_velocity, _control_parameters)
 
 
 @dataclass(frozen=True)
@@ -114,9 +115,6 @@ class UnicycleRobot(Robot):
 
     def nominal_control(self, state, goal):
         """Convert the goal-tracking world velocity to physical inputs."""
-        delta = goal-state[:2]
-        velocity = self.position_gain*delta
-        speed = jnp.linalg.norm(velocity)
-        velocity *= jnp.minimum(1., self.v_max/jnp.maximum(speed, 1e-9))
-        nominal = jnp.linalg.solve(self.control_output_matrix(state), velocity)
-        return jnp.where(jnp.linalg.norm(delta) < self.goal_tolerance, jnp.zeros(2), nominal)
+        velocity = goal_velocity(state[:2], goal, self.position_gain,
+                                 self.v_max, self.goal_tolerance)
+        return jnp.linalg.solve(self.control_output_matrix(state), velocity)

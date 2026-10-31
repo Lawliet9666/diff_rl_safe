@@ -7,11 +7,11 @@ radius: 0.3  # m
 a_max: 2.0  # m/s^2
 
 # State limits.
-# Total planar speed; QP uses a 16-facet inner approximation.
+# Total planar speed; enforced by a continuous-time CBF (check sampled execution).
 v_max: 1.2  # m/s
 
 # Navigation.
-goal_tolerance: 0.6  # m
+goal_tolerance: 0.3  # m
 goal_min_distance: 6.0  # m
 
 # Reward scales.
