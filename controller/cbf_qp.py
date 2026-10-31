@@ -112,7 +112,7 @@ class ControlResult(NamedTuple):
     iterations: int
 
 
-def _tracking_qp_data(nominal, constraints, low, high, weights, output_matrix, *,
+def _prepare_osqp_data(nominal, constraints, low, high, weights, output_matrix, *,
                       soft_indices=(), slack_weight=0.0):
     """Validate and scale the physical tracking QP."""
     if not jax.config.x64_enabled:
@@ -144,7 +144,7 @@ def _tracking_qp_data(nominal, constraints, low, high, weights, output_matrix, *
     return nominal, data, scale
 
 
-def _solve_qp_data(nominal, data, scale, domain, solver):
+def _solve_osqp(nominal, data, scale, domain, solver):
     """Condition and solve the shared physical QP with CPU OSQP."""
     A, b = -data.g, data.h
     P = scale[:, None]*data.q*scale[None, :]
@@ -227,10 +227,10 @@ def solve_qp(nominal, constraints, low, high, weights, *, output_matrix,
         if mask.shape != (n,) or not np.isfinite(mask).all():
             raise ValueError("soft_mask must be a finite vector with one entry per CBF row")
         ids = np.flatnonzero(mask > .5)
-    augmented_nominal, data, scale = _tracking_qp_data(
+    augmented_nominal, data, scale = _prepare_osqp_data(
         nominal, constraints, low, high, weights, output_matrix,
         soft_indices=ids, slack_weight=slack_weight)
-    augmented = _solve_qp_data(augmented_nominal, data, scale, constraints.domain, solver)
+    augmented = _solve_osqp(augmented_nominal, data, scale, constraints.domain, solver)
     if slack_weight == 0:
         return augmented, jnp.zeros(n, dtype=augmented.candidate.dtype)
     candidate = augmented.candidate[:d]
@@ -288,7 +288,7 @@ def warmup_controller(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None
                            _control_output_matrix(robot, state)))
 
 
-def _jax_qp_data(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None,
+def _prepare_jax_data(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None,
                  slack_weight=0.0, speed_facets=16):
     """Assemble the physical projection; whiten variables for mixed input units."""
     ids = _nearest_obstacle_ids(state[..., :2], obstacles, qp_obs_top_k)
@@ -382,7 +382,7 @@ def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
             jnp.where(active[:, None], obstacles.radii, 0.),
             jnp.where(active[:, None], obstacles.mask, 0.))
         nominal = jnp.where(active[:, None], nominal, 0.)
-    data = _jax_qp_data(robot, state, nominal, obstacles, dt,
+    data = _prepare_jax_data(robot, state, nominal, obstacles, dt,
                         qp_obs_top_k=qp_obs_top_k, slack_weight=slack_weight,
                         speed_facets=speed_facets)
     empty = jnp.empty((0,), jnp.float64)
