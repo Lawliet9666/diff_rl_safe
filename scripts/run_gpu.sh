@@ -5,9 +5,9 @@ usage() {
   cat <<'HELP'
 Usage: bash scripts/run_gpu.sh METHOD ROBOT [--gpu ID] [--dry-run] [overrides / controller flags]
 
-Methods: ppo, ppo_filter, barriernet, barriernet_sim, cbf, all.
+Methods: ppo, ppo_filter, cbf_rl, barriernet, barriernet_sim, cbf, all.
 Robots: single_integrator, unicycle, double_integrator, humanoid, quadrotor, all.
-'all all' runs CBF, PPO, PPO+filter, BarrierNet, then BarrierNet+simulation;
+'all all' runs CBF, PPO, PPO+filter, CBF-RL, BarrierNet, then BarrierNet+simulation;
 each method runs the five robots sequentially. No jobs run in parallel.
 
 Requires CUDA-enabled JAX and exactly one visible GPU. --gpu selects visibility,
@@ -43,6 +43,7 @@ shift 2
 case "$method" in
   ppo) profile=(model=ppo_gnn trainer.safety_filter.enabled=false trainer.reward_loss.weight=0.0) ;;
   ppo_filter) profile=(model=ppo_gnn trainer.safety_filter.enabled=true trainer.reward_loss.weight=0.0) ;;
+  cbf_rl) profile=(model=ppo_gnn trainer.physical_limits.enabled=false trainer.safety_filter.enabled=true trainer.safety_filter.reward.weight=1.0 trainer.reward_loss.weight=0.0) ;;
   barriernet) profile=(model=barriernet_gnn trainer.safety_filter.enabled=false trainer.reward_loss.weight=0.0) ;;
   barriernet_sim) profile=(model=barriernet_gnn trainer.safety_filter.enabled=false trainer.reward_loss.weight=0.1 trainer.reward_loss.horizon=8) ;;
   cbf|all) ;;
@@ -84,7 +85,7 @@ if [[ ! "$threads" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 if [[ "$method" == all ]]; then
-  for next_method in cbf ppo ppo_filter barriernet barriernet_sim; do
+  for next_method in cbf ppo ppo_filter cbf_rl barriernet barriernet_sim; do
     command=(bash "$0" "$next_method" "$target")
     if [[ -n "$gpu" ]]; then command+=(--gpu "$gpu"); fi
     if "$dry_run"; then command+=(--dry-run); fi

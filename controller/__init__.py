@@ -51,6 +51,8 @@ def make_safety_filter(config, env_cfg):
     section = config.trainer.safety_filter
     if not isinstance(section.enabled, bool):
         raise ValueError("trainer.safety_filter.enabled must be true or false")
+    if section.reward.weight > 0 and not section.enabled:
+        raise ValueError("CBF-RL reward requires the obstacle safety_filter, not physical-only projection")
     physical = config.trainer.physical_limits
     if not isinstance(physical.enabled, bool):
         raise ValueError("trainer.physical_limits.enabled must be true or false")

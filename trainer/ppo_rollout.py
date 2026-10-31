@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import jax
 import jax.numpy as jnp
 
@@ -207,9 +209,24 @@ def _collect_reward_windows(body, initial, params, value_fn, loss_fn, horizon, s
     return carry, transitions, metrics
 
 
+def _cbf_reward(proposed, filtered, diagnostics, sigma):
+    """CBF-RL Eqs. (22)-(23), averaging raw residuals over active obstacle rows."""
+    mask = diagnostics["obstacle_mask"]
+    residual = diagnostics["proposed_cbf_residual"]
+    violation = jnp.sum(jnp.where(mask > 0, jnp.minimum(residual, 0.) * mask, 0.), axis=-1)
+    violation = violation / jnp.maximum(mask.sum(axis=-1), 1.)
+    correction = jnp.expm1(-jnp.sum(jnp.square(proposed-filtered), axis=-1) / sigma**2)
+    return jax.tree_util.tree_map(lambda value: jax.lax.stop_gradient(value.astype(jnp.float32)), {
+        "cbf_rl/violation": violation,
+        "cbf_rl/correction": correction,
+        "cbf_rl/reward": violation + correction,
+    })
+
+
 def make_rollout_collector(model_module, *, step_fn, reset_fn,
                            observe_fn, timeout_aware=False, safety_filter=None,
-                           reward_loss_fn=None, reward_horizon=8):
+                           reward_loss_fn=None, reward_horizon=8,
+                           cbf_reward_weight=0.0, cbf_reward_sigma=0.5):
     """Infer policy-QP support once when creating the collector, before JIT tracing."""
     has_policy_qp = hasattr(model_module, "build_qp_context")
     if safety_filter is not None and has_policy_qp:
@@ -217,6 +234,12 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
 
     if reward_loss_fn is not None and (reward_horizon <= 0 or safety_filter is not None):
         raise ValueError("shared reward loss needs a positive horizon and no external filter")
+    for name, value in (("weight", cbf_reward_weight), ("sigma", cbf_reward_sigma)):
+        if (isinstance(value, bool) or not math.isfinite(value)
+                or value < 0 or (name == "sigma" and value == 0)):
+            raise ValueError(f"invalid safety_filter.reward.{name}")
+    if cbf_reward_weight > 0 and safety_filter is None:
+        raise ValueError("CBF-RL reward requires an external obstacle safety filter")
     need_timeout_values = timeout_aware or reward_loss_fn is not None
 
     def collect(
@@ -272,6 +295,10 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
             next_state, reward, done, metrics = step_fn(env_cfg, state, executed_action, env_key)
             if has_policy_qp:
                 reward = reward - float(hparams.qp_residual_reward_weight) * qp_diagnostics["qp_slack"]
+            if cbf_reward_weight > 0:
+                shaping = _cbf_reward(env_action, executed_action, filter_diagnostics, cbf_reward_sigma)
+                shaping["cbf_rl/weighted_reward"] = cbf_reward_weight * shaping["cbf_rl/reward"]
+                reward = reward + shaping["cbf_rl/weighted_reward"]
             done_bool = done > 0.5
             next_ppo_returns, completed_ppo_return = _update_ppo_episode_returns(
                 running_ppo_returns,
@@ -349,6 +376,8 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
                 transition['executed_act'] = executed_action
                 transition.update({name: value for name, value in filter_diagnostics.items()
                                    if name.startswith('filter/')})
+            if cbf_reward_weight > 0:
+                transition.update(shaping)
             if need_timeout_values:
                 truncated = metrics.get("truncated", metrics["timeout"])
                 terminated = metrics.get("terminated", jnp.where(truncated > 0.5, 0.0, done))
@@ -415,6 +444,9 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
         if timeout_aware:
             batch.update({key: transitions[key] for key in ("terminated", "truncated", "next_values")})
         batch.update({key: jnp.mean(value) for key, value in transitions.items() if key.startswith("control/")})
+        if cbf_reward_weight > 0:
+            batch.update({name: jnp.mean(value) for name, value in transitions.items()
+                          if name.startswith("cbf_rl/")})
         batch.update(reward_metrics)
         return batch, (next_state, next_history, next_ppo_returns), next_rng
 

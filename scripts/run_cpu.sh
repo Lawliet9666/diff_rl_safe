@@ -10,6 +10,7 @@ Usage:
 Methods (GNN policies by default):
   ppo             Ordinary PPO, without a safety filter.
   ppo_filter      PPO with a fixed post-sampling CBF-QP filter.
+  cbf_rl          PPO+filter with CBF-RL reward shaping (weight=1, sigma=0.5).
   barriernet      PPO with a learned differentiable CBF-QP layer.
   barriernet_sim  BarrierNet plus simulation reward gradients (weight=0.1, horizon=8).
   cbf             Goal-tracking CBF-QP; no training (slack=10, nearest 5 of 30 humans).
@@ -61,6 +62,7 @@ fi
 case "$method" in
   ppo) profile=(model=ppo_gnn trainer.safety_filter.enabled=false trainer.reward_loss.weight=0.0) ;;
   ppo_filter) profile=(model=ppo_gnn trainer.safety_filter.enabled=true trainer.reward_loss.weight=0.0) ;;
+  cbf_rl) profile=(model=ppo_gnn trainer.physical_limits.enabled=false trainer.safety_filter.enabled=true trainer.safety_filter.reward.weight=1.0 trainer.reward_loss.weight=0.0) ;;
   barriernet) profile=(model=barriernet_gnn trainer.safety_filter.enabled=false trainer.reward_loss.weight=0.0) ;;
   barriernet_sim) profile=(model=barriernet_gnn trainer.safety_filter.enabled=false trainer.reward_loss.weight=0.1 trainer.reward_loss.horizon=8) ;;
   cbf|eval) ;;

@@ -456,6 +456,10 @@ def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
         count = jnp.maximum(data['mask'].sum(axis=1), 1.)
         diagnostics = {
             'qp_ids': data['ids'], 'slack': slack, 'cbf_residual': residual[:, :data['mask'].shape[1]],
+            'proposed_cbf_residual': ((data['constraints'].A[:, :data['mask'].shape[1]]
+                @ nominal.astype(jnp.float64)[..., None]).squeeze(-1)
+                + data['constraints'].b[:, :data['mask'].shape[1]]),
+            'obstacle_mask': data['mask'],
             'filter/slack': (slack*data['mask']).sum(axis=1)/count,
             'filter/slack_max': jnp.max(slack*data['mask'], axis=1),
             'filter/correction': correction,

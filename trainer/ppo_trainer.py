@@ -123,6 +123,8 @@ class PPOTrainer:
             run_name += f"-ent{trainer.ent_coef}"
         if self.config.trainer.safety_filter.enabled:
             run_name += "-safetyfilter"
+            if trainer.safety_filter.reward.weight > 0:
+                run_name += "-cbfrl"
         run_name += "-braxppo"
         lr_schedule = str(getattr(trainer, "learning_rate_schedule", "linear")).strip().lower()
         if lr_schedule == "adaptive_kl":
@@ -166,6 +168,8 @@ class PPOTrainer:
             safety_filter=self.safety_filter,
             reward_loss_fn=reward_loss_fn,
             reward_horizon=self.config.trainer.reward_loss.horizon,
+            cbf_reward_weight=self.config.trainer.safety_filter.reward.weight,
+            cbf_reward_sigma=self.config.trainer.safety_filter.reward.sigma,
         )
 
     def setup_model_and_optimizer(self):
@@ -436,7 +440,7 @@ class PPOTrainer:
             "robot_omega_delta_max": batch["robot_omega_delta_max"],
             "robot_omega_delta_penalty_mean": batch["robot_omega_delta_penalty_mean"],
             **{key: batch[key] for key in diagnostic_keys},
-            **{key: value for key, value in batch.items() if key.startswith(("control/", "filter/"))},
+            **{key: value for key, value in batch.items() if key.startswith(("control/", "filter/", "cbf_rl/"))},
             "rollout_batch_finite": PPOTrainer._finite_if_enabled(run_finite_check, batch),
             "gae_finite": PPOTrainer._finite_if_enabled(
                 run_finite_check,
@@ -462,7 +466,7 @@ class PPOTrainer:
             "robot_omega_delta_max": float(summary["robot_omega_delta_max"]),
             "robot_omega_delta_penalty_mean": float(summary["robot_omega_delta_penalty_mean"]),
         }
-        metrics.update({key: float(value) for key, value in summary.items() if key.startswith(("control/", "filter/"))})
+        metrics.update({key: float(value) for key, value in summary.items() if key.startswith(("control/", "filter/", "cbf_rl/"))})
         if "qp_slack_sum" in summary:
             metrics.update({
                 "qp_slack_mean": PPOTrainer._summary_mean(summary, "qp_slack"),
@@ -613,7 +617,7 @@ class PPOTrainer:
             if "physical_contact_rate" in eval_metrics:
                 log_dict["eval/physical_contact_rate"] = eval_metrics["physical_contact_rate"]
 
-        log_dict.update({key: value for key, value in train_metrics.items() if key.startswith(("control/", "filter/"))})
+        log_dict.update({key: value for key, value in train_metrics.items() if key.startswith(("control/", "filter/", "cbf_rl/"))})
         wandb_log = {key: value for key, value in log_dict.items() if not key.startswith("train/")}
         if completed > 0 and periodic_log:
             wandb_log.update({key: value for key, value in log_dict.items() if key.startswith("train/")})
