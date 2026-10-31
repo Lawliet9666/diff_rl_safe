@@ -30,7 +30,7 @@ from trainer.ppo_core import (
     tree_all_finite,
 )
 from env import make_env
-from controller.safety_filter import make_safety_filter
+from controller import make_safety_filter
 from trainer.evaluation import evaluate_env
 from trainer.ppo_rollout import make_rollout_collector
 from trainer.reward_loss import make_reward_loss

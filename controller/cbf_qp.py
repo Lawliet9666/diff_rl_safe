@@ -1,4 +1,4 @@
-"""CPU OSQP safety filters for robot CBF constraints."""
+"""Shared CBF-QP execution filter with OSQP and batched JAX backends."""
 from typing import NamedTuple
 from dataclasses import dataclass
 from functools import partial
@@ -6,22 +6,75 @@ import math
 
 import jax
 import jax.numpy as jnp
+import jax.scipy.linalg as jsp_linalg
 import numpy as np
 import osqp
 from scipy import sparse
 
-from env.robots.base import check_obstacle_shapes
+from env.robots.base import Obstacles, check_obstacle_shapes
+from env.robots import (DoubleIntegratorRobot, HumanoidRobot, QuadrotorRobot,
+                        SingleIntegratorRobot)
+from solver.jax_qpth.qp import solve_qp as solve_jax_qp
+
+
+class _TrackingQP(NamedTuple):
+    q: object
+    p: object
+    g: object
+    h: object
+
+
+def _assemble_qp(nominal, A, b, low, high, weights, output_matrix, *,
+                         soft_indices, slack_weight, xp):
+    """Build 0.5*z.T@q@z+p.T@z subject to g@z<=h.
+
+    The physical variable is z=[u, delta]. Only soft_indices receive nonnegative
+    slacks; all other constraints and input bounds stay hard. Leading dimensions
+    are batches. Backend-specific conditioning and solving remain with callers.
+    """
+    nominal = xp.asarray(nominal)
+    dtype, leading = nominal.dtype, nominal.shape[:-1]
+    dim, rows = nominal.shape[-1], A.shape[-2]
+    indices = xp.asarray(soft_indices, dtype=int)
+    count = indices.shape[0]
+    zeros = lambda *shape: xp.zeros(leading+shape, dtype=dtype)
+    batch = lambda value: xp.broadcast_to(value, leading+value.shape)
+    matrix = xp.asarray(output_matrix, dtype=dtype)
+    weights = xp.asarray(weights, dtype=dtype)
+    tracking = xp.swapaxes(matrix, -1, -2) @ (weights[..., :, None]*matrix)
+    tracking = xp.broadcast_to(tracking, leading+(dim, dim))
+    slack_eye = batch(xp.eye(count, dtype=dtype))
+    q = xp.concatenate([
+        xp.concatenate([tracking, zeros(dim, count)], axis=-1),
+        xp.concatenate([zeros(count, dim), slack_weight*slack_eye], axis=-1),
+    ], axis=-2)
+    p = xp.concatenate([-(tracking @ nominal[..., None])[..., 0], zeros(count)], axis=-1)
+    soft_columns = batch(xp.eye(rows, dtype=dtype)[:, indices])
+    constraints = xp.concatenate([-xp.asarray(A, dtype=dtype), -soft_columns], axis=-1)
+    eye = batch(xp.eye(dim, dtype=dtype))
+    lower = xp.concatenate([-eye, zeros(dim, count)], axis=-1)
+    upper = xp.concatenate([eye, zeros(dim, count)], axis=-1)
+    nonnegative = xp.concatenate([zeros(count, dim), -slack_eye], axis=-1)
+    g = xp.concatenate([constraints, lower, upper, nonnegative], axis=-2)
+    low = xp.broadcast_to(xp.asarray(low, dtype=dtype), leading+(dim,))
+    high = xp.broadcast_to(xp.asarray(high, dtype=dtype), leading+(dim,))
+    h = xp.concatenate([xp.asarray(b, dtype=dtype), -low, high, zeros(count)], axis=-1)
+    return _TrackingQP(q, p, g, h)
+
+
+def _nearest_obstacle_ids(position, obstacles, top_k):
+    distance = jnp.linalg.norm(obstacles.centers-position[..., None, :], axis=-1)
+    count = obstacles.mask.shape[-1] if top_k is None else min(top_k, obstacles.mask.shape[-1])
+    return jax.lax.top_k(-jnp.where(obstacles.mask > .5, distance, jnp.inf), count)[1]
 
 
 def select_obstacles(position, obstacles, top_k):
-    """Select nearest obstacles without changing scene indices or array shapes."""
+    """Select nearest obstacles without changing the single-scene array shapes."""
     if top_k is None:
         return obstacles
     if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
         raise ValueError("controller.qp_obs_top_k must be null or a positive integer")
-    distance = jnp.linalg.norm(obstacles.centers-position, axis=1)
-    _, indices = jax.lax.top_k(-jnp.where(obstacles.mask > .5, distance, jnp.inf),
-                              min(top_k, obstacles.mask.size))
+    indices = _nearest_obstacle_ids(position, obstacles, top_k)
     mask = jnp.zeros_like(obstacles.mask).at[indices].set(obstacles.mask[indices])
     return obstacles._replace(mask=mask)
 
@@ -59,7 +112,8 @@ class ControlResult(NamedTuple):
     iterations: int
 
 
-def _tracking_qp_data(nominal, constraints, low, high, weights, output_matrix):
+def _tracking_qp_data(nominal, constraints, low, high, weights, output_matrix, *,
+                      soft_indices=(), slack_weight=0.0):
     """Validate and scale the physical tracking QP."""
     if not jax.config.x64_enabled:
         raise ValueError("CBF-QP requires JAX_ENABLE_X64=true before importing JAX")
@@ -81,13 +135,20 @@ def _tracking_qp_data(nominal, constraints, low, high, weights, output_matrix):
     if (not all(np.isfinite(x).all() for x in (nominal, low, high, weights, M, cbf_A, cbf_b, domain))
             or np.any(weights <= 0) or np.any(low > high)):
         raise ValueError("QP data must be finite, with positive weights and ordered bounds")
-    MS = M*scale[None, :]
-    P = MS.T @ (weights[:, None]*MS)
-    return nominal, low, high, cbf_A, cbf_b, P, scale
+    data = _assemble_qp(nominal, cbf_A, cbf_b, low, high, weights, M,
+                                soft_indices=soft_indices, slack_weight=slack_weight, xp=np)
+    count = len(soft_indices)
+    if count:
+        scale = np.concatenate([scale, np.full(count, 1./math.sqrt(slack_weight))])
+        nominal = np.concatenate([nominal, np.zeros(count)])
+    return nominal, data, scale
 
 
-def _solve_qp_data(nominal, A, b, P, scale, domain, solver):
-    """Solve the scaled QP and check feasibility/KKT residuals."""
+def _solve_qp_data(nominal, data, scale, domain, solver):
+    """Condition and solve the shared physical QP with CPU OSQP."""
+    A, b = -data.g, data.h
+    P = scale[:, None]*data.q*scale[None, :]
+    q = data.p*scale
     tolerance = solver.feasibility_tolerance
     d = nominal.size
     try:
@@ -98,7 +159,6 @@ def _solve_qp_data(nominal, A, b, P, scale, domain, solver):
     row_scale = np.maximum(np.linalg.norm(scaled_A, axis=1), 1.0)
     C = scaled_A / row_scale[:, None]
     lower = -b / row_scale
-    q = -P @ (nominal/scale)
     problem = osqp.OSQP()
     try:
         problem.setup(P=sparse.csc_matrix(np.triu(P)), q=q,
@@ -145,64 +205,41 @@ def _solve_qp_data(nominal, A, b, P, scale, domain, solver):
                         status, int(result.info.iter))
 
 
-def solve_qp(nominal, constraints, low, high, weights, *,
-             output_matrix, solver=SolverConfig()):
-    """Minimize 0.5*||M@(u-nominal)||_W^2 with hard constraints (CPU OSQP)."""
-    nominal, low, high, cbf_A, cbf_b, P, scale = _tracking_qp_data(
-        nominal, constraints, low, high, weights, output_matrix)
-    d = nominal.size
-    A = np.concatenate([cbf_A, np.eye(d), -np.eye(d)])
-    b = np.concatenate([cbf_b, -low, high])
-    return _solve_qp_data(nominal, A, b, P, scale, constraints.domain, solver)
-
-
 def validate_slack_weight(weight):
     if (isinstance(weight, bool) or not isinstance(weight, (int, float))
             or not math.isfinite(weight) or weight < 0):
         raise ValueError("controller.slack_weight must be finite and nonnegative")
 
 
-def solve_slack_qp(nominal, constraints, low, high, weights, *, soft_mask,
-                   slack_weight, output_matrix, solver=SolverConfig()):
-    """CPU QP with cost 0.5*||M@(u-nominal)||_W^2 + rho/2*||delta||^2.
+def solve_qp(nominal, constraints, low, high, weights, *, output_matrix,
+             solver=SolverConfig(), slack_weight=0.0, soft_mask=None):
+    """Solve the CPU tracking QP and return (ControlResult, per-row slack).
 
-    Only soft_mask rows receive slacks, in constraint order.
-    residual excludes slack; valid checks the relaxed QP."""
+    Zero slack_weight keeps every constraint hard. A positive weight requires
+    soft_mask and relaxes only its selected rows. Residuals exclude slack;
+    validity checks the relaxed QP.
+    """
     validate_slack_weight(slack_weight)
+    n, d = np.shape(constraints.A)
+    ids = ()
+    if slack_weight > 0:
+        mask = np.asarray(soft_mask)
+        if mask.shape != (n,) or not np.isfinite(mask).all():
+            raise ValueError("soft_mask must be a finite vector with one entry per CBF row")
+        ids = np.flatnonzero(mask > .5)
+    augmented_nominal, data, scale = _tracking_qp_data(
+        nominal, constraints, low, high, weights, output_matrix,
+        soft_indices=ids, slack_weight=slack_weight)
+    augmented = _solve_qp_data(augmented_nominal, data, scale, constraints.domain, solver)
     if slack_weight == 0:
-        raise ValueError("solve_slack_qp requires a positive slack_weight")
-    nominal, low, high, cbf_A, cbf_b, tracking_P, control_scale = _tracking_qp_data(
-        nominal, constraints, low, high, weights, output_matrix)
-    n, d = cbf_A.shape
-    mask = np.asarray(soft_mask)
-    if mask.shape != (n,) or not np.isfinite(mask).all():
-        raise ValueError("soft_mask must be a finite vector with one entry per CBF row")
-    ids = np.flatnonzero(mask > .5)
-    k = len(ids)
-    E = np.zeros((n, k))
-    E[ids, np.arange(k)] = 1.
-    A = np.block([
-        [cbf_A, E],
-        [np.eye(d), np.zeros((d, k))],
-        [-np.eye(d), np.zeros((d, k))],
-        [np.zeros((k, d)), np.eye(k)],
-    ])
-    b = np.concatenate([cbf_b, -low, high, np.zeros(k)])
-    # delta = z_delta/sqrt(rho) conditions the cost.
-    scale = np.concatenate([control_scale, np.full(k, 1./math.sqrt(slack_weight))])
-    P = np.zeros((d+k, d+k))
-    P[:d, :d] = tracking_P
-    P[d:, d:] = np.eye(k)
-    augmented = _solve_qp_data(
-        np.concatenate([nominal, np.zeros(k)]), A, b, P, scale,
-        constraints.domain, solver)
+        return augmented, jnp.zeros(n, dtype=augmented.candidate.dtype)
     candidate = augmented.candidate[:d]
     raw = jnp.concatenate([
-        jnp.asarray(cbf_A)@candidate+jnp.asarray(cbf_b),
+        jnp.asarray(constraints.A)@candidate+jnp.asarray(constraints.b),
         candidate-jnp.asarray(low), jnp.asarray(high)-candidate])
     result = augmented._replace(
         action=augmented.action[:d], candidate=candidate, residual=raw,
-        correction_norm=float(np.linalg.norm(np.asarray(candidate)-nominal)))
+        correction_norm=float(np.linalg.norm(np.asarray(candidate)-np.asarray(nominal))))
     slack = jnp.zeros(n, dtype=candidate.dtype).at[ids].set(augmented.candidate[d:])
     return result, slack
 
@@ -212,9 +249,10 @@ def _control_output_matrix(robot, state):
     return robot.control_output_matrix(state)
 
 
-@partial(jax.jit, static_argnames=("robot",))
-def _controller_constraints(robot, state, obstacles, dt):
-    return robot.control_constraints(state, obstacles, dt)
+@partial(jax.jit, static_argnames=("robot", "speed_facets"))
+def _controller_constraints(robot, state, obstacles, dt, speed_facets=16):
+    kwargs = dict(speed_facets=speed_facets) if isinstance(robot, SingleIntegratorRobot) else {}
+    return robot.control_constraints(state, obstacles, dt, **kwargs)
 
 
 def control_residual(robot, state, action, obstacles, dt):
@@ -241,32 +279,6 @@ def _validate_controller_inputs(robot, state, nominal, obstacles, dt):
         raise ValueError("obstacle radii must be nonnegative")
 
 
-def _solve_controller_qp(robot, state, nominal, obstacles, dt, *, solver, slack_weight):
-    robot.validate_cbf_domain(state, obstacles)
-    low, high = robot.input_bounds()
-    constraints = _controller_constraints(robot, state, obstacles, dt)
-    weights = jnp.asarray(robot.weights)
-    options = dict(solver=solver,
-                   output_matrix=_control_output_matrix(robot, state))
-    if slack_weight == 0:
-        result = solve_qp(nominal, constraints, low, high, weights, **options)
-        return result, jnp.zeros_like(obstacles.mask)
-    # Leading rows are obstacles; appended state/speed constraints stay hard.
-    soft_mask = jnp.pad(obstacles.mask, (0, constraints.A.shape[0]-obstacles.mask.size))
-    result, slack = solve_slack_qp(nominal, constraints, low, high, weights,
-                                 soft_mask=soft_mask, slack_weight=slack_weight, **options)
-    # An infeasibility certificate is not a slack solution for the held input.
-    applied_slack = slack[:obstacles.mask.size] if result.valid else jnp.zeros_like(obstacles.mask)
-    return result, applied_slack
-
-
-def solve_cbf_qp(robot, state, nominal, obstacles, dt, *, solver=SolverConfig()):
-    _validate_controller_inputs(robot, state, nominal, obstacles, dt)
-    result, _ = _solve_controller_qp(robot, state, nominal, obstacles, dt,
-                                     solver=solver, slack_weight=0.0)
-    return result
-
-
 def warmup_controller(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None):
     """Compile CBF/output computations without solving a QP."""
     _validate_controller_inputs(robot, state, nominal, obstacles, dt)
@@ -276,17 +288,140 @@ def warmup_controller(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None
                            _control_output_matrix(robot, state)))
 
 
-def generate_action(robot, state, nominal, obstacles, dt, *, solver=SolverConfig(),
-                    slack_weight=0.0, qp_obs_top_k=None):
-    """Non-differentiable CPU OSQP filter for a nominal physical input [control_dim].
+def _jax_qp_data(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None,
+                 slack_weight=0.0, speed_facets=16):
+    """Assemble the physical projection; whiten variables for mixed input units."""
+    ids = _nearest_obstacle_ids(state[..., :2], obstacles, qp_obs_top_k)
+    batch = jnp.arange(state.shape[0])[:, None]
+    obstacles = jax.tree_util.tree_map(lambda value: value[batch, ids], obstacles)
+    x = state.astype(jnp.float64)
+    obstacles = jax.tree_util.tree_map(lambda value: value.astype(jnp.float64), obstacles)
+    constraints = jax.vmap(lambda x, obs: _controller_constraints(
+        robot, x, obs, dt, speed_facets))(x, obstacles)
+    dim = robot.control_dim
+    slack_dim = obstacles.mask.shape[-1] if slack_weight > 0 else 0
+    matrices = jax.vmap(robot.control_output_matrix)(x)
+    low, high = robot.input_bounds()
+    q, p, g, h = _assemble_qp(
+        nominal.astype(jnp.float64), constraints.A, constraints.b, low, high,
+        jnp.asarray(robot.weights, jnp.float64), matrices,
+        soft_indices=jnp.arange(slack_dim), slack_weight=slack_weight, xp=jnp)
+    total = dim+slack_dim
+    transform = jsp_linalg.solve_triangular(
+        jnp.swapaxes(jnp.linalg.cholesky(q), 1, 2),
+        jnp.broadcast_to(jnp.eye(total), q.shape), lower=False)
+    scaled_q = jnp.swapaxes(transform, 1, 2) @ q @ transform
+    scaled_p = (jnp.swapaxes(transform, 1, 2) @ p[..., None]).squeeze(-1)
+    scaled_g = g @ transform
+    scale = jnp.maximum(jnp.linalg.norm(scaled_g, axis=-1), 1.)
+    return dict(q=scaled_q, p=scaled_p, g=scaled_g/scale[..., None], h=h/scale,
+                transform=transform, raw_g=g, raw_h=h, constraints=constraints,
+                ids=ids, mask=obstacles.mask)
 
-    slack_weight=0 is hard; positive weights relax active obstacle rows only.
-    Full-scene input and returned obstacle_mask retain scene ordering.
-    Numerical errors raise; infeasibility returns qp.valid=False and a NaN action."""
+
+def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
+                    solver=SolverConfig(), slack_weight=0.0, qp_obs_top_k=None,
+                    speed_facets=16, max_iter=40, eps=1.0e-12, active=None):
+    """Filter a nominal physical input using OSQP or batched JAX forward solving.
+
+    Only obstacle constraints receive slack. The JAX backend stops gradients and
+    accepts single states, batches and active masks; OSQP handles one state.
+    """
+    if backend not in {"osqp", "jax"}:
+        raise ValueError("generate_action backend must be 'osqp' or 'jax'")
+    if not math.isfinite(dt) or dt <= 0:
+        raise ValueError("generate_action dt must be positive")
     validate_slack_weight(slack_weight)
-    _validate_controller_inputs(robot, state, nominal, obstacles, dt)
-    obstacles = select_obstacles(state[:2], obstacles, qp_obs_top_k)
-    result, slack = _solve_controller_qp(robot, state, nominal, obstacles, dt,
-                                        solver=solver, slack_weight=slack_weight)
-    return result.action, {"nominal": nominal, "qp": result, "slack": slack,
-                           "obstacle_mask": obstacles.mask}
+    if qp_obs_top_k is not None and (not isinstance(qp_obs_top_k, int)
+            or isinstance(qp_obs_top_k, bool) or qp_obs_top_k <= 0):
+        raise ValueError("generate_action qp_obs_top_k must be null or a positive integer")
+    for name, value, minimum in (("speed_facets", speed_facets, 4), ("max_iter", max_iter, 1)):
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            raise ValueError(f"generate_action {name} must be an integer >= {minimum}")
+    if not math.isfinite(eps) or eps <= 0:
+        raise ValueError("generate_action eps must be finite and positive")
+    if backend == "osqp":
+        if active is not None:
+            raise ValueError("active masks require the batched JAX backend")
+        _validate_controller_inputs(robot, state, nominal, obstacles, dt)
+        obstacles = select_obstacles(state[:2], obstacles, qp_obs_top_k)
+        robot.validate_cbf_domain(state, obstacles)
+        low, high = robot.input_bounds()
+        constraints = _controller_constraints(robot, state, obstacles, dt, speed_facets)
+        # Leading obstacle rows may be softened; appended physical limits stay hard.
+        soft_mask = (jnp.pad(obstacles.mask, (0, constraints.A.shape[0]-obstacles.mask.size))
+                     if slack_weight > 0 else None)
+        result, slack = solve_qp(
+            nominal, constraints, low, high, jnp.asarray(robot.weights),
+            output_matrix=_control_output_matrix(robot, state), solver=solver,
+            slack_weight=slack_weight, soft_mask=soft_mask)
+        # An infeasibility certificate is not a slack solution for the held input.
+        slack = (slack[:obstacles.mask.size] if slack_weight > 0 and result.valid
+                 else jnp.zeros_like(obstacles.mask))
+        return result.action, {"nominal": nominal, "qp": result, "slack": slack,
+                               "obstacle_mask": obstacles.mask}
+
+    single = state.ndim == 1
+    expected = state.shape[:-1]+(robot.control_dim,)
+    if (state.ndim not in (1, 2) or state.shape[-1] != robot.state_dim
+            or nominal.shape != expected):
+        raise ValueError("nominal action must match the robot-state batch and Robot.control_dim")
+    if single:
+        state, nominal = state[None], nominal[None]
+        obstacles = jax.tree_util.tree_map(lambda value: value[None], obstacles)
+        if active is not None:
+            active = jnp.atleast_1d(active)
+    state, nominal, obstacles = jax.tree_util.tree_map(
+        jax.lax.stop_gradient, (state, nominal, obstacles))
+    if active is not None:
+        initial = robot.initial_state(jnp.zeros(3, state.dtype))
+        state = jnp.where(active[:, None], state, initial)
+        obstacles = Obstacles(
+            jnp.where(active[:, None, None], obstacles.centers, 0.),
+            jnp.where(active[:, None, None], obstacles.velocities, 0.),
+            jnp.where(active[:, None], obstacles.radii, 0.),
+            jnp.where(active[:, None], obstacles.mask, 0.))
+        nominal = jnp.where(active[:, None], nominal, 0.)
+    data = _jax_qp_data(robot, state, nominal, obstacles, dt,
+                        qp_obs_top_k=qp_obs_top_k, slack_weight=slack_weight,
+                        speed_facets=speed_facets)
+    empty = jnp.empty((0,), jnp.float64)
+    # Match BarrierNet's first-order versus high-order solver settings.
+    high_order = isinstance(robot, (DoubleIntegratorRobot, HumanoidRobot, QuadrotorRobot))
+    solution, _, dual, _ = solve_jax_qp(
+        data['q'], data['p'], data['g'], data['h'], empty, empty,
+        eps=eps, verbose=-1, notImprovedLim=max_iter if high_order else 3,
+        maxIter=max_iter, check_Q_spd=False, safe_step=high_order)
+    physical = (data['transform'] @ solution[..., None]).squeeze(-1)
+    dim = robot.control_dim
+    action = physical[:, :dim].astype(nominal.dtype)
+    slack = jnp.maximum(physical[:, dim:], 0.)
+    if slack_weight == 0:
+        slack = jnp.zeros_like(data['mask'])
+    applied_solution = jnp.concatenate([action.astype(jnp.float64), physical[:, dim:]], axis=1)
+    primal = jnp.maximum(jnp.max(
+        (data['raw_g'] @ applied_solution[..., None]).squeeze(-1)-data['raw_h'], axis=1), 0.)
+    dual_residual = jnp.max(jnp.abs(
+        (data['q'] @ solution[..., None]).squeeze(-1)+data['p']+
+        (jnp.swapaxes(data['g'], 1, 2) @ dual[..., None]).squeeze(-1)), axis=1)
+    distance = data['h']-(data['g'] @ solution[..., None]).squeeze(-1)
+    complementarity = jnp.max(jnp.abs(distance*dual), axis=1)
+    dual_feasibility = jnp.maximum(jnp.max(-dual, axis=1), 0.)
+    errors = jnp.stack([primal, dual_residual, complementarity, dual_feasibility], axis=1)
+    residual = (data['constraints'].A @ action.astype(jnp.float64)[..., None]).squeeze(-1)+data['constraints'].b
+    count = jnp.maximum(data['mask'].sum(axis=1), 1.)
+    correction = jnp.linalg.norm(action-nominal, axis=1)
+    diagnostics = {
+        'qp_ids': data['ids'], 'slack': slack, 'cbf_residual': residual[:, :data['mask'].shape[1]],
+        'filter/slack': (slack*data['mask']).sum(axis=1)/count,
+        'filter/slack_max': jnp.max(slack*data['mask'], axis=1),
+        'filter/correction': correction,
+        # Tolerances below affect diagnostic labels only.
+        'filter/intervention': (correction > 1e-5).astype(jnp.float32),
+        'filter/cbf_violation': jnp.maximum(jnp.max(-residual[:, :data['mask'].shape[1]]*data['mask'], axis=1), 0.),
+        'filter/primal_residual': primal,
+        'filter/kkt_residual': jnp.max(errors[:, 1:], axis=1),
+        'filter/initial_safe': jnp.all(data['constraints'].domain >= -1e-5, axis=1).astype(jnp.float32),
+    }
+    result = jax.tree_util.tree_map(jax.lax.stop_gradient, (action, diagnostics))
+    return jax.tree_util.tree_map(lambda value: value[0], result) if single else result

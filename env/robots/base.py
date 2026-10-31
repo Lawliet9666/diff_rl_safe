@@ -2,7 +2,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import NamedTuple
-import math
 
 from jax import Array
 import jax.numpy as jnp
@@ -66,16 +65,6 @@ def join_constraints(*blocks):
 
 
 
-def planar_speed_constraints(velocity, dt, v_max, control_dim):
-    """Hard next-step speed disk, using a 16-facet inscribed polygon."""
-    angles = jnp.arange(16, dtype=velocity.dtype)*2*jnp.pi/16
-    normals = jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)
-    bound = v_max*math.cos(math.pi/16)*(1.-1e-7)
-    margin = bound-normals@velocity
-    A = -dt*jnp.pad(normals, ((0, 0), (0, control_dim-2)))
-    return Constraints(A, margin, margin)
-
-
 def _hocbf(h, h_dot, h_ddot, dh_ddot_dx_g, h_dddot_drift, kappa):
     # psi_i = d(psi_{i-1})/dt + kappa_i*psi_{i-1}, psi_0 = h.
     kappa1, kappa2, kappa3 = kappa
@@ -115,6 +104,8 @@ def _control_parameters(section, names, label, *, selected_cbf=None):
         active = section["cbf"][selected_cbf]
         if not isinstance(active, Mapping):
             raise ValueError(f"{label}.cbf.{selected_cbf} must be a mapping")
+        collect({name: value for name, value in section["cbf"].items()
+                 if not isinstance(value, Mapping)})
         section = {**section, "cbf": active}
     collect(section)
     missing = set(names)-parameters.keys()

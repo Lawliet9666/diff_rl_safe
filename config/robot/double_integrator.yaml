@@ -18,5 +18,5 @@ goal_min_distance: 6.0  # m
 reward:
   progress_speed_scale: ${robot.v_max}  # m/s; progress clipping
   potential_factor: 3.0
-  back_factor: 0.1
-  spin_factor: 4.5
+  back_factor: 0.0
+  spin_factor: 0.0

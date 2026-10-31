@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 
 from trainer.ppo_core import flat_time_batch, _trainable_params, _with_trainable
+from env.robots.base import Obstacles
 
 
 def _topk_mask(values, qp_obs):
@@ -265,7 +266,9 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
 
             executed_action = env_action
             if safety_filter is not None:
-                executed_action, filter_diagnostics = safety_filter(state, env_action)
+                obstacles = Obstacles(state.human_positions, state.human_vels,
+                                      state.human_radii, state.human_mask)
+                executed_action, filter_diagnostics = safety_filter(state.robot_state, env_action, obstacles)
             next_state, reward, done, metrics = step_fn(env_cfg, state, executed_action, env_key)
             if has_policy_qp:
                 reward = reward - float(hparams.qp_residual_reward_weight) * qp_diagnostics["qp_slack"]

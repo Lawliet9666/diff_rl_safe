@@ -6,6 +6,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from model import make_action_fn
+from env.robots.base import Obstacles
+from controller.cbf_qp import _nearest_obstacle_ids
 
 
 DEFAULT_EVAL_SEEDS = tuple(range(100, 1001, 100))
@@ -79,7 +81,9 @@ def _make_rollout(env, module, hp, cfg, capture, safety_filter=None):
             action, diagnostics = action_fn(obs)
             ids = jnp.zeros((obs.shape[0], 0), jnp.int32)
         if safety_filter is not None:
-            action, diagnostics = safety_filter(state, action, active=active)
+            obstacles = Obstacles(state.human_positions, state.human_vels,
+                                  state.human_radii, state.human_mask)
+            action, diagnostics = safety_filter(state.robot_state, action, obstacles, active=active)
             ids = diagnostics['qp_ids']
         proposed, reward, done, metrics = step_fn(cfg, state, action, key)
         info = {name: metrics[name] for name in ("success", "collision", "min_clearance")}
@@ -117,7 +121,10 @@ def _make_rollout(env, module, hp, cfg, capture, safety_filter=None):
             ids = (module.build_qp_context(history.reshape(size, -1), hp, **(dict(robot_state=state.robot_state) if getattr(hp, "robot_state_dim", 0) else {}))["qp_topk_ids"]
                    if use_qp else jnp.zeros((size, 0), jnp.int32))
             if safety_filter is not None:
-                ids = safety_filter.select_obstacles(state)[1]
+                obstacles = Obstacles(state.human_positions, state.human_vels,
+                                      state.human_radii, state.human_mask)
+                ids = _nearest_obstacle_ids(state.robot_state[..., :2], obstacles,
+                                            safety_filter.keywords["qp_obs_top_k"])
             jax.debug.callback(capture, env.snapshot_fn(state), history, zero,
                                false, false, false, ~false, ids, zero, ordered=True)
 

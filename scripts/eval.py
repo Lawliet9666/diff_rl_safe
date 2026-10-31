@@ -434,7 +434,7 @@ class Evaluator:
         from utils import load_jax_checkpoint
         from env import make_env
         from trainer.evaluation import evaluate_env
-        from controller.safety_filter import make_safety_filter
+        from controller import make_safety_filter
 
         checkpoint = Path(checkpoint)
         params = load_jax_checkpoint(checkpoint)["params"]

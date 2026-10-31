@@ -86,12 +86,14 @@ class SingleIntegratorRobot(Robot):
         b = self.kappa[0]*h-2*jnp.sum(relative*obstacles.velocities, axis=1)
         return masked_rows(2*relative, b, h[:, None], obstacles.mask)
 
-    def control_constraints(self, state, obstacles, dt):
+    def control_constraints(self, state, obstacles, dt, *, speed_facets=16):
         """Obstacle CBFs followed by the hard inscribed speed polygon."""
         constraints = self.cbf_constraints(state, obstacles, dt)
-        angles = jnp.arange(16)*2*jnp.pi/16
+        if not isinstance(speed_facets, int) or isinstance(speed_facets, bool) or speed_facets < 4:
+            raise ValueError("speed_facets must be an integer >= 4")
+        angles = jnp.arange(speed_facets)*2*jnp.pi/speed_facets
         normals = jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)
-        bound = self.v_max*math.cos(math.pi/16)*(1.-1e-7)
+        bound = self.v_max*math.cos(math.pi/speed_facets)*(1.-1e-7)
         return constraints._replace(
             A=jnp.concatenate([constraints.A, -normals]),
-            b=jnp.concatenate([constraints.b, jnp.full(16, bound)]))
+            b=jnp.concatenate([constraints.b, jnp.full(speed_facets, bound)]))
