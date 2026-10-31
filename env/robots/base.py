@@ -141,6 +141,11 @@ class Robot(ABC):
         """Check finite values and physical state limits."""
         return jnp.all(jnp.isfinite(state))
 
+    def physical_constraints(self, state, dt):
+        """Physical CBF/input rows A@u+b >= 0, excluding componentwise bounds."""
+        return Constraints(jnp.empty((0, self.control_dim), state.dtype),
+                           jnp.empty(0, state.dtype), jnp.empty(0, state.dtype))
+
     @abstractmethod
     def input_bounds(self):
         """Return componentwise physical input bounds (lower, upper)."""

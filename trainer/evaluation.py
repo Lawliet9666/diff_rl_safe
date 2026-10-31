@@ -87,6 +87,8 @@ def _make_rollout(env, module, hp, cfg, capture, safety_filter=None):
             ids = diagnostics['qp_ids']
         proposed, reward, done, metrics = step_fn(cfg, state, action, key)
         info = {name: metrics[name] for name in ("success", "collision", "min_clearance")}
+        if "physical_state_limit" in metrics:
+            info["physical_state_limit"] = metrics["physical_state_limit"].astype(jnp.float32)
         if "physical_contact" in metrics:
             info["physical_contact"] = metrics["physical_contact"]
         for name in ("qp_slack", "alpha", "beta"):
@@ -120,7 +122,8 @@ def _make_rollout(env, module, hp, cfg, capture, safety_filter=None):
         if capture is not None:
             ids = (module.build_qp_context(history.reshape(size, -1), hp, **(dict(robot_state=state.robot_state) if getattr(hp, "robot_state_dim", 0) else {}))["qp_topk_ids"]
                    if use_qp else jnp.zeros((size, 0), jnp.int32))
-            if safety_filter is not None:
+            if (safety_filter is not None
+                    and safety_filter.keywords.get("constraint_mode", "cbf") != "physical"):
                 obstacles = Obstacles(state.human_positions, state.human_vels,
                                       state.human_radii, state.human_mask)
                 ids = _nearest_obstacle_ids(state.robot_state[..., :2], obstacles,

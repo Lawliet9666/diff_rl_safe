@@ -74,6 +74,9 @@ class DoubleIntegratorRobot(Robot):
         return (jnp.all(jnp.isfinite(state))
                 & (jnp.linalg.norm(state[2:]) <= self.v_max+tolerance))
 
+    def physical_constraints(self, state, dt):
+        return self.velocity_constraints(state)
+
     def velocity_constraints(self, state):
         """Continuous-time speed CBF; held-step speed bounds need separate checks."""
         velocity = state[2:]
@@ -115,7 +118,7 @@ class DoubleIntegratorRobot(Robot):
         b = drift + (kappa1+kappa2)*h_dot + kappa1*kappa2*h
         domain = jnp.stack([h, h_dot+kappa1*h], axis=1)
         obstacle_rows = masked_rows(A, b, domain, obstacles.mask)
-        return join_constraints(obstacle_rows, self.velocity_constraints(state))
+        return join_constraints(obstacle_rows, self.physical_constraints(state, dt))
 
     def nominal_control(self, state, goal):
         desired = goal_velocity(state[:2], goal, self.position_gain,

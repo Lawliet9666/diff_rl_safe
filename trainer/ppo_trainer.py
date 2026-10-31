@@ -608,6 +608,8 @@ class PPOTrainer:
             log_dict["charts/eval_timeout_rate"] = eval_metrics["timeout_rate"]
             log_dict["charts/eval_min_clearance"] = eval_metrics["mean_min_clearance"]
             log_dict["charts/eval_episode_length"] = eval_metrics["mean_episode_length"]
+            if "physical_state_limit" in eval_metrics:
+                log_dict["eval/physical_state_limit"] = eval_metrics["physical_state_limit"]
             if "physical_contact_rate" in eval_metrics:
                 log_dict["eval/physical_contact_rate"] = eval_metrics["physical_contact_rate"]
 

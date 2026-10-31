@@ -249,9 +249,11 @@ def _control_output_matrix(robot, state):
     return robot.control_output_matrix(state)
 
 
-@partial(jax.jit, static_argnames=("robot", "speed_facets"))
-def _controller_constraints(robot, state, obstacles, dt, speed_facets=16):
+@partial(jax.jit, static_argnames=("robot", "speed_facets", "constraint_mode"))
+def _controller_constraints(robot, state, obstacles, dt, speed_facets=16, constraint_mode="cbf"):
     kwargs = dict(speed_facets=speed_facets) if isinstance(robot, SingleIntegratorRobot) else {}
+    if constraint_mode == "physical":
+        return robot.physical_constraints(state, dt, **kwargs)
     return robot.control_constraints(state, obstacles, dt, **kwargs)
 
 
@@ -289,15 +291,20 @@ def warmup_controller(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None
 
 
 def _prepare_jax_data(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None,
-                 slack_weight=0.0, speed_facets=16):
-    """Assemble the physical projection; whiten variables for mixed input units."""
-    ids = _nearest_obstacle_ids(state[..., :2], obstacles, qp_obs_top_k)
-    batch = jnp.arange(state.shape[0])[:, None]
-    obstacles = jax.tree_util.tree_map(lambda value: value[batch, ids], obstacles)
+                 slack_weight=0.0, speed_facets=16, constraint_mode="cbf"):
+    """Assemble one fixed-CBF QP; whiten variables for mixed input units."""
     x = state.astype(jnp.float64)
-    obstacles = jax.tree_util.tree_map(lambda value: value.astype(jnp.float64), obstacles)
-    constraints = jax.vmap(lambda x, obs: _controller_constraints(
-        robot, x, obs, dt, speed_facets))(x, obstacles)
+    if constraint_mode == "physical":
+        ids = jnp.empty((state.shape[0], 0), jnp.int32)
+        constraints = jax.vmap(lambda x: _controller_constraints(
+            robot, x, None, dt, speed_facets, constraint_mode))(x)
+    else:
+        ids = _nearest_obstacle_ids(state[..., :2], obstacles, qp_obs_top_k)
+        batch = jnp.arange(state.shape[0])[:, None]
+        obstacles = jax.tree_util.tree_map(lambda value: value[batch, ids], obstacles)
+        obstacles = jax.tree_util.tree_map(lambda value: value.astype(jnp.float64), obstacles)
+        constraints = jax.vmap(lambda x, obs: _controller_constraints(
+            robot, x, obs, dt, speed_facets))(x, obstacles)
     dim = robot.control_dim
     slack_dim = obstacles.mask.shape[-1] if slack_weight > 0 else 0
     matrices = jax.vmap(robot.control_output_matrix)(x)
@@ -321,11 +328,14 @@ def _prepare_jax_data(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None
 
 def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
                     solver=SolverConfig(), slack_weight=0.0, qp_obs_top_k=None,
-                    speed_facets=16, max_iter=40, eps=1.0e-12, active=None):
+                    speed_facets=16, max_iter=40, eps=1.0e-12, active=None,
+                    constraint_mode="cbf"):
     """Filter a nominal physical input using OSQP or batched JAX forward solving.
 
     Only obstacle constraints receive slack. The JAX backend stops gradients and
     accepts single states, batches and active masks; OSQP handles one state.
+    Physical mode solves only the existing physical CBFs and input limits once.
+    Discrete state-limit violations are reported by the environment.
     """
     if backend not in {"osqp", "jax"}:
         raise ValueError("generate_action backend must be 'osqp' or 'jax'")
@@ -340,6 +350,11 @@ def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
             raise ValueError(f"generate_action {name} must be an integer >= {minimum}")
     if not math.isfinite(eps) or eps <= 0:
         raise ValueError("generate_action eps must be finite and positive")
+    if constraint_mode not in {"cbf", "physical"}:
+        raise ValueError("constraint_mode must be 'cbf' or 'physical'")
+    if constraint_mode == "physical":
+        if backend != "jax" or slack_weight != 0.:
+            raise ValueError("physical-only projection requires the JAX backend and no slack")
     if backend == "osqp":
         if active is not None:
             raise ValueError("active masks require the batched JAX backend")
@@ -368,9 +383,16 @@ def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
         raise ValueError("nominal action must match the robot-state batch and Robot.control_dim")
     if single:
         state, nominal = state[None], nominal[None]
-        obstacles = jax.tree_util.tree_map(lambda value: value[None], obstacles)
+        if constraint_mode == "cbf":
+            obstacles = jax.tree_util.tree_map(lambda value: value[None], obstacles)
         if active is not None:
             active = jnp.atleast_1d(active)
+    if constraint_mode == "physical":
+        empty = jnp.empty((state.shape[0], 0), state.dtype)
+        vectors = jnp.empty((state.shape[0], 0, 2), state.dtype)
+        obstacles = Obstacles(vectors, vectors, empty, empty)
+        if active is not None and active.shape != state.shape[:1]:
+            raise ValueError("active must match the robot-state batch")
     state, nominal, obstacles = jax.tree_util.tree_map(
         jax.lax.stop_gradient, (state, nominal, obstacles))
     if active is not None:
@@ -384,10 +406,10 @@ def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
         nominal = jnp.where(active[:, None], nominal, 0.)
     data = _prepare_jax_data(robot, state, nominal, obstacles, dt,
                         qp_obs_top_k=qp_obs_top_k, slack_weight=slack_weight,
-                        speed_facets=speed_facets)
+                        speed_facets=speed_facets, constraint_mode=constraint_mode)
     empty = jnp.empty((0,), jnp.float64)
     # Match BarrierNet's first-order versus high-order solver settings.
-    high_order = isinstance(robot, (DoubleIntegratorRobot, HumanoidRobot, QuadrotorRobot))
+    high_order = constraint_mode == "physical" or isinstance(robot, (DoubleIntegratorRobot, HumanoidRobot, QuadrotorRobot))
     solution, _, dual, _ = solve_jax_qp(
         data['q'], data['p'], data['g'], data['h'], empty, empty,
         eps=eps, verbose=-1, notImprovedLim=max_iter if high_order else 3,
@@ -409,19 +431,40 @@ def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
     dual_feasibility = jnp.maximum(jnp.max(-dual, axis=1), 0.)
     errors = jnp.stack([primal, dual_residual, complementarity, dual_feasibility], axis=1)
     residual = (data['constraints'].A @ action.astype(jnp.float64)[..., None]).squeeze(-1)+data['constraints'].b
-    count = jnp.maximum(data['mask'].sum(axis=1), 1.)
     correction = jnp.linalg.norm(action-nominal, axis=1)
-    diagnostics = {
-        'qp_ids': data['ids'], 'slack': slack, 'cbf_residual': residual[:, :data['mask'].shape[1]],
-        'filter/slack': (slack*data['mask']).sum(axis=1)/count,
-        'filter/slack_max': jnp.max(slack*data['mask'], axis=1),
-        'filter/correction': correction,
-        # Tolerances below affect diagnostic labels only.
-        'filter/intervention': (correction > 1e-5).astype(jnp.float32),
-        'filter/cbf_violation': jnp.maximum(jnp.max(-residual[:, :data['mask'].shape[1]]*data['mask'], axis=1), 0.),
-        'filter/primal_residual': primal,
-        'filter/kkt_residual': jnp.max(errors[:, 1:], axis=1),
-        'filter/initial_safe': jnp.all(data['constraints'].domain >= -1e-5, axis=1).astype(jnp.float32),
-    }
+    if constraint_mode == "physical":
+        valid = (jnp.all(jnp.isfinite(state), axis=1) & jnp.all(jnp.isfinite(nominal), axis=1)
+                 & jnp.all(jnp.isfinite(errors), axis=1) & (jnp.max(errors, axis=1) <= 1e-6))
+        def fail(_):
+            def raise_failure(ok, residuals):
+                failed = np.flatnonzero(~np.asarray(ok)).tolist()
+                raise RuntimeError(f"Physical CBF-QP failed for batch rows {failed}; "
+                                   f"KKT residuals={np.asarray(residuals).tolist()}")
+            jax.debug.callback(raise_failure, valid, errors, ordered=True)
+            return 0
+        jax.lax.cond(jnp.all(valid), lambda _: 0, fail, None)
+        diagnostics = {
+            'qp_ids': data['ids'],
+            'filter/correction': correction,
+            'filter/intervention': (correction > 1e-5).astype(jnp.float32),
+            'filter/primal_residual': primal,
+            'filter/kkt_residual': jnp.max(errors[:, 1:], axis=1),
+            'filter/physical_cbf_violation': jnp.max(-residual, axis=1, initial=0.),
+            'filter/initial_safe': jnp.all(data['constraints'].domain >= -1e-5, axis=1).astype(jnp.float32),
+        }
+    else:
+        count = jnp.maximum(data['mask'].sum(axis=1), 1.)
+        diagnostics = {
+            'qp_ids': data['ids'], 'slack': slack, 'cbf_residual': residual[:, :data['mask'].shape[1]],
+            'filter/slack': (slack*data['mask']).sum(axis=1)/count,
+            'filter/slack_max': jnp.max(slack*data['mask'], axis=1),
+            'filter/correction': correction,
+            # Tolerances below affect diagnostic labels only.
+            'filter/intervention': (correction > 1e-5).astype(jnp.float32),
+            'filter/cbf_violation': jnp.maximum(jnp.max(-residual[:, :data['mask'].shape[1]]*data['mask'], axis=1), 0.),
+            'filter/primal_residual': primal,
+            'filter/kkt_residual': jnp.max(errors[:, 1:], axis=1),
+            'filter/initial_safe': jnp.all(data['constraints'].domain >= -1e-5, axis=1).astype(jnp.float32),
+        }
     result = jax.tree_util.tree_map(jax.lax.stop_gradient, (action, diagnostics))
     return jax.tree_util.tree_map(lambda value: value[0], result) if single else result

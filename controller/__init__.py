@@ -51,7 +51,12 @@ def make_safety_filter(config, env_cfg):
     section = config.trainer.safety_filter
     if not isinstance(section.enabled, bool):
         raise ValueError("trainer.safety_filter.enabled must be true or false")
-    if not section.enabled:
+    physical = config.trainer.physical_limits
+    if not isinstance(physical.enabled, bool):
+        raise ValueError("trainer.physical_limits.enabled must be true or false")
+    if section.enabled and physical.enabled:
+        raise ValueError("enable either physical_limits or safety_filter, not both")
+    if not (section.enabled or physical.enabled):
         return None
     if config.model.type not in {"ppo_mlp", "ppo_gnn"}:
         raise ValueError("external safety filter requires PPO-MLP or PPO-GNN; policy QP layers remain separate")
@@ -60,6 +65,9 @@ def make_safety_filter(config, env_cfg):
         raise ValueError("external safety filter currently requires the JAX environment")
     if not jax.config.x64_enabled:
         raise ValueError("external safety filter requires JAX_ENABLE_X64=true")
+    if physical.enabled:
+        return partial(generate_action, env_cfg.robot, dt=env_cfg.dt, backend="jax",
+                       constraint_mode="physical")
     if config.robot.type == 'humanoid' and env_cfg.robot.barrier != 'distance':
         raise ValueError("SF-PPO humanoid requires the distance HOCBF")
     top_k = section.qp_obs_top_k

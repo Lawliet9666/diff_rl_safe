@@ -142,6 +142,9 @@ class HumanoidRobot(Robot):
         return (jnp.all(jnp.isfinite(state))
                 & (jnp.linalg.norm(state[3:5]) <= self.v_max+tolerance))
 
+    def physical_constraints(self, state, dt):
+        return self.velocity_constraints(state)
+
     def velocity_constraints(self, state):
         """Continuous-time speed CBF; held-step speed bounds need separate checks."""
         velocity = state[3:5]
@@ -218,7 +221,7 @@ class HumanoidRobot(Robot):
         else:
             raise ValueError("humanoid barrier must be distance or parabolic")
         obstacle_rows = masked_rows(A, b, domain, obstacles.mask)
-        return join_constraints(obstacle_rows, self.velocity_constraints(state))
+        return join_constraints(obstacle_rows, self.physical_constraints(state, dt))
 
     def nominal_control(self, state, goal):
         delta = goal-state[:2]

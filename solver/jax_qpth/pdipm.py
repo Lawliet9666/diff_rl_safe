@@ -159,10 +159,11 @@ def forward(Q, p, G, h, A, b, eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20
         -b if neq > 0 else jnp.zeros((n_batch, 0), dtype=dtype),
     )
 
+    # Interior-point ratios require strictly positive slack and dual variables.
     min_s = jnp.min(s0, axis=1, keepdims=True)
-    s0 = jnp.where(min_s < 0.0, s0 - min_s + 1.0, s0)
+    s0 = jnp.where(min_s <= 0.0, s0 - min_s + 1.0, s0)
     min_z = jnp.min(z0, axis=1, keepdims=True)
-    z0 = jnp.where(min_z < 0.0, z0 - min_z + 1.0, z0)
+    z0 = jnp.where(min_z <= 0.0, z0 - min_z + 1.0, z0)
 
     initial_carry = (
         x0,

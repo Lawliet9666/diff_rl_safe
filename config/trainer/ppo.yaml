@@ -32,6 +32,10 @@ eval_freq_timesteps: 0
 eval_episodes: 20
 max_checkpoints: 10
 
+# Existing physical CBFs/input limits only; one QP per PPO action, no obstacles.
+physical_limits:
+  enabled: false
+
 # External fixed-CBF filter for ordinary PPO; also enabled during evaluation.
 safety_filter:
   enabled: false

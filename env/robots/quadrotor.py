@@ -214,6 +214,15 @@ class QuadrotorRobot(Robot):
                              jnp.array([0., 0., 0., -1.])])
         return h, dh_dx_g
 
+    def physical_constraints(self, state, dt):
+        """Existing altitude, tilt, thrust and speed CBFs, without obstacles."""
+        altitude = _hocbf(*self.altitude_barrier(state), kappa=self.kappa)
+        h, dh_dx_g = self.state_barriers(state)
+        b = jnp.array([self.kappa_tilt*h[0], self.kappa_thrust*h[1],
+                       self.kappa_thrust*h[2]])
+        return join_constraints(altitude, Constraints(dh_dx_g, b, h),
+                                self.speed_constraints(state))
+
     @partial(jax.jit, static_argnames=("self",))
     def cbf_constraints(self, state, obstacles, dt, *, kappa=None, r_safe=None):
         """Obstacle, altitude, speed, tilt and thrust constraints."""
@@ -221,12 +230,7 @@ class QuadrotorRobot(Robot):
         rates = self.kappa if kappa is None else jnp.moveaxis(kappa, -1, 0)
         obs = _hocbf(*self.barrier(state, obstacles, r_safe=r_safe), kappa=rates)
         obs = masked_rows(obs.A, obs.b, obs.domain.reshape((-1, 3)), obstacles.mask)
-        altitude = _hocbf(*self.altitude_barrier(state), kappa=self.kappa)
-        h, dh_dx_g = self.state_barriers(state)
-        b = jnp.array([self.kappa_tilt*h[0], self.kappa_thrust*h[1],
-                       self.kappa_thrust*h[2]])
-        return join_constraints(obs, altitude, Constraints(dh_dx_g, b, h),
-                                self.speed_constraints(state))
+        return join_constraints(obs, self.physical_constraints(state, dt))
 
     def nominal_control(self, state, goal):
         """Goal-tracking reference before safety filtering."""

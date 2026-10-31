@@ -353,6 +353,8 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
                 truncated = metrics.get("truncated", metrics["timeout"])
                 terminated = metrics.get("terminated", jnp.where(truncated > 0.5, 0.0, done))
                 transition.update(terminated=terminated, truncated=truncated, next_values=final_value)
+            if "physical_state_limit" in metrics:
+                transition["control/physical_state_limit"] = metrics["physical_state_limit"].astype(jnp.float32)
             if "physical_contact" in metrics:
                 transition["control/physical_contact"] = metrics["physical_contact"]
             return (next_state, next_history, next_ppo_returns, key), transition

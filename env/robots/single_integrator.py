@@ -5,7 +5,7 @@ from typing import ClassVar
 
 import jax.numpy as jnp
 
-from .base import (Robot, RobotStep, check_obstacle_shapes, masked_rows,
+from .base import (Robot, RobotStep, Constraints, join_constraints, check_obstacle_shapes, masked_rows,
                    goal_velocity, _control_parameters)
 
 
@@ -86,14 +86,16 @@ class SingleIntegratorRobot(Robot):
         b = self.kappa[0]*h-2*jnp.sum(relative*obstacles.velocities, axis=1)
         return masked_rows(2*relative, b, h[:, None], obstacles.mask)
 
-    def control_constraints(self, state, obstacles, dt, *, speed_facets=16):
-        """Obstacle CBFs followed by the hard inscribed speed polygon."""
-        constraints = self.cbf_constraints(state, obstacles, dt)
+    def physical_constraints(self, state, dt, *, speed_facets=16):
+        """Hard inscribed speed polygon, shared with the obstacle controller."""
         if not isinstance(speed_facets, int) or isinstance(speed_facets, bool) or speed_facets < 4:
             raise ValueError("speed_facets must be an integer >= 4")
         angles = jnp.arange(speed_facets)*2*jnp.pi/speed_facets
         normals = jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)
         bound = self.v_max*math.cos(math.pi/speed_facets)*(1.-1e-7)
-        return constraints._replace(
-            A=jnp.concatenate([constraints.A, -normals]),
-            b=jnp.concatenate([constraints.b, jnp.full(speed_facets, bound)]))
+        return Constraints(-normals, jnp.full(speed_facets, bound), jnp.empty(0, state.dtype))
+
+    def control_constraints(self, state, obstacles, dt, *, speed_facets=16):
+        """Obstacle CBFs followed by the hard inscribed speed polygon."""
+        return join_constraints(self.cbf_constraints(state, obstacles, dt),
+            self.physical_constraints(state, dt, speed_facets=speed_facets))
