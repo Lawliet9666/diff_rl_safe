@@ -210,11 +210,17 @@ def _collect_reward_windows(body, initial, params, value_fn, loss_fn, horizon, s
 
 
 def _cbf_reward(proposed, filtered, diagnostics, sigma):
-    """CBF-RL Eqs. (22)-(23), averaging raw residuals over active obstacle rows."""
+    """CBF-RL shaping using the active obstacle with minimum surface clearance."""
     mask = diagnostics["obstacle_mask"]
     residual = diagnostics["proposed_cbf_residual"]
-    violation = jnp.sum(jnp.where(mask > 0, jnp.minimum(residual, 0.) * mask, 0.), axis=-1)
-    violation = violation / jnp.maximum(mask.sum(axis=-1), 1.)
+    clearance = diagnostics["obstacle_clearance"]
+    if residual.shape[-1] == 0:
+        violation = jnp.zeros(residual.shape[:-1], dtype=residual.dtype)
+    else:
+        active = mask > 0.5
+        index = jnp.argmin(jnp.where(active, clearance, jnp.inf), axis=-1)
+        selected = jnp.take_along_axis(residual, index[..., None], axis=-1)[..., 0]
+        violation = jnp.where(jnp.any(active, axis=-1), jnp.minimum(selected, 0.), 0.)
     correction = jnp.expm1(-jnp.sum(jnp.square(proposed-filtered), axis=-1) / sigma**2)
     return jax.tree_util.tree_map(lambda value: jax.lax.stop_gradient(value.astype(jnp.float32)), {
         "cbf_rl/violation": violation,

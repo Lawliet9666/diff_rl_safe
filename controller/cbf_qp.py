@@ -13,7 +13,7 @@ from scipy import sparse
 
 from env.robots.base import Obstacles, check_obstacle_shapes
 from env.robots import (DoubleIntegratorRobot, HumanoidRobot, QuadrotorRobot,
-                        SingleIntegratorRobot)
+                        SingleIntegratorRobot, UnicycleRobot)
 from solver.jax_qpth.qp import (solve_qp as solve_jax_qp, qp_residuals,
                                check_qp_residuals)
 
@@ -295,6 +295,7 @@ def _prepare_jax_data(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None
     x = state.astype(jnp.float64)
     if constraint_mode == "physical":
         ids = jnp.empty((state.shape[0], 0), jnp.int32)
+        clearance = jnp.empty((state.shape[0], 0), jnp.float64)
         constraints = jax.vmap(lambda x: _controller_constraints(
             robot, x, None, dt, speed_facets, constraint_mode))(x)
     else:
@@ -302,6 +303,15 @@ def _prepare_jax_data(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None
         batch = jnp.arange(state.shape[0])[:, None]
         obstacles = jax.tree_util.tree_map(lambda value: value[batch, ids], obstacles)
         obstacles = jax.tree_util.tree_map(lambda value: value.astype(jnp.float64), obstacles)
+        # Match the existing distance-CBF geometry, including the unicycle's
+        # lookahead point and its inflated obstacle radius.
+        position = x[:, :2]
+        radius = robot.radius + obstacles.radii + robot.margin
+        if isinstance(robot, UnicycleRobot):
+            heading = jnp.stack((jnp.cos(x[:, 2]), jnp.sin(x[:, 2])), axis=-1)
+            position = position + robot.lookahead * heading
+            radius = radius + robot.lookahead
+        clearance = jnp.linalg.norm(position[:, None, :] - obstacles.centers, axis=-1) - radius
         constraints = jax.vmap(lambda x, obs: _controller_constraints(
             robot, x, obs, dt, speed_facets))(x, obstacles)
     dim = robot.control_dim
@@ -323,7 +333,7 @@ def _prepare_jax_data(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None
     return dict(q=scaled_q, p=scaled_p, g=scaled_g/scale[..., None], h=h/scale,
                 transform=transform, row_scale=scale, raw_q=q, raw_p=p,
                 raw_g=g, raw_h=h, constraints=constraints,
-                ids=ids, mask=obstacles.mask)
+                ids=ids, mask=obstacles.mask, clearance=clearance)
 
 
 def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
@@ -448,6 +458,7 @@ def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
                 @ nominal.astype(jnp.float64)[..., None]).squeeze(-1)
                 + data['constraints'].b[:, :data['mask'].shape[1]]),
             'obstacle_mask': data['mask'],
+            'obstacle_clearance': data['clearance'],
             'filter/slack': (slack*data['mask']).sum(axis=1)/count,
             'filter/slack_max': jnp.max(slack*data['mask'], axis=1),
             'filter/correction': correction,

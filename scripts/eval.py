@@ -451,7 +451,7 @@ class Evaluator:
         video_dir = self.save_dir/f"visualize_{checkpoint.stem}" if self.visualize else None
         return evaluate_env(env, params, hparams, env_cfg, module,
                             episodes=self.episodes, seeds=self.seeds, video_dir=video_dir,
-                            safety_filter=make_safety_filter(self.config, env_cfg))
+                            safety_filter=make_safety_filter(self.config, env_cfg, evaluation=True))
 
     def eval_all_ckpts(self, checkpoint=None):
         if self.is_controller:

@@ -44,8 +44,8 @@ def make_controller(config):
     return robot, solver, action_fn
 
 
-def make_safety_filter(config, env_cfg):
-    """Build only an explicitly enabled, ordinary-PPO JAX execution filter."""
+def make_safety_filter(config, env_cfg, *, evaluation=False):
+    """Build the PPO execution filter; CBF-RL uses it only during training."""
     import jax
 
     section = config.trainer.safety_filter
@@ -83,6 +83,8 @@ def make_safety_filter(config, env_cfg):
         value = section[name]
         if isinstance(value, bool) or not math.isfinite(float(value)) or float(value) < 0 or (name != 'slack_weight' and value == 0):
             raise ValueError(f"invalid trainer.safety_filter.{name}")
+    if evaluation and section.reward.weight > 0:
+        return None
     return partial(generate_action, env_cfg.robot, dt=env_cfg.dt, backend="jax",
         qp_obs_top_k=min(top_k, env_cfg.num_humans) if top_k is not None else env_cfg.num_humans,
         slack_weight=float(section.slack_weight), speed_facets=section.speed_facets,

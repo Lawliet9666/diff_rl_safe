@@ -632,7 +632,8 @@ class PPOTrainer:
         episodes = int(self.config.trainer.eval_episodes if episodes is None else episodes)
         return evaluate_env(
             self.env, self.params, self.jax_hparams,
-            self.jax_env_cfg, self.model_module, episodes=episodes, safety_filter=self.safety_filter,
+            self.jax_env_cfg, self.model_module, episodes=episodes,
+            safety_filter=make_safety_filter(self.config, self.jax_env_cfg, evaluation=True),
         )
 
     def _assert_finite_eval_metrics(self, eval_metrics, update, global_step):
