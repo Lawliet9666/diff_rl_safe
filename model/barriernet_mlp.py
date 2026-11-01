@@ -93,8 +93,8 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2, *, robot=None, control
     extended = robot_type in {"double_integrator", "humanoid", "quadrotor"}
     if not extended:
         normalize_robot_type(robot_type)
-    if extended and robot_type == "humanoid" and robot is not None and robot.barrier != "distance":
-        raise ValueError("Humanoid RL requires the distance HOCBF")
+    if extended and robot_type == "humanoid" and robot is not None and robot.barrier not in {"distance", "clearance"}:
+        raise ValueError("Humanoid RL requires the distance or clearance HOCBF")
     if extended and float(actor_cfg.qp_slack_weight) <= 0:
         raise ValueError("High-order BarrierNet requires a positive obstacle slack weight")
     if robot is None or int(act_dim) != robot.control_dim:

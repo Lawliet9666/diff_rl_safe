@@ -70,8 +70,8 @@ def make_safety_filter(config, env_cfg, *, evaluation=False):
     if physical.enabled:
         return partial(generate_action, env_cfg.robot, dt=env_cfg.dt, backend="jax",
                        constraint_mode="physical")
-    if config.robot.type == 'humanoid' and env_cfg.robot.barrier != 'distance':
-        raise ValueError("SF-PPO humanoid requires the distance HOCBF")
+    if config.robot.type == 'humanoid' and env_cfg.robot.barrier not in {'distance', 'clearance'}:
+        raise ValueError("SF-PPO humanoid requires the distance or clearance HOCBF")
     top_k = section.qp_obs_top_k
     if top_k is not None and (not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0):
         raise ValueError("trainer.safety_filter.qp_obs_top_k must be null or a positive integer")

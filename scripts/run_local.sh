@@ -16,6 +16,7 @@ Defaults: CPU, 4 threads, 4 environments, batch 1024; CUDA uses 8 threads,
 CPU_THREADS sets thread limits, not CPU affinity. --gpu sets visibility only;
 omit it under Slurm to preserve the allocated GPU. Extra overrides take precedence.
 RUN_NAME is a prefix; each run appends method, robot and a timestamp.
+Humanoid CBF-RL selects the clearance barrier; override controller.humanoid.barrier to change it.
 For METHOD=all, overrides apply only to RL; configure CBF separately.
 HELP
 }
@@ -130,7 +131,11 @@ for method in "${methods[@]}"; do
           "wandb_entity=${WANDB_ENTITY:-}" "wandb_project=${WANDB_PROJECT:-diff_rl_safe}"
           "device=$device" env=crowd_dyn_var_num_env "robot=$robot"
           "trainer.num_envs=$num_envs" "trainer.timesteps_per_batch=$batch"
-          trainer.total_timesteps=15000000 "${profile[@]}" "$@") ;;
+          trainer.total_timesteps=15000000 "${profile[@]}")
+        if [[ "$method" == cbf_rl && "$robot" == humanoid ]]; then
+          command+=(controller.humanoid.barrier=clearance)
+        fi
+        command+=("$@") ;;
     esac
     printf '\n[%s] %s\n' "$method" "$robot"
     if "$dry_run"; then

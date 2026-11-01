@@ -46,8 +46,8 @@ def prepare_robot_policy(config):
         if config.env.get("backend", "jax") != "jax":
             raise ValueError("New RL robots currently require the JAX environment")
         if (robot_type == "humanoid" and config.model.type not in {"ppo_mlp", "ppo_gnn"}
-                and config.controller.humanoid.barrier != "distance"):
-            raise ValueError("Humanoid RL currently requires the distance HOCBF")
+                and config.controller.humanoid.barrier not in {"distance", "clearance"}):
+            raise ValueError("Humanoid RL currently requires the distance or clearance HOCBF")
     robot = make_robot(config)
     with open_dict(config):
         config.env.act_dim = robot.control_dim

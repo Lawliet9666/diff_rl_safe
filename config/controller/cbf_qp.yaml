@@ -44,7 +44,7 @@ quadrotor:
     weights: [1.0, 1.0, 1.0, 1.0e-6]  # World jerk x/y/z, then omega_z.
 
 humanoid:
-  barrier: distance  # distance: order 2; parabolic: order 1.
+  barrier: distance  # distance: squared/order 2; clearance: norm/order 2; parabolic: order 1.
   nominal:
     position_gain: 1.0
     velocity_gain: 2.0
@@ -53,6 +53,8 @@ humanoid:
     kappa_speed: 4.0  # Shared first-order total-speed CBF rate.
     distance:
       kappa: [1.5, 1.5]  # Distance HOCBF rates.
+    clearance:
+      kappa: [1.5, 1.5]  # h = distance-R; acceleration-level HOCBF rates.
     parabolic:
       kappa: [2.0]  # h_dot + kappa_1*h >= 0
       parabolic_gain: 1.0  # Curvature.

@@ -73,12 +73,12 @@ class HumanoidRobot(Robot):
         r = config.robot
         section = config.controller.humanoid
         barrier = section.get("barrier") if isinstance(section, Mapping) else None
-        if barrier == "distance":
+        if barrier in {"distance", "clearance"}:
             cbf_type = DistanceCBFParams
         elif barrier == "parabolic":
             cbf_type = ParabolicCBFParams
         else:
-            raise ValueError("humanoid barrier must be distance or parabolic")
+            raise ValueError("humanoid barrier must be distance, clearance or parabolic")
         cbf_names = tuple(field.name for field in fields(cbf_type))
         parameters = _control_parameters(
             section,
@@ -98,7 +98,7 @@ class HumanoidRobot(Robot):
         if not all(math.isfinite(v) and v > 0 for v in values):
             raise ValueError("invalid humanoid velocity, input limits or speed CBF gain")
 
-        valid_cbf = ((self.barrier == "distance" and isinstance(self.cbf, DistanceCBFParams))
+        valid_cbf = ((self.barrier in {"distance", "clearance"} and isinstance(self.cbf, DistanceCBFParams))
                      or (self.barrier == "parabolic" and isinstance(self.cbf, ParabolicCBFParams)))
         values = (self.goal_tolerance, self.radius, *self.weights,
                   self.position_gain, self.velocity_gain, self.heading_gain)
@@ -168,7 +168,11 @@ class HumanoidRobot(Robot):
         return jnp.eye(3)
 
     def validate_cbf_domain(self, state, obstacles):
-        """Parabolic CBF requires strict separation from inflated obstacles."""
+        """Validate the selected barrier's formula domain, separately from safety."""
+        if self.barrier == "clearance":
+            distance_sq = jnp.sum((state[:2]-obstacles.centers)**2, axis=1)
+            if not bool(jnp.all((obstacles.mask <= .5) | (distance_sq > 0))):
+                raise ValueError("clearance CBF requires nonzero robot-obstacle center distance")
         if self.barrier == "parabolic":
             radius = self.radius + obstacles.radii + self.margin
             q = jnp.sum((state[:2]-obstacles.centers)**2, axis=1) - radius**2
@@ -186,6 +190,28 @@ class HumanoidRobot(Robot):
         dh_dot_dx_g = 2*z @ B
         h_ddot_drift = 2*jnp.sum(w*w, axis=1)
         return h, h_dot, dh_dot_dx_g, h_ddot_drift
+
+    def clearance_barrier(self, state, obstacles, *, r_safe=None):
+        """h = ||p-p_o||-R; h_ddot = A@u+drift for constant obstacle velocity.
+
+        This uses the CBF-RL paper's clearance function with a second-order
+        HOCBF for this model's acceleration controls.
+        """
+        z = state[:2]-obstacles.centers
+        w = self.world_velocity(state)-obstacles.velocities
+        radius = self.radius + obstacles.radii + self.margin if r_safe is None else r_safe
+        active = obstacles.mask > .5
+        # Inactive coincident centers have no constraint or formula singularity.
+        # Active centers retain the exact norm, with no epsilon approximation.
+        z = jnp.where(active[:, None], z, jnp.array([1., 0.], dtype=state.dtype))
+        w = jnp.where(active[:, None], w, 0.)
+        distance = jnp.linalg.norm(z, axis=1)
+        normal = z/distance[:, None]
+        h = distance-radius
+        h_dot = jnp.sum(normal*w, axis=1)
+        A = normal @ self.acceleration_map(state)
+        drift = (jnp.sum(w*w, axis=1)-h_dot**2)/distance
+        return h, h_dot, A, drift
 
     def parabolic_barrier(self, state, obstacles):
         """Return (h, squared_clearance, A, drift), where h_dot = A@u + drift."""
@@ -209,8 +235,9 @@ class HumanoidRobot(Robot):
     def cbf_constraints(self, state, obstacles, dt, *, kappa=None, r_safe=None):
         """Obstacle CBFs followed by a hard continuous-time speed CBF."""
         check_obstacle_shapes(obstacles)
-        if self.barrier == "distance":
-            h, h_dot, A, h_ddot_drift = self.distance_barrier(state, obstacles, r_safe=r_safe)
+        if self.barrier in {"distance", "clearance"}:
+            barrier_fn = self.distance_barrier if self.barrier == "distance" else self.clearance_barrier
+            h, h_dot, A, h_ddot_drift = barrier_fn(state, obstacles, r_safe=r_safe)
             kappa1, kappa2 = self.cbf.kappa if kappa is None else jnp.moveaxis(kappa, -1, 0)
             b = h_ddot_drift+(kappa1+kappa2)*h_dot+kappa1*kappa2*h
             domain = jnp.stack([h, h_dot+kappa1*h], axis=1)
@@ -219,7 +246,7 @@ class HumanoidRobot(Robot):
             b = h_dot_drift+self.cbf.kappa[0]*h
             domain = jnp.stack([h, q], axis=1)
         else:
-            raise ValueError("humanoid barrier must be distance or parabolic")
+            raise ValueError("humanoid barrier must be distance, clearance or parabolic")
         obstacle_rows = masked_rows(A, b, domain, obstacles.mask)
         return join_constraints(obstacle_rows, self.physical_constraints(state, dt))
 
