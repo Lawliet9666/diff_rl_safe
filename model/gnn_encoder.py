@@ -53,7 +53,7 @@ def _dense_flat(layer, x):
 def _dense_flat_no_bias(weight, x):
     leading_shape = x.shape[:-1]
     flat_x = x.reshape((-1, x.shape[-1]))
-    flat_out = jnp.sum(flat_x[:, None, :] * weight[None, :, :], axis=-1)
+    flat_out = jnp.matmul(flat_x, weight.T, precision=jax.lax.Precision.HIGHEST)
     return flat_out.reshape((*leading_shape, weight.shape[0]))
 
 
@@ -102,11 +102,11 @@ def _sparse_edge_mlp_from_parts(layers, nodes, edges, receiver_idx, sender_idx, 
     recv_weight = weight[:, :node_dim]
     send_weight = weight[:, node_dim : 2 * node_dim]
     edge_weight = weight[:, 2 * node_dim :]
-    receiver_nodes = nodes[:, receiver_idx, :]
-    sender_nodes = nodes[:, sender_idx, :]
+    receiver_projection = _dense_flat_no_bias(recv_weight, nodes)
+    sender_projection = _dense_flat_no_bias(send_weight, nodes)
     x = (
-        _dense_flat_no_bias(recv_weight, receiver_nodes)
-        + _dense_flat_no_bias(send_weight, sender_nodes)
+        receiver_projection[:, receiver_idx, :]
+        + sender_projection[:, sender_idx, :]
         + _dense_flat_no_bias(edge_weight, edges)
         + first["bias"]
     )
