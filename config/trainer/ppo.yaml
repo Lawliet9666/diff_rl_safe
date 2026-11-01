@@ -39,7 +39,7 @@ physical_limits:
 # PPO+filter keeps this at evaluation; CBF-RL uses it only during training.
 safety_filter:
   enabled: false
-  qp_obs_top_k: 5  # null: all; positive integer: nearest active obstacles.
+  qp_obs_top_k: 5  # PPO+filter: nearest centers; CBF-RL: one global minimum-clearance obstacle.
   slack_weight: 10.0  # Obstacle rows only; 0 selects hard constraints.
   speed_facets: 16  # Single-integrator speed disk inner approximation only.
   max_iter: 40

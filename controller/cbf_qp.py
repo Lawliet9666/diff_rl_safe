@@ -69,6 +69,17 @@ def _nearest_obstacle_ids(position, obstacles, top_k):
     return jax.lax.top_k(-jnp.where(obstacles.mask > .5, distance, jnp.inf), count)[1]
 
 
+def _obstacle_clearance(robot, state, obstacles):
+    """Surface clearance in the geometry used by the robot's distance CBF."""
+    position = state[..., :2]
+    radius = robot.radius + obstacles.radii.astype(state.dtype) + robot.margin
+    if isinstance(robot, UnicycleRobot):
+        heading = jnp.stack((jnp.cos(state[..., 2]), jnp.sin(state[..., 2])), axis=-1)
+        position = position + robot.lookahead * heading
+        radius = radius + robot.lookahead
+    return jnp.linalg.norm(position[..., None, :] - obstacles.centers, axis=-1) - radius
+
+
 def select_obstacles(position, obstacles, top_k):
     """Select nearest obstacles without changing the single-scene array shapes."""
     if top_k is None:
@@ -290,7 +301,8 @@ def warmup_controller(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None
 
 
 def _prepare_jax_data(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None,
-                 slack_weight=0.0, speed_facets=16, constraint_mode="cbf"):
+                 slack_weight=0.0, speed_facets=16, constraint_mode="cbf",
+                 single_obstacle=False):
     """Assemble one fixed-CBF QP; whiten variables for mixed input units."""
     x = state.astype(jnp.float64)
     if constraint_mode == "physical":
@@ -299,19 +311,18 @@ def _prepare_jax_data(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None
         constraints = jax.vmap(lambda x: _controller_constraints(
             robot, x, None, dt, speed_facets, constraint_mode))(x)
     else:
-        ids = _nearest_obstacle_ids(state[..., :2], obstacles, qp_obs_top_k)
+        if single_obstacle and obstacles.mask.shape[-1]:
+            clearance = _obstacle_clearance(robot, x, obstacles)
+            # Search all obstacles, without nearest-center top-k truncation.
+            # At equal clearance, argmin selects the first obstacle.
+            ids = jnp.argmin(jnp.where(obstacles.mask > .5, clearance, jnp.inf),
+                             axis=-1, keepdims=True)
+        else:
+            ids = _nearest_obstacle_ids(state[..., :2], obstacles, qp_obs_top_k)
         batch = jnp.arange(state.shape[0])[:, None]
         obstacles = jax.tree_util.tree_map(lambda value: value[batch, ids], obstacles)
         obstacles = jax.tree_util.tree_map(lambda value: value.astype(jnp.float64), obstacles)
-        # Match the existing distance-CBF geometry, including the unicycle's
-        # lookahead point and its inflated obstacle radius.
-        position = x[:, :2]
-        radius = robot.radius + obstacles.radii + robot.margin
-        if isinstance(robot, UnicycleRobot):
-            heading = jnp.stack((jnp.cos(x[:, 2]), jnp.sin(x[:, 2])), axis=-1)
-            position = position + robot.lookahead * heading
-            radius = radius + robot.lookahead
-        clearance = jnp.linalg.norm(position[:, None, :] - obstacles.centers, axis=-1) - radius
+        clearance = _obstacle_clearance(robot, x, obstacles)
         constraints = jax.vmap(lambda x, obs: _controller_constraints(
             robot, x, obs, dt, speed_facets))(x, obstacles)
     dim = robot.control_dim
@@ -339,13 +350,15 @@ def _prepare_jax_data(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None
 def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
                     solver=SolverConfig(), slack_weight=0.0, qp_obs_top_k=None,
                     speed_facets=16, max_iter=40, eps=1.0e-12, active=None,
-                    constraint_mode="cbf"):
+                    constraint_mode="cbf", single_obstacle=False):
     """Filter a nominal physical input using OSQP or batched JAX forward solving.
 
     Only obstacle constraints receive slack. The JAX backend stops gradients and
     accepts single states, batches and active masks; OSQP handles one state.
     Physical mode solves only the existing physical CBFs and input limits once.
     Discrete state-limit violations are reported by the environment.
+    single_obstacle selects minimum surface clearance over all active obstacles
+    for CBF-RL; the selected robot CBF/HOCBF and physical/input limits are retained.
     """
     if backend not in {"osqp", "jax"}:
         raise ValueError("generate_action backend must be 'osqp' or 'jax'")
@@ -362,6 +375,10 @@ def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
         raise ValueError("generate_action eps must be finite and positive")
     if constraint_mode not in {"cbf", "physical"}:
         raise ValueError("constraint_mode must be 'cbf' or 'physical'")
+    if not isinstance(single_obstacle, bool):
+        raise ValueError("single_obstacle must be true or false")
+    if single_obstacle and (backend != "jax" or constraint_mode != "cbf"):
+        raise ValueError("single_obstacle requires the JAX obstacle filter")
     if constraint_mode == "physical":
         if backend != "jax" or slack_weight != 0.:
             raise ValueError("physical-only projection requires the JAX backend and no slack")
@@ -416,7 +433,8 @@ def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
         nominal = jnp.where(active[:, None], nominal, 0.)
     data = _prepare_jax_data(robot, state, nominal, obstacles, dt,
                         qp_obs_top_k=qp_obs_top_k, slack_weight=slack_weight,
-                        speed_facets=speed_facets, constraint_mode=constraint_mode)
+                        speed_facets=speed_facets, constraint_mode=constraint_mode,
+                        single_obstacle=single_obstacle)
     empty = jnp.empty((0,), jnp.float64)
     # Match BarrierNet's first-order versus high-order solver settings.
     high_order = constraint_mode == "physical" or isinstance(robot, (DoubleIntegratorRobot, HumanoidRobot, QuadrotorRobot))
@@ -460,11 +478,11 @@ def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
             'obstacle_mask': data['mask'],
             'obstacle_clearance': data['clearance'],
             'filter/slack': (slack*data['mask']).sum(axis=1)/count,
-            'filter/slack_max': jnp.max(slack*data['mask'], axis=1),
+            'filter/slack_max': jnp.max(slack*data['mask'], axis=1, initial=0.),
             'filter/correction': correction,
             # Tolerances below affect diagnostic labels only.
             'filter/intervention': (correction > 1e-5).astype(jnp.float32),
-            'filter/cbf_violation': jnp.maximum(jnp.max(-residual[:, :data['mask'].shape[1]]*data['mask'], axis=1), 0.),
+            'filter/cbf_violation': jnp.max(-residual[:, :data['mask'].shape[1]]*data['mask'], axis=1, initial=0.),
             'filter/primal_residual': primal,
             'filter/kkt_residual': jnp.max(errors[:, 1:], axis=1),
             'filter/initial_safe': jnp.all(data['constraints'].domain >= -1e-5, axis=1).astype(jnp.float32),

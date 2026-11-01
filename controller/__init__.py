@@ -87,5 +87,6 @@ def make_safety_filter(config, env_cfg, *, evaluation=False):
         return None
     return partial(generate_action, env_cfg.robot, dt=env_cfg.dt, backend="jax",
         qp_obs_top_k=min(top_k, env_cfg.num_humans) if top_k is not None else env_cfg.num_humans,
+        single_obstacle=section.reward.weight > 0,
         slack_weight=float(section.slack_weight), speed_facets=section.speed_facets,
         max_iter=section.max_iter, eps=float(section.eps))
