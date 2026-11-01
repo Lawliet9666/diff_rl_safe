@@ -40,10 +40,16 @@ def qp_residuals(Q, p, G, h, x, dual, *, A=None, b=None, nu=None,
     return xp.where(finite[..., None], errors, xp.inf)
 
 
+def qp_solution_valid(errors, tolerance=1e-6):
+    """Per-problem acceptance; failure does not certify infeasibility."""
+    errors = jax.lax.stop_gradient(errors)
+    return jnp.all(jnp.isfinite(errors) & (errors <= tolerance), axis=-1)
+
+
 def check_qp_residuals(errors, *, tolerance=1e-6, label="QP"):
     """Reject invalid JAX solutions without altering the successful action VJP."""
     errors = jax.lax.stop_gradient(errors)
-    valid = jnp.all(jnp.isfinite(errors) & (errors <= tolerance), axis=-1)
+    valid = qp_solution_valid(errors, tolerance)
     def fail(_):
         def raise_failure(ok, residuals):
             if not np.all(ok):

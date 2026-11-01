@@ -94,7 +94,7 @@ def save_videos(env, video_dir, traces, records, env_cfg, hparams, module):
             ids = np.asarray([frame["qp_ids"] for frame in trace[1:]])
             rewards = np.asarray([frame["reward"] for frame in trace[1:]], dtype=np.float32)
             totals = np.r_[0., np.cumsum(rewards)]
-            status = ("collision" if record["collision"] else "success" if record["success"]
+            status = ("qp_failure" if record.get("qp_failure", False) else "collision" if record["collision"] else "success" if record["success"]
                       else "timeout")
             frames = [renderer.frame(
                 qpos[t], qvel[t], mocap[t], mask, trace[t]["qp_ids"], qpos[:t+1, :2],

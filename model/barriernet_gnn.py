@@ -240,7 +240,7 @@ def _current_obs(obs, hparams):
     return obs_history, obs_history[:, -1, :]
 
 
-def _actor_outputs(params, hparams, obs, qp_context=None):
+def _actor_outputs(params, hparams, obs, qp_context=None, *, return_status=False):
     obs_history, current_obs = _current_obs(obs, hparams)
     actor_params = params["actor"]
     robot_latent, human_latents = spatio_temporal_graph_encode(
@@ -279,7 +279,7 @@ def _actor_outputs(params, hparams, obs, qp_context=None):
     r_safe_topk = _gather_topk(r_safe_all, qp_topk_ids)
     if hparams.robot_state_dim == 0:
         nominal_xy = _body_to_world(nominal_xy, qp_obs[:, 4])
-    safe_xy, slack = cbf_qp.solve_slack_qp(
+    qp_result = cbf_qp.solve_slack_qp(
         params,
         hparams,
         qp_obs,
@@ -287,7 +287,9 @@ def _actor_outputs(params, hparams, obs, qp_context=None):
         alpha_topk,
         r_safe_topk,
         robot_state=qp_context.get("robot_state"),
+        return_status=return_status,
     )
+    safe_xy, slack = qp_result[:2]
     return (
         robot_latent,
         qp_obs,
@@ -296,7 +298,7 @@ def _actor_outputs(params, hparams, obs, qp_context=None):
         r_safe_topk,
         safe_xy,
         slack,
-    )
+    ) + qp_result[2:]
 
 
 def safe_action_mean(params, hparams, obs, qp_context=None):
@@ -323,6 +325,8 @@ def get_action_and_value(
     return_diagnostics=False,
     qp_context=None,
 ):
+    actor_outputs = _actor_outputs(params, hparams, obs, qp_context=qp_context,
+                                   return_status=return_diagnostics)
     (
         robot_latent,
         qp_obs,
@@ -331,7 +335,7 @@ def get_action_and_value(
         r_safe,
         safe_xy,
         slack,
-    ) = _actor_outputs(params, hparams, obs, qp_context=qp_context)
+    ) = actor_outputs[:7]
 
     action, logprob, entropy, sampled_policy_action = (
         actor_critic.action_logprob_entropy(
@@ -371,5 +375,6 @@ def get_action_and_value(
                 slack,
                 robot_state=None if qp_context is None else qp_context.get("robot_state"),
             )
+        diagnostics["qp_failure"] = actor_outputs[7]
         outputs = outputs + (diagnostics,)
     return outputs

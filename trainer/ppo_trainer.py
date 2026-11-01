@@ -84,6 +84,8 @@ class PPOTrainer:
 
         self.setup_env()
         self.setup_model_and_optimizer()
+        self.setup_rollout_collector()
+        self.jitted_train_step = self._make_jitted_train_step()
         self.setup_wandb()
         self.total_updates = max(1, int(np.ceil(self.total_timesteps / max(self.timesteps_per_batch, 1))))
         self.last_eval_timestep = 0
@@ -123,7 +125,7 @@ class PPOTrainer:
             run_name += f"-ent{trainer.ent_coef}"
         if self.config.trainer.safety_filter.enabled:
             run_name += "-safetyfilter"
-            if trainer.safety_filter.reward.weight > 0:
+            if trainer.cbf_rl.enabled:
                 run_name += "-cbfrl"
         run_name += "-braxppo"
         lr_schedule = str(getattr(trainer, "learning_rate_schedule", "linear")).strip().lower()
@@ -158,6 +160,9 @@ class PPOTrainer:
         if self.config.model.type in {"barriernet_gnn", "barriernet_mlp"}:
             self.robot_model_kwargs["control_dt"] = self.jax_env_cfg.dt
         self.safety_filter = make_safety_filter(self.config, self.jax_env_cfg)
+
+    def setup_rollout_collector(self):
+        reward_cfg = self.config.robot.reward.cbf_rl
         reward_loss_fn = make_reward_loss(self.config)
         self.rollout_collector = make_rollout_collector(
             self.model_module,
@@ -168,8 +173,8 @@ class PPOTrainer:
             safety_filter=self.safety_filter,
             reward_loss_fn=reward_loss_fn,
             reward_horizon=self.config.trainer.reward_loss.horizon,
-            cbf_reward_weight=self.config.trainer.safety_filter.reward.weight,
-            cbf_reward_sigma=self.config.trainer.safety_filter.reward.sigma,
+            cbf_reward_weight=reward_cfg.weight if self.config.trainer.cbf_rl.enabled else 0.0,
+            cbf_reward_sigma=reward_cfg.sigma,
         )
 
     def setup_model_and_optimizer(self):
@@ -208,7 +213,6 @@ class PPOTrainer:
         self.env_state = None
         self.global_step = 0
         self.current_lr = float(self.config.trainer.lr)
-        self.jitted_train_step = self._make_jitted_train_step()
         self.lr_schedule = self._normalize_lr_schedule(getattr(self.config.trainer, "learning_rate_schedule", "linear"))
         self.lr_min = float(getattr(self.config.trainer, "learning_rate_schedule_min_lr", 0.0))
         configured_lr_max = float(getattr(self.config.trainer, "learning_rate_schedule_max_lr", 0.0))
@@ -386,6 +390,8 @@ class PPOTrainer:
             update_batch["qp_topk_ids"] = jnp.asarray(batch["qp_topk_ids"], dtype=jnp.int32)
         if "qp_robot_state" in batch:
             update_batch["qp_robot_state"] = batch["qp_robot_state"]  # Preserve dynamics precision.
+        if "policy_valid" in batch:
+            update_batch["policy_valid"] = batch["policy_valid"]
         return update_batch
 
     @staticmethod
@@ -427,6 +433,7 @@ class PPOTrainer:
         return {
             "global_step": batch["global_step"],
             "completed_count": batch["train_completed_count"],
+            "qp_failure_count": batch["train_qp_failure_count"],
             "return_sum": batch["train_return_sum"],
             "ppo_return_sum": batch["train_ppo_return_sum"],
             "length_sum": batch["train_length_sum"],
@@ -453,6 +460,7 @@ class PPOTrainer:
     def _train_metrics_from_host_summary(summary):
         metrics = {
             "completed_count": int(summary["completed_count"]),
+            "qp_failure_count": int(summary["qp_failure_count"]),
             "return_sum": float(summary["return_sum"]),
             "ppo_return_sum": float(summary["ppo_return_sum"]),
             "length_sum": float(summary["length_sum"]),
@@ -530,6 +538,7 @@ class PPOTrainer:
             "diagnostics/approx_kl": ppo_metrics["approx_kl"],
             "diagnostics/clipfrac": ppo_metrics["clipfrac"],
             "diagnostics/max_abs_logratio": ppo_metrics["max_abs_logratio"],
+            "diagnostics/qp_update_failure_rate": ppo_metrics.get("qp_update_failure_rate", 0.),
             "safety/min_clearance": train_metrics["min_clearance"],
             "diagnostics/boundary_violation_mean": train_metrics["boundary_violation_mean"],
             "diagnostics/boundary_violation_max": train_metrics["boundary_violation_max"],
@@ -604,12 +613,14 @@ class PPOTrainer:
             log_dict["train/success_rate"] = float(train_metrics["success_count"] / completed)
             log_dict["train/collision_rate"] = float(train_metrics["collision_count"] / completed)
             log_dict["train/timeout_rate"] = float(train_metrics["timeout_count"] / completed)
+            log_dict["train/qp_failure_rate"] = float(train_metrics["qp_failure_count"] / completed)
         if eval_metrics is not None:
             log_dict["charts/eval_return_mean"] = eval_metrics["mean_return"]
             log_dict["charts/eval_return_std"] = eval_metrics["std_return"]
             log_dict["charts/eval_success_rate"] = eval_metrics["success_rate"]
             log_dict["charts/eval_collision_rate"] = eval_metrics["collision_rate"]
             log_dict["charts/eval_timeout_rate"] = eval_metrics["timeout_rate"]
+            log_dict["charts/eval_qp_failure_rate"] = eval_metrics["qp_failure_rate"]
             log_dict["charts/eval_min_clearance"] = eval_metrics["mean_min_clearance"]
             log_dict["charts/eval_episode_length"] = eval_metrics["mean_episode_length"]
             if "physical_state_limit" in eval_metrics:
@@ -619,7 +630,7 @@ class PPOTrainer:
 
         log_dict.update({key: value for key, value in train_metrics.items() if key.startswith(("control/", "filter/", "cbf_rl/"))})
         wandb_log = {key: value for key, value in log_dict.items() if not key.startswith("train/")}
-        if completed > 0 and periodic_log:
+        if completed > 0 and (periodic_log or train_metrics["qp_failure_count"] > 0):
             wandb_log.update({key: value for key, value in log_dict.items() if key.startswith("train/")})
         with (self.save_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
             serialized = {key: value if value is None or np.isfinite(value) else None

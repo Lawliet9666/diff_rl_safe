@@ -137,26 +137,26 @@ def _cbf_constraints(actor_params, hparams, obs, beta, r_safe):
     return _unicycle_cbf_constraints(actor_params, hparams, obs, beta, r_safe)
 
 
-def solve_unicycle_slack_qp(params, hparams, obs, nominal_xy, beta, r_safe):
+def solve_unicycle_slack_qp(params, hparams, obs, nominal_xy, beta, r_safe, *, return_status=False):
     q, p = _unicycle_qp_objective(hparams, obs, nominal_xy)
     g, h_qp, _mask = _unicycle_cbf_constraints(params["actor"], hparams, obs, beta, r_safe)
-    return _solve_slack_qp(params, hparams, obs, q, p, g, h_qp)
+    return _solve_slack_qp(params, hparams, obs, q, p, g, h_qp, return_status=return_status)
 
 
-def solve_single_integrator_slack_qp(params, hparams, obs, nominal_xy, beta, r_safe):
+def solve_single_integrator_slack_qp(params, hparams, obs, nominal_xy, beta, r_safe, *, return_status=False):
     q, p = _single_integrator_qp_objective(hparams, obs, nominal_xy)
     g, h_qp, _mask = _single_integrator_cbf_constraints(
         params["actor"], hparams, obs, beta, r_safe
     )
-    return _solve_slack_qp(params, hparams, obs, q, p, g, h_qp)
+    return _solve_slack_qp(params, hparams, obs, q, p, g, h_qp, return_status=return_status)
 
 
-def solve_slack_qp(params, hparams, obs, nominal_xy, beta, r_safe):
+def solve_slack_qp(params, hparams, obs, nominal_xy, beta, r_safe, *, return_status=False):
     if hparams.robot_type == "single_integrator":
         return solve_single_integrator_slack_qp(
-            params, hparams, obs, nominal_xy, beta, r_safe
+            params, hparams, obs, nominal_xy, beta, r_safe, return_status=return_status
         )
-    return solve_unicycle_slack_qp(params, hparams, obs, nominal_xy, beta, r_safe)
+    return solve_unicycle_slack_qp(params, hparams, obs, nominal_xy, beta, r_safe, return_status=return_status)
 
 
 def lightweight_diagnostics(params, hparams, obs, nominal_xy, beta, r_safe, safe_xy, slack):

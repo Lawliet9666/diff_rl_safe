@@ -51,7 +51,10 @@ def make_safety_filter(config, env_cfg, *, evaluation=False):
     section = config.trainer.safety_filter
     if not isinstance(section.enabled, bool):
         raise ValueError("trainer.safety_filter.enabled must be true or false")
-    if section.reward.weight > 0 and not section.enabled:
+    cbf_rl = config.trainer.cbf_rl.enabled
+    if not isinstance(cbf_rl, bool):
+        raise ValueError("trainer.cbf_rl.enabled must be true or false")
+    if cbf_rl and not section.enabled:
         raise ValueError("CBF-RL reward requires the obstacle safety_filter, not physical-only projection")
     physical = config.trainer.physical_limits
     if not isinstance(physical.enabled, bool):
@@ -83,10 +86,10 @@ def make_safety_filter(config, env_cfg, *, evaluation=False):
         value = section[name]
         if isinstance(value, bool) or not math.isfinite(float(value)) or float(value) < 0 or (name != 'slack_weight' and value == 0):
             raise ValueError(f"invalid trainer.safety_filter.{name}")
-    if evaluation and section.reward.weight > 0:
+    if evaluation and cbf_rl:
         return None
     return partial(generate_action, env_cfg.robot, dt=env_cfg.dt, backend="jax",
         qp_obs_top_k=min(top_k, env_cfg.num_humans) if top_k is not None else env_cfg.num_humans,
-        single_obstacle=section.reward.weight > 0,
+        single_obstacle=cbf_rl,
         slack_weight=float(section.slack_weight), speed_facets=section.speed_facets,
         max_iter=section.max_iter, eps=float(section.eps))

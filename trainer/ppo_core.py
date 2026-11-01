@@ -153,8 +153,13 @@ def init_ppo_opt_state(params, max_grad_norm=1.0):
     return {"brax": init_optax_adam_state(_trainable_params(params), max_grad_norm=max_grad_norm)}
 
 
-def _normalize_advantages(advantages):
+def _normalize_advantages(advantages, valid=None):
     advantages = jnp.asarray(advantages, dtype=jnp.float32)
+    if valid is not None:
+        count = jnp.maximum(jnp.sum(valid), 1)
+        mean = jnp.sum(jnp.where(valid, advantages, 0.)) / count
+        variance = jnp.sum(jnp.where(valid, (advantages-mean)**2, 0.)) / count
+        return jnp.where(valid, (advantages-mean) / (jnp.sqrt(variance)+1e-8), 0.)
     return (advantages - jnp.mean(advantages)) / (jnp.std(advantages) + jnp.asarray(1e-8, dtype=jnp.float32))
 
 
@@ -172,19 +177,24 @@ def brax_ppo_loss(
 ):
     full_params = _with_trainable(params, trainable_params)
     policy_action = batch["policy_act"]
+    valid = jnp.asarray(batch.get("policy_valid", jnp.ones(policy_action.shape[0], dtype=bool)))
+    update_qp_failure = jnp.zeros_like(valid)
     if "qp_obs" in batch and "qp_topk_ids" in batch:
-        _action, log_prob, entropy, values = get_action_and_value_fn(
+        _action, log_prob, entropy, values, diagnostics = get_action_and_value_fn(
             full_params,
             hparams,
             batch["obs"],
             action=batch["act"],
             policy_action=policy_action,
+            return_diagnostics=True,
             qp_context={
                 "qp_obs": batch["qp_obs"],
                 "qp_topk_ids": batch["qp_topk_ids"],
                 **({"robot_state": batch["qp_robot_state"]} if "qp_robot_state" in batch else {}),
             },
         )
+        update_qp_failure = diagnostics["qp_failure"] & valid
+        valid = valid & ~diagnostics["qp_failure"]
     else:
         _action, log_prob, entropy, values = get_action_and_value_fn(
             full_params,
@@ -195,13 +205,16 @@ def brax_ppo_loss(
         )
     advantages = jnp.asarray(batch["advantages"], dtype=jnp.float32)
     if normalize_advantage:
-        advantages = _normalize_advantages(advantages)
+        advantages = _normalize_advantages(advantages, valid)
 
-    logratio = log_prob - batch["logp"]
+    def actor_mean(value):
+        return jnp.sum(jnp.where(valid, value, 0.)) / jnp.maximum(jnp.sum(valid), 1)
+
+    logratio = jnp.where(valid, log_prob - batch["logp"], 0.)
     ratio = jnp.exp(logratio)
     surrogate_loss1 = ratio * advantages
     surrogate_loss2 = jnp.clip(ratio, 1.0 - clip, 1.0 + clip) * advantages
-    policy_loss = -jnp.mean(jnp.minimum(surrogate_loss1, surrogate_loss2))
+    policy_loss = -actor_mean(jnp.minimum(surrogate_loss1, surrogate_loss2))
 
     value_error = batch["returns"] - values
     value_loss = jnp.square(value_error)
@@ -217,11 +230,11 @@ def brax_ppo_loss(
     )
     value_loss = jnp.mean(value_loss) * 0.5 * vf_coef
 
-    entropy = jnp.mean(entropy)
+    entropy = actor_mean(entropy)
     entropy_loss = -ent_coef * entropy
     total_loss = policy_loss + value_loss + entropy_loss
-    approx_kl = ((ratio - 1.0) - logratio).mean()
-    clipfrac = (jnp.abs(ratio - 1.0) > clip).astype(jnp.float32).mean()
+    approx_kl = actor_mean((ratio - 1.0) - logratio)
+    clipfrac = actor_mean((jnp.abs(ratio - 1.0) > clip).astype(jnp.float32))
     std = shared_actor_std(full_params)
     return total_loss, {
         "policy_loss": policy_loss,
@@ -229,6 +242,7 @@ def brax_ppo_loss(
         "entropy_loss": entropy_loss,
         "approx_kl": approx_kl,
         "clipfrac": clipfrac,
+        "qp_update_failure_rate": jnp.mean(update_qp_failure.astype(jnp.float32)),
         "max_abs_policy_action": jnp.max(jnp.abs(policy_action)),
         "max_abs_logratio": jnp.max(jnp.abs(logratio)),
         "max_ratio": jnp.max(ratio),

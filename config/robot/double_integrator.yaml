@@ -16,6 +16,9 @@ goal_min_distance: 6.0  # m
 
 # Reward scales.
 reward:
+  cbf_rl:
+    weight: 0.01  # Shared coefficient for raw violation + correction.
+    sigma: [1.0, 1.0]  # ax, ay [m/s^2]; manual starting values.
   progress_speed_scale: ${robot.v_max}  # m/s; progress clipping
   potential_factor: 3.0
   back_factor: 0.0

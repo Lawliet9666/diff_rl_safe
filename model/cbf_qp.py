@@ -71,7 +71,7 @@ def _cbf_constraints(hparams, obs, alpha, r_safe):
     return _unicycle_cbf_constraints(hparams, obs, alpha, r_safe)
 
 
-def solve_slack_qp(params, hparams, obs, nominal_xy, alpha, r_safe, *, robot_state=None):
+def solve_slack_qp(params, hparams, obs, nominal_xy, alpha, r_safe, *, robot_state=None, return_status=False):
     if getattr(hparams, "robot_state_dim", 0):
         if robot_state is None:
             raise ValueError("High-order CBF-QP requires full-precision robot_state")
@@ -86,17 +86,19 @@ def solve_slack_qp(params, hparams, obs, nominal_xy, alpha, r_safe, *, robot_sta
         identity = jnp.broadcast_to(jnp.eye(hparams.act_dim, dtype=q.dtype), q.shape)
         transform = jsp_linalg.solve_triangular(jnp.swapaxes(chol, 1, 2), identity, lower=False)
         # Relax obstacle rows only; state/input limits stay hard.
-        action, slack = _solve_slack_qp(params, hparams, robot_state, q, p,
+        result = _solve_slack_qp(params, hparams, robot_state, q, p,
                               -constraints.A[:, :n], constraints.b[:, :n],
                               hard_g=-constraints.A[:, n:], hard_h=constraints.b[:, n:],
-                              control_transform=transform)
-        return action.astype(obs.dtype), slack.astype(obs.dtype)
+                              control_transform=transform, return_status=return_status)
+        action, slack = result[:2]
+        result = (action.astype(obs.dtype), slack.astype(obs.dtype), *result[2:])
+        return result
     if hparams.robot_type == "single_integrator":
         q, p = _single_integrator_qp_objective(hparams, obs, nominal_xy)
     else:
         q, p = _unicycle_qp_objective(hparams, obs, nominal_xy)
     g, h_qp, _mask = _cbf_constraints(hparams, obs, alpha, r_safe)
-    return _solve_slack_qp(params, hparams, obs, q, p, g, h_qp)
+    return _solve_slack_qp(params, hparams, obs, q, p, g, h_qp, return_status=return_status)
 
 
 def lightweight_diagnostics(

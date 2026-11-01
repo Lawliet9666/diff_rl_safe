@@ -12,6 +12,9 @@ goal_min_distance: 6.0  # m
 
 # Reward scales.
 reward:
+  cbf_rl:
+    weight: 0.01  # Shared coefficient for raw violation + correction.
+    sigma: [0.5, 0.5]  # vx, vy [m/s]; paper's velocity-space sigma.
   progress_speed_scale: ${robot.v_max}  # m/s; progress clipping
   potential_factor: 2.0
   back_factor: 0.0

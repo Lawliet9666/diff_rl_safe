@@ -276,7 +276,7 @@ def _current_obs(obs, hparams):
     return history, history[:, -1, :]
 
 
-def _actor_outputs(params, hparams, obs, qp_context=None):
+def _actor_outputs(params, hparams, obs, qp_context=None, *, return_status=False):
     latent = _shared_latent(params, hparams, obs)
     _history, current_obs = _current_obs(obs, hparams)
     actor_params = params["actor"]
@@ -323,14 +323,16 @@ def _actor_outputs(params, hparams, obs, qp_context=None):
         )
     r_safe_topk = _gather_topk(r_safe_all, qp_topk_ids)
     nominal_xy = _body_to_world(nominal_xy, qp_obs[:, 4])
-    safe_xy, slack = cvar_qp.solve_slack_qp(
+    qp_result = cvar_qp.solve_slack_qp(
         params,
         hparams,
         qp_obs,
         nominal_xy,
         beta_topk,
         r_safe_topk,
+        return_status=return_status,
     )
+    safe_xy, slack = qp_result[:2]
     return (
         latent,
         qp_obs,
@@ -339,7 +341,7 @@ def _actor_outputs(params, hparams, obs, qp_context=None):
         r_safe_topk,
         safe_xy,
         slack,
-    )
+    ) + qp_result[2:]
 
 
 def safe_action_mean(params, hparams, obs, qp_context=None):
@@ -369,6 +371,8 @@ def get_action_and_value(
     return_diagnostics=False,
     qp_context=None,
 ):
+    actor_outputs = _actor_outputs(params, hparams, obs, qp_context=qp_context,
+                                   return_status=return_diagnostics)
     (
         latent,
         qp_obs,
@@ -377,7 +381,7 @@ def get_action_and_value(
         r_safe,
         safe_xy,
         slack,
-    ) = _actor_outputs(params, hparams, obs, qp_context=qp_context)
+    ) = actor_outputs[:7]
     action, logprob, entropy, sampled_policy_action = (
         actor_critic.action_logprob_entropy(
             params,
@@ -414,5 +418,6 @@ def get_action_and_value(
                 safe_xy,
                 slack,
             )
+        diagnostics["qp_failure"] = actor_outputs[7]
         outputs = outputs + (diagnostics,)
     return outputs

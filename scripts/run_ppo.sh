@@ -14,4 +14,4 @@ case "$1" in
   ppo) profile=(model=ppo_gnn trainer.safety_filter.enabled=false) ;;
   ppo_filter) profile=(model=ppo_gnn trainer.safety_filter.enabled=true) ;;
 esac
-profile+=(trainer.safety_filter.reward.weight=0.0 trainer.reward_loss.weight=0.0)
+profile+=(trainer.cbf_rl.enabled=false trainer.reward_loss.weight=0.0)

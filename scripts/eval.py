@@ -416,6 +416,12 @@ class Evaluator:
         self.seeds = seeds
         self.config = OmegaConf.load(self.save_dir / "config.yaml")
         self.is_controller = "controller" in self.config and "model" not in self.config
+        if not self.is_controller and "cbf_rl" not in self.config.trainer:
+            # Older checkpoints identified CBF-RL by a positive filter reward weight.
+            legacy_reward = self.config.trainer.safety_filter.get("reward")
+            enabled = legacy_reward is not None and legacy_reward.weight > 0
+            self.config.trainer.cbf_rl = {"enabled": enabled}
+            print(f"Loaded legacy checkpoint configuration: trainer.cbf_rl.enabled={enabled}", flush=True)
         self.episodes = int((1 if self.is_controller else 50) if episodes is None else episodes)
         backend = self.config.env.get("backend", "jax")
         if backend not in ("jax", "crax_mjx"):
@@ -468,7 +474,7 @@ class Evaluator:
             results[path.name] = self.evaluate_one_ckpt(path)
             print(f"{path.name}: {json.dumps(results[path.name])}")
         aggregate = {"num_checkpoints": len(paths)}
-        for key in ("mean_return", "success_rate", "collision_rate", "timeout_rate", "mean_min_clearance"):
+        for key in ("mean_return", "success_rate", "collision_rate", "timeout_rate", "qp_failure_rate", "mean_min_clearance"):
             values = [metrics[key] for metrics in results.values() if metrics[key] is not None]
             aggregate[f"mean_{key}"] = float(np.mean(values)) if values else None
         results["aggregate"] = aggregate

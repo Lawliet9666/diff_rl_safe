@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 from solver.jax_qpth import QPFunction
-from solver.jax_qpth.qp import qp_residuals, check_qp_residuals
+from solver.jax_qpth.qp import qp_residuals, check_qp_residuals, qp_solution_valid
 
 
 def _single_integrator_qp_objective(hparams, obs, nominal_xy):
@@ -36,7 +36,7 @@ def _unicycle_qp_objective(hparams, obs, nominal_xy):
     return q, p
 
 
-def _solve_slack_qp(params, hparams, obs, q, p, g, h_qp, *, hard_g=None, hard_h=None, control_transform=None):
+def _solve_slack_qp(params, hparams, obs, q, p, g, h_qp, *, hard_g=None, hard_h=None, control_transform=None, return_status=False):
     batch = obs.shape[0]
     dtype = obs.dtype
     slack_dim = g.shape[1]
@@ -127,17 +127,30 @@ def _solve_slack_qp(params, hparams, obs, q, p, g, h_qp, *, hard_g=None, hard_h=
         empty,
         empty,
     )
+    physical = solution if transform is None else (transform @ solution[..., None]).squeeze(-1)
+    errors = qp_residuals(raw_q.astype(qp_dtype), raw_p.astype(qp_dtype),
+                          raw_g.astype(qp_dtype), raw_h.astype(qp_dtype), physical,
+                          dual/row_scale, slack=solver_slack*row_scale)
+    valid = qp_solution_valid(errors)
+    if return_status:
+        # Invalid input is a programming/numerical-data error, not an episode outcome.
+        finite = jnp.ones((batch,), dtype=bool)
+        for value in (raw_q, raw_p, raw_g, raw_h):
+            finite &= jnp.all(jnp.isfinite(value).reshape((batch, -1)), axis=1)
+        check_qp_residuals(jnp.where(finite[:, None], 0., jnp.inf), label="Nonfinite QP input")
+        # This placeholder must never be executed: callers terminate failed rows.
+        # Mask before transforming so a failed solver iterate cannot poison its VJP.
+        solution = jnp.where(valid[:, None], solution, 0.)
+    else:
+        check_qp_residuals(errors, label="Differentiable QP")
     if transform is not None:
         solution = (transform @ solution[..., None]).squeeze(-1)
-    errors = qp_residuals(raw_q.astype(qp_dtype), raw_p.astype(qp_dtype),
-                          raw_g.astype(qp_dtype), raw_h.astype(qp_dtype), solution,
-                          dual/row_scale, slack=solver_slack*row_scale)
-    check_qp_residuals(errors, label="Differentiable QP")
     action = solution[:, : hparams.act_dim].astype(dtype)
     slack = solution[
         :, hparams.act_dim : hparams.act_dim + slack_dim
     ].astype(dtype)
-    return action, jnp.maximum(slack, 0.0)
+    result = (action, jnp.maximum(slack, 0.0))
+    return (*result, ~valid) if return_status else result
 
 
 def _masked_positive_stats(values, mask):

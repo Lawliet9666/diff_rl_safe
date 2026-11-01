@@ -16,6 +16,7 @@ from env.obstacle.obstacle import (
     workspace_center_radii,
 )
 from env.robots import Robot, angle_normalize, make_robot
+from env import finish_qp_failure
 
 
 class JaxSocialNavConfig(NamedTuple):
@@ -208,9 +209,11 @@ class JaxSocialNav:
             raise ValueError("reset keys must have shape (2,) or (batch_size, 2)")
         return jax.vmap(lambda rng: self._reset_one(env_cfg, rng))(key)
 
-    def step_fn(self, env_cfg, state: JaxSocialNavState, action, key):
+    def step_fn(self, env_cfg, state: JaxSocialNavState, action, key, *, qp_failure=None):
         """Advance robot, obstacles and navigation outcomes."""
         cfg, rng = env_cfg, key
+        if qp_failure is not None:
+            action = jnp.where(jnp.asarray(qp_failure)[:, None], 0., action)
         def advance_one(x, u):
             u = jnp.asarray(u, dtype=x.dtype)
             if cfg.integration_steps == 1:
@@ -282,7 +285,13 @@ class JaxSocialNav:
             "episode_return": completed_returns.astype(jnp.float32),
             "episode_length": completed_lengths.astype(jnp.float32),
         }
-        return next_state, reward.astype(jnp.float32), done.astype(jnp.float32), metrics
+        if qp_failure is not None:
+            # Failed solves end at the current state, before advancing the robot/crowd.
+            metrics["min_clearance"] = jnp.where(
+                qp_failure, self.compute_distances(cfg, state)[1].astype(jnp.float32), metrics["min_clearance"])
+        return finish_qp_failure(state, next_state, reward.astype(jnp.float32),
+                                 done.astype(jnp.float32), metrics, qp_failure,
+                                 cfg.collision_penalty)
 
     def observe_fn(self, env_cfg, state, hparams=None):
         """Build policy observations with the requested human slots."""

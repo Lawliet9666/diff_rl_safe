@@ -6,6 +6,7 @@ import math
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from trainer.ppo_core import flat_time_batch, _trainable_params, _with_trainable
 from env.robots.base import Obstacles
@@ -61,6 +62,7 @@ def _rollout_summary(transitions, has_policy_qp, beta_budget=None):
         "train_success_count": transitions["success"].astype(jnp.int32).sum(),
         "train_collision_count": transitions["collision"].astype(jnp.int32).sum(),
         "train_timeout_count": transitions["timeout"].astype(jnp.int32).sum(),
+        "train_qp_failure_count": transitions["qp_failure"].astype(jnp.int32).sum(),
         "jax_env_min_clearance": jnp.nanmin(transitions["min_clearance"]),
         "boundary_violation_mean": jnp.mean(transitions["boundary_violation"]),
         "boundary_violation_max": jnp.max(transitions["boundary_violation"]),
@@ -209,8 +211,8 @@ def _collect_reward_windows(body, initial, params, value_fn, loss_fn, horizon, s
     return carry, transitions, metrics
 
 
-def _cbf_reward(proposed, filtered, diagnostics, sigma):
-    """CBF-RL shaping using the active obstacle with minimum surface clearance."""
+def _active_cbf_violation(diagnostics):
+    """Negative proposed residual for the obstacle with minimum clearance."""
     mask = diagnostics["obstacle_mask"]
     residual = diagnostics["proposed_cbf_residual"]
     clearance = diagnostics["obstacle_clearance"]
@@ -221,10 +223,18 @@ def _cbf_reward(proposed, filtered, diagnostics, sigma):
         index = jnp.argmin(jnp.where(active, clearance, jnp.inf), axis=-1)
         selected = jnp.take_along_axis(residual, index[..., None], axis=-1)[..., 0]
         violation = jnp.where(jnp.any(active, axis=-1), jnp.minimum(selected, 0.), 0.)
-    correction = jnp.expm1(-jnp.sum(jnp.square(proposed-filtered), axis=-1) / sigma**2)
+    return violation
+
+
+def _cbf_reward(proposed, filtered, diagnostics, sigma):
+    """Raw CBF-RL violation plus exponential action-correction penalty."""
+    violation = _active_cbf_violation(diagnostics)
+    correction_squared = jnp.sum(jnp.square((proposed-filtered)/sigma), axis=-1)
+    correction = jnp.expm1(-correction_squared)
     return jax.tree_util.tree_map(lambda value: jax.lax.stop_gradient(value.astype(jnp.float32)), {
         "cbf_rl/violation": violation,
         "cbf_rl/correction": correction,
+        "cbf_rl/correction_norm": jnp.sqrt(correction_squared),
         "cbf_rl/reward": violation + correction,
     })
 
@@ -240,10 +250,18 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
 
     if reward_loss_fn is not None and (reward_horizon <= 0 or safety_filter is not None):
         raise ValueError("shared reward loss needs a positive horizon and no external filter")
-    for name, value in (("weight", cbf_reward_weight), ("sigma", cbf_reward_sigma)):
-        if (isinstance(value, bool) or not math.isfinite(value)
-                or value < 0 or (name == "sigma" and value == 0)):
-            raise ValueError(f"invalid safety_filter.reward.{name}")
+    if (isinstance(cbf_reward_weight, bool) or not math.isfinite(cbf_reward_weight)
+            or cbf_reward_weight < 0):
+        raise ValueError("invalid robot.reward.cbf_rl.weight")
+    try:
+        sigma = np.asarray(cbf_reward_sigma, dtype=np.float32)
+    except (TypeError, ValueError) as error:
+        raise ValueError("robot.reward.cbf_rl.sigma must be a positive scalar or vector") from error
+    if (sigma.ndim not in (0, 1) or sigma.size == 0
+            or any(isinstance(v, (bool, np.bool_)) for v in np.asarray(cbf_reward_sigma, dtype=object).flat)
+            or not np.all(np.isfinite(sigma) & (sigma > 0))):
+        raise ValueError("robot.reward.cbf_rl.sigma must be a finite positive scalar or vector")
+    cbf_reward_sigma = jnp.asarray(sigma)
     if cbf_reward_weight > 0 and safety_filter is None:
         raise ValueError("CBF-RL reward requires an external obstacle safety filter")
     need_timeout_values = timeout_aware or reward_loss_fn is not None
@@ -264,6 +282,8 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
         nav_state, obs_history, ppo_episode_returns = env_state
         batch_size = int(obs_history.shape[0])
         act_dim = int(hparams.act_dim)
+        if cbf_reward_weight > 0 and cbf_reward_sigma.ndim == 1 and cbf_reward_sigma.shape != (act_dim,):
+            raise ValueError("robot.reward.cbf_rl.sigma must have one value per policy action channel")
 
         def body(policy_params, carry, _unused):
             state, history, running_ppo_returns, key = carry
@@ -293,18 +313,29 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
                     return_policy_action=True,
                 )
 
+            qp_failure = (qp_diagnostics.get("qp_failure", jnp.zeros(batch_size, dtype=bool))
+                          if has_policy_qp else jnp.zeros(batch_size, dtype=bool))
             executed_action = env_action
             if safety_filter is not None:
                 obstacles = Obstacles(state.human_positions, state.human_vels,
                                       state.human_radii, state.human_mask)
-                executed_action, filter_diagnostics = safety_filter(state.robot_state, env_action, obstacles)
-            next_state, reward, done, metrics = step_fn(env_cfg, state, executed_action, env_key)
+                executed_action, filter_diagnostics = safety_filter(
+                    state.robot_state, env_action, obstacles, allow_failure=True)
+                qp_failure |= filter_diagnostics["qp_failure"]
+            step_kwargs = {"qp_failure": qp_failure} if has_policy_qp or safety_filter is not None else {}
+            executed_action = jnp.where(qp_failure[:, None], 0., executed_action)
+            next_state, reward, done, metrics = step_fn(env_cfg, state, executed_action, env_key, **step_kwargs)
             if has_policy_qp:
                 reward = reward - float(hparams.qp_residual_reward_weight) * qp_diagnostics["qp_slack"]
             if cbf_reward_weight > 0:
                 shaping = _cbf_reward(env_action, executed_action, filter_diagnostics, cbf_reward_sigma)
+                shaping["cbf_rl/weighted_violation"] = cbf_reward_weight * shaping["cbf_rl/violation"]
+                shaping["cbf_rl/weighted_correction"] = cbf_reward_weight * shaping["cbf_rl/correction"]
                 shaping["cbf_rl/weighted_reward"] = cbf_reward_weight * shaping["cbf_rl/reward"]
+                shaping = {name: jnp.where(qp_failure, 0., value) for name, value in shaping.items()}
+                shaping["cbf_rl/task_reward"] = reward
                 reward = reward + shaping["cbf_rl/weighted_reward"]
+                shaping["cbf_rl/train_reward"] = reward
             done_bool = done > 0.5
             next_ppo_returns, completed_ppo_return = _update_ppo_episode_returns(
                 running_ppo_returns,
@@ -378,6 +409,7 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
                     "robot_omega_delta": metrics["robot_omega_delta"],
                     "robot_omega_delta_penalty": metrics["robot_omega_delta_penalty"],
                 }
+            transition["qp_failure"] = qp_failure.astype(jnp.float32)
             if safety_filter is not None:
                 transition['executed_act'] = executed_action
                 transition.update({name: value for name, value in filter_diagnostics.items()
@@ -447,6 +479,7 @@ def make_rollout_collector(model_module, *, step_fn, reset_fn,
                           for name, value in transitions.items() if name.startswith('filter/')})
         if "qp_robot_state" in transitions:
             batch["qp_robot_state"] = flat_time_batch(transitions["qp_robot_state"])
+        batch["policy_valid"] = flat_time_batch(transitions["qp_failure"] < .5)
         if timeout_aware:
             batch.update({key: transitions[key] for key in ("terminated", "truncated", "next_values")})
         batch.update({key: jnp.mean(value) for key, value in transitions.items() if key.startswith("control/")})

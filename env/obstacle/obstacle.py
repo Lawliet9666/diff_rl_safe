@@ -171,7 +171,7 @@ def update_obstacle_goals(cfg, state, rng):
     )
     return state._replace(human_goals=new_goals)
 
-def social_force_actions(cfg, state):
+def social_force_actions(cfg, state, *, distance_norm=vector_norm):
     pos = state.human_positions
     vel = state.human_vels
     goals = state.human_goals
@@ -204,7 +204,7 @@ def social_force_actions(cfg, state):
         robot_neighbor_mask = jnp.zeros_like(mask, dtype=bool)
 
     delta = pos[:, :, None, :] - all_pos[:, None, :, :]
-    dist = vector_norm(delta, axis=-1)
+    dist = distance_norm(delta, axis=-1)
     valid_neighbor = mask[:, :, None] & all_mask[:, None, :]
     eye = jnp.eye(cfg.num_humans, dtype=bool)[None, :, :]
     valid_neighbor = valid_neighbor.at[:, :, : cfg.num_humans].set(valid_neighbor[:, :, : cfg.num_humans] & ~eye)
@@ -246,14 +246,14 @@ def human_step(cfg, state, actions):
     return next_positions, clipped
 
 
-def advance_obstacles(cfg, state, rng):
+def advance_obstacles(cfg, state, rng, *, distance_norm=vector_norm):
     """Update obstacles after robot motion."""
     gmm_rng = rng
     if cfg.end_goal_changing or cfg.random_goal_changing:
         goal_rng, gmm_rng = jax.random.split(rng)
         state = update_obstacle_goals(cfg, state, goal_rng)
 
-    human_actions = social_force_actions(cfg, state)
+    human_actions = social_force_actions(cfg, state, distance_norm=distance_norm)
     if cfg.human_use_gmm:
         human_actions = apply_gmm_noise(cfg, human_actions, state, gmm_rng)
     next_positions, next_vels = human_step(cfg, state, human_actions)

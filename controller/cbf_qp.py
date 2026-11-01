@@ -350,7 +350,7 @@ def _prepare_jax_data(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None
 def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
                     solver=SolverConfig(), slack_weight=0.0, qp_obs_top_k=None,
                     speed_facets=16, max_iter=40, eps=1.0e-12, active=None,
-                    constraint_mode="cbf", single_obstacle=False):
+                    constraint_mode="cbf", single_obstacle=False, allow_failure=False):
     """Filter a nominal physical input using OSQP or batched JAX forward solving.
 
     Only obstacle constraints receive slack. The JAX backend stops gradients and
@@ -359,6 +359,8 @@ def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
     Discrete state-limit violations are reported by the environment.
     single_obstacle selects minimum surface clearance over all active obstacles
     for CBF-RL; the selected robot CBF/HOCBF and physical/input limits are retained.
+    allow_failure reports rejected JAX solves for per-episode termination;
+    its placeholder actions must not be executed.
     """
     if backend not in {"osqp", "jax"}:
         raise ValueError("generate_action backend must be 'osqp' or 'jax'")
@@ -453,8 +455,18 @@ def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
                           slack=solver_slack*data['row_scale'])
     finite_inputs = jnp.all(jnp.isfinite(state), axis=1) & jnp.all(jnp.isfinite(nominal), axis=1)
     errors = jnp.where(finite_inputs[:, None], errors, jnp.inf)
-    check_qp_residuals(errors, tolerance=solver.feasibility_tolerance,
-                       label="Physical CBF-QP" if constraint_mode == "physical" else "SF-PPO CBF-QP")
+    failed = ~jnp.all(jnp.isfinite(errors) & (errors <= solver.feasibility_tolerance), axis=1)
+    if allow_failure:
+        finite = finite_inputs
+        for name in ('raw_q', 'raw_p', 'raw_g', 'raw_h'):
+            finite &= jnp.all(jnp.isfinite(data[name]).reshape((state.shape[0], -1)), axis=1)
+        check_qp_residuals(jnp.where(finite[:, None], 0., jnp.inf), label="Nonfinite QP input")
+        # A transport placeholder only; the environment discards these rows' step.
+        action = jnp.where(failed[:, None], 0., action)
+        slack = jnp.where(failed[:, None], 0., slack)
+    else:
+        check_qp_residuals(errors, tolerance=solver.feasibility_tolerance,
+                           label="Physical CBF-QP" if constraint_mode == "physical" else "SF-PPO CBF-QP")
     primal = errors[:, 0]
     residual = (data['constraints'].A @ action.astype(jnp.float64)[..., None]).squeeze(-1)+data['constraints'].b
     correction = jnp.linalg.norm(action-nominal, axis=1)
@@ -487,5 +499,11 @@ def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
             'filter/kkt_residual': jnp.max(errors[:, 1:], axis=1),
             'filter/initial_safe': jnp.all(data['constraints'].domain >= -1e-5, axis=1).astype(jnp.float32),
         }
+    if allow_failure:
+        # Invalid solver diagnostics must not poison finite batch statistics.
+        for name, value in diagnostics.items():
+            if name.startswith('filter/'):
+                diagnostics[name] = jnp.where(failed, 0., value)
+        diagnostics['qp_failure'] = failed
     result = jax.tree_util.tree_map(jax.lax.stop_gradient, (action, diagnostics))
     return jax.tree_util.tree_map(lambda value: value[0], result) if single else result

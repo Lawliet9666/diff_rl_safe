@@ -36,6 +36,10 @@ max_checkpoints: 10
 physical_limits:
   enabled: false
 
+# CBF-RL uses robot.reward.cbf_rl and removes the filter during evaluation.
+cbf_rl:
+  enabled: false
+
 # PPO+filter keeps this at evaluation; CBF-RL uses it only during training.
 safety_filter:
   enabled: false
@@ -44,10 +48,6 @@ safety_filter:
   speed_facets: 16  # Single-integrator speed disk inner approximation only.
   max_iter: 40
   eps: 1.0e-12
-  # Positive weight selects CBF-RL; evaluation uses task reward without a filter.
-  reward:
-    weight: 0.0
-    sigma: 0.5
 
 # Differentiate the existing reward over windows of the shared PPO rollout.
 reward_loss:

@@ -181,7 +181,7 @@ def _current_obs(obs, hparams):
     return obs_history, obs_history[:, -1, :]
 
 
-def _actor_outputs(params, hparams, obs, qp_context=None):
+def _actor_outputs(params, hparams, obs, qp_context=None, *, return_status=False):
     obs_history, current_obs = _current_obs(obs, hparams)
     actor_params = params["actor"]
     robot_latent, human_latents = spatio_temporal_graph_encode(
@@ -221,10 +221,10 @@ def _actor_outputs(params, hparams, obs, qp_context=None):
         beta_topk = _uniform_beta_budget(qp_blocks[:, :, 5], hparams)
     r_safe_topk = _gather_topk(r_safe_all, qp_topk_ids)
     nominal_xy = _body_to_world(nominal_xy, qp_obs[:, 4])
-    safe_xy, slack = cvar_qp.solve_slack_qp(
-        params, hparams, qp_obs, nominal_xy, beta_topk, r_safe_topk
+    qp_result = cvar_qp.solve_slack_qp(
+        params, hparams, qp_obs, nominal_xy, beta_topk, r_safe_topk, return_status=return_status
     )
-    return robot_latent, qp_obs, nominal_xy, beta_topk, r_safe_topk, safe_xy, slack
+    return robot_latent, qp_obs, nominal_xy, beta_topk, r_safe_topk, *qp_result
 
 
 def safe_action_mean(params, hparams, obs, qp_context=None):
@@ -258,12 +258,14 @@ def get_action_and_value(
     return_diagnostics=False,
     qp_context=None,
 ):
-    robot_latent, qp_obs, nominal_xy, beta, r_safe, safe_xy, slack = _actor_outputs(
+    actor_outputs = _actor_outputs(
         params,
         hparams,
         obs,
         qp_context=qp_context,
+        return_status=return_diagnostics,
     )
+    robot_latent, qp_obs, nominal_xy, beta, r_safe, safe_xy, slack = actor_outputs[:7]
     mean = safe_xy
 
     action, logprob, entropy, sampled_policy_action = actor_critic.action_logprob_entropy(
@@ -283,5 +285,6 @@ def get_action_and_value(
             diagnostics = cvar_qp.full_diagnostics(params, hparams, qp_obs, nominal_xy, beta, r_safe, safe_xy, slack)
         else:
             diagnostics = cvar_qp.lightweight_diagnostics(params, hparams, qp_obs, nominal_xy, beta, r_safe, safe_xy, slack)
+        diagnostics["qp_failure"] = actor_outputs[7]
         outputs = outputs + (diagnostics,)
     return outputs

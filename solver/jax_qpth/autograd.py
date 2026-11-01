@@ -11,6 +11,17 @@ from .util import bger
 def qpth_backward(Q, p, G, h, A, b, zhats, lams, slacks, nus, dl_dzhat):
     """Return qpth-style gradients for Q, p, G, h, A, b."""
     del h
+    # Failed forward rows are masked by the caller. Do not factor their invalid
+    # KKT systems even when their cotangent is zero (0 * NaN is still NaN).
+    active = jnp.any(dl_dzhat != 0., axis=-1)
+    matrix_mask, vector_mask = active[:, None, None], active[:, None]
+    Q = jnp.where(matrix_mask, Q, jnp.eye(Q.shape[-1], dtype=Q.dtype))
+    G = jnp.where(matrix_mask, G, 0.)
+    A = jnp.where(matrix_mask, A, jnp.eye(A.shape[-2], A.shape[-1], dtype=A.dtype))
+    zhats = jnp.where(vector_mask, zhats, 0.)
+    lams = jnp.where(vector_mask, lams, 1.)
+    slacks = jnp.where(vector_mask, slacks, 1.)
+    nus = jnp.where(vector_mask, nus, 0.)
     d = jnp.clip(lams, min=1e-8) / jnp.clip(slacks, min=1e-8)
     n_batch, nineq, _nz = G.shape
     neq = A.shape[1]
@@ -30,4 +41,5 @@ def qpth_backward(Q, p, G, h, A, b, zhats, lams, slacks, nus, dl_dzhat):
     else:
         dAs = jnp.zeros_like(A)
         dbs = jnp.zeros_like(b)
-    return dQs, dps, dGs, dhs, dAs, dbs
+    return tuple(jnp.where(active.reshape((active.shape[0],)+(1,)*(v.ndim-1)), v, 0.)
+                 for v in (dQs, dps, dGs, dhs, dAs, dbs))

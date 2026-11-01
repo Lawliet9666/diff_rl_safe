@@ -198,7 +198,7 @@ def save_videos(video_dir, traces, records, env_cfg, hparams, module):
                 status = "timeout"
             frames.append(render_jax_social_nav_frame(
                 env_cfg, state, status=status, robot_traj=trajectory, qp_viz=qp_viz))
-        status = ("collision" if record["collision"] else "success" if record["success"]
+        status = ("qp_failure" if record.get("qp_failure", False) else "collision" if record["collision"] else "success" if record["success"]
                   else "timeout")
         filename = f"episode_{index:04d}_seed_{record['seed']}_{status}.mp4"
         save_video(video_dir/filename, frames, fps=int(round(1./env_cfg.dt)))
