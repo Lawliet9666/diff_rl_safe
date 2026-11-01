@@ -1,110 +1,89 @@
 # diff_rl_safe
+![Recorded unicycle navigation](docs/demo.gif)
 
-Social navigation with JAX environments, CBF-QP controllers, and PPO policies
-using BarrierNet, DiffCVaR, or PPO with MLP/GNN encoders.
+JAX social navigation with CBF-QP controllers and PPO, CBF-RL, and BarrierNet policies.
+
+## Prerequisites
+- Micromamba for the local `diffrl` environment.
+- CUDA-enabled JAX for GPU execution; Slurm and a Conda environment named `diffrl` on Matilda.
+- W&B authentication (`wandb login`), or set `WANDB_MODE=disabled`.
 
 ## Getting Started
-
-For macOS (CPU), using Micromamba:
-
 ```bash
 micromamba create -f environment.yml
 micromamba activate diffrl
 ```
 
 ## Quick Start
-
-Run a CBF-QP controller without training:
-
 ```bash
-python scripts/run_controller.py robot=unicycle --visualize
-python scripts/run_controller.py robot=quadrotor --visualize
+# CBF controller, no training
+bash scripts/run_local.sh cbf unicycle --visualize
+
+# Preview CBF-RL across five robots
+bash scripts/run_local.sh cbf_rl all --device cuda --dry-run
+
+# Train PPO and PPO+filter sequentially on one GPU
+bash scripts/run_ppo.sh both all --device cuda
+
+# Preview four independent Matilda jobs
+bash scripts/run_matilda.sh all --dry-run
+
+# Submit the four jobs on Matilda
+bash scripts/run_matilda.sh all
 ```
 
-Outputs are saved under `outputs/controllers/<robot>_<scenario>_seed<seed>/<timestamp>/`.
-Omit `--visualize` to skip videos.
+| Method | Script / selector |
+| --- | --- |
+| PPO / PPO + safety filter | `run_ppo.sh ppo`, `ppo_filter`, or `both`; local selector `ppo_both` runs both |
+| CBF-RL with runtime filtering | `run_cbf_rl.sh` / `cbf_rl` |
+| Differentiable CBF-QP | `run_barriernet.sh` / `barriernet` |
+| Differentiable CBF-QP + simulation gradients | `run_barriernet_sim.sh` / `barriernet_sim` |
+| CBF controller | `run_cbf.sh` / `cbf` |
 
-Train the default BarrierNet-GNN policy:
+All five robot models are supported: `single_integrator`, `unicycle`,
+`double_integrator`, `humanoid`, and `quadrotor`. Methods and robots execute
+sequentially within each process. Matilda `all` submits four independent jobs:
+PPO+PPO-filter, CBF-RL, BarrierNet, and BarrierNet+simulation.
 
+| Launcher | CPU threads | Environments | PPO batch | Steps per run |
+| --- | ---: | ---: | ---: | ---: |
+| Local CPU | 4 | 4 | 1024 | 15M |
+| Local CUDA | 8 | 16 | 4096 | 15M |
+| Matilda, per job | 8 | 32 | 4096 | 15M |
+
+Each Matilda job requests one GPU and 64 GB RAM. W&B is online by default;
+`RUN_NAME`, `WANDB_MODE`, `WANDB_ENTITY`, and `WANDB_PROJECT` customize logging.
+GPU visibility is inherited from Slurm. Local `--gpu ID` selects one visible GPU.
+`CPU_THREADS` sets thread limits, not CPU affinity. The default crowd has 30 humans.
+
+Pass Hydra overrides after launcher options:
 ```bash
-WANDB_MODE=disabled RUN_NAME=barriernet_gnn bash scripts/run_ppo.sh
+bash scripts/run_local.sh cbf_rl unicycle --device cpu model=ppo_mlp seed=1
+bash scripts/run_matilda.sh cbf_rl all seed=1 trainer.total_timesteps=5000000
 ```
-
-Select another policy or robot:
-
-```bash
-WANDB_MODE=disabled RUN_NAME=diff_cvar_gnn bash scripts/run_ppo.sh model=diff_cvar_gnn
-WANDB_MODE=disabled RUN_NAME=ppo_mlp_si bash scripts/run_ppo.sh model=ppo_mlp robot=single_integrator
-```
-
-PPO supports `unicycle` and `single_integrator`; the quadrotor currently uses the
-controller entry point. Training outputs are saved under
-`outputs/<scenario>/runs/<run>/`, including `config.yaml`, metrics, and checkpoints.
-
-## Common Overrides
-
-Pass Hydra overrides directly to either launcher where applicable:
-
-| Option | Default | Override example |
-| --- | --- | --- |
-| Policy | `barriernet_gnn` | `model=diff_cvar_mlp` |
-| Device | `auto` | `device=cpu` or `device=cuda` |
-| Training environments | `128` | `trainer.num_envs=64` |
-| Training timesteps | `20000000` | `trainer.total_timesteps=5000000` |
-| Number of humans | `20` | `env.humans.num_humans=15` |
-| Seed | `0` | `seed=1` |
-
-Policies: `barriernet_gnn`, `barriernet_mlp`, `diff_cvar_gnn`, `diff_cvar_mlp`,
-`ppo_gnn`, and `ppo_mlp`. See `config/` for all parameters.
-
-For the optional CRAX/MJX backend, install its physics dependencies first, then run:
-
-```bash
-WANDB_MODE=disabled RUN_NAME=crax_barriernet bash scripts/run_ppo.sh env=crax_social_nav robot=unicycle
-```
-
-## W&B Logging
-
-```bash
-wandb login
-WANDB_PROJECT=diff_rl_safe WANDB_ENTITY="<user_or_team>" \
-  RUN_NAME=online_run bash scripts/run_ppo.sh
-```
-
-Use `WANDB_MODE=disabled` to disable W&B logging.
+Robot/CBF parameters remain in `config/`. Additional policy modules, including
+DiffCVaR, can be selected with `model=`; the optional CRAX backend uses
+`env=crax_social_nav` with a supported robot. Training outputs go to
+`outputs/<scenario>/runs/<run>/`; controllers use `outputs/controllers/`.
 
 ## Evaluation
-
-Use `controller.slack_weight=0` for hard CBF-QP, or a positive weight for obstacle
-slack for all five robot models. Re-evaluate a saved controller run:
-
-```bash
-RUN_DIR="outputs/controllers/<robot>_<scenario>_seed<seed>/<timestamp>"
-python scripts/eval.py --save-dir "$RUN_DIR" --seeds 100,200 --episodes 1 --visualize
-```
-
-Evaluate an RL checkpoint:
-
 ```bash
 RUN_DIR="outputs/crowd_dyn_var_num_env/runs/<run>"
 python scripts/eval.py --save-dir "$RUN_DIR" \
-  --checkpoint "$RUN_DIR/ckpt_<step>.pkl" --seeds 100,200 --episodes 1 --visualize
+  --checkpoint "$RUN_DIR/ckpt_<step>.pkl" --seeds 100,200 --episodes 50 --visualize
 ```
-
 `--episodes` is the count per base seed. Omit `--checkpoint` to evaluate all RL
-checkpoints, or `--visualize` to skip videos. Results are saved to
-`<run>/eval_results.json`; videos go to `<run>/visualize_cbf_qp/` for controllers
-and `<run>/visualize_ckpt_<step>/` for RL.
+checkpoints. The same evaluator accepts controller run directories. Results are
+saved to `<run>/eval_results.json`, with videos under `<run>/visualize_*/`.
 
 ## Project Structure
-
 ```text
 config/           Hydra environment, robot, controller, policy, and PPO settings
-controller/       Deterministic CBF-QP controller and rollout execution
+controller/       CBF-QP controllers and fixed execution filters
 env/              JAX/CRAX environments and shared robot models
-model/            BarrierNet, DiffCVaR, and PPO policies with MLP/GNN encoders
+model/            PPO, BarrierNet, and DiffCVaR policies
 solver/jax_qpth/   Differentiable QP solver
 trainer/          Shared PPO training and evaluation
-utils.py          Shared device configuration and model checkpoint utilities
-scripts/          Controller, training, and evaluation entry points
+scripts/          run_local.sh, run_matilda.sh, method profiles, and Python entry points
+utils.py          Device configuration and checkpoint utilities
 ```
