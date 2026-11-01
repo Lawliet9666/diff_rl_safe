@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 from solver.jax_qpth import QPFunction
+from solver.jax_qpth.qp import qp_residuals, check_qp_residuals
 
 
 def _single_integrator_qp_objective(hparams, obs, nominal_xy):
@@ -89,6 +90,8 @@ def _solve_slack_qp(params, hparams, obs, q, p, g, h_qp, *, hard_g=None, hard_h=
     g_qp = jnp.concatenate([g_qp, bound_g], axis=1)
     h_qp_full = jnp.concatenate([h_qp_full, bound_h], axis=1)
 
+    raw_q, raw_p, raw_g, raw_h = q_qp, p_qp, g_qp, h_qp_full
+    row_scale = jnp.ones_like(h_qp_full)
     transform = None
     if control_transform is not None:
         # Exact variable/row scaling for mixed-unit QPs.
@@ -106,7 +109,7 @@ def _solve_slack_qp(params, hparams, obs, q, p, g, h_qp, *, hard_g=None, hard_h=
 
     qp_dtype = jnp.float64
     empty = jnp.empty((0,), dtype=qp_dtype)
-    solution = QPFunction(
+    solution, _, dual, solver_slack = QPFunction(
         eps=hparams.qp_eps,
         verbose=hparams.qp_verbose,
         # Use the full iteration budget for stiff HOCBF problems.
@@ -114,6 +117,7 @@ def _solve_slack_qp(params, hparams, obs, q, p, g, h_qp, *, hard_g=None, hard_h=
                         else hparams.qp_not_improved_lim),
         maxIter=hparams.qp_max_iter,
         check_Q_spd=hparams.qp_check_q_spd,
+        return_duals=True,
         safe_step=control_transform is not None,
     )(
         q_qp.astype(qp_dtype),
@@ -125,6 +129,10 @@ def _solve_slack_qp(params, hparams, obs, q, p, g, h_qp, *, hard_g=None, hard_h=
     )
     if transform is not None:
         solution = (transform @ solution[..., None]).squeeze(-1)
+    errors = qp_residuals(raw_q.astype(qp_dtype), raw_p.astype(qp_dtype),
+                          raw_g.astype(qp_dtype), raw_h.astype(qp_dtype), solution,
+                          dual/row_scale, slack=solver_slack*row_scale)
+    check_qp_residuals(errors, label="Differentiable QP")
     action = solution[:, : hparams.act_dim].astype(dtype)
     slack = solution[
         :, hparams.act_dim : hparams.act_dim + slack_dim

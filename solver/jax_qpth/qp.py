@@ -12,6 +12,49 @@ from .pdipm import forward as pdipm_forward
 from .util import expand_qp_params, reduce_grad
 
 
+def qp_residuals(Q, p, G, h, x, dual, *, A=None, b=None, nu=None,
+                 slack=None, xp=jnp):
+    """Absolute KKT errors in the original QP coordinates, including all slacks.
+
+    Order: primal feasibility, stationarity, complementarity, dual feasibility.
+    Undo solver variable/row scaling before calling. Nonfinite data or solutions
+    give infinite errors; positive decision-variable slack is allowed by G/h.
+    """
+    maximum = lambda value: xp.max(value, axis=-1, initial=0.)
+    margin = h - (G @ x[..., None])[..., 0]
+    s = margin if slack is None else slack
+    primal = xp.maximum(maximum(-margin), maximum(-s))
+    primal = xp.maximum(primal, maximum(xp.abs(s-margin)))
+    stationarity = (Q @ x[..., None])[..., 0] + p + (xp.swapaxes(G, -1, -2) @ dual[..., None])[..., 0]
+    values = [(Q, 2), (p, 1), (G, 2), (h, 1), (x, 1), (dual, 1), (s, 1)]
+    if A is not None:
+        primal = xp.maximum(primal, maximum(xp.abs((A @ x[..., None])[..., 0]-b)))
+        stationarity = stationarity + (xp.swapaxes(A, -1, -2) @ nu[..., None])[..., 0]
+        values += [(A, 2), (b, 1), (nu, 1)]
+    errors = xp.stack([primal, maximum(xp.abs(stationarity)),
+                       xp.maximum(maximum(xp.abs(margin*dual)), maximum(xp.abs(s*dual))),
+                       maximum(-dual)], axis=-1)
+    finite = xp.all(xp.isfinite(errors), axis=-1)
+    for value, ndim in values:
+        finite = finite & xp.all(xp.isfinite(value), axis=tuple(range(-ndim, 0)))
+    return xp.where(finite[..., None], errors, xp.inf)
+
+
+def check_qp_residuals(errors, *, tolerance=1e-6, label="QP"):
+    """Reject invalid JAX solutions without altering the successful action VJP."""
+    errors = jax.lax.stop_gradient(errors)
+    valid = jnp.all(jnp.isfinite(errors) & (errors <= tolerance), axis=-1)
+    def fail(_):
+        def raise_failure(ok, residuals):
+            if not np.all(ok):
+                failed = np.flatnonzero(~np.asarray(ok)).tolist()
+                raise RuntimeError(f"{label} failed for batch rows {failed}; "
+                                   f"KKT residuals={np.asarray(residuals).tolist()}")
+        jax.debug.callback(raise_failure, valid, errors, ordered=True)
+        return 0
+    jax.lax.cond(jnp.all(valid), lambda _: 0, fail, None)
+
+
 def _check_q_spd(Q):
     chol = jnp.linalg.cholesky(Q)
     ok = jnp.all(jnp.isfinite(chol))
@@ -49,12 +92,12 @@ def solve_qp(Q, p, G, h, A, b, eps=1e-12, verbose=0, notImprovedLim=3, maxIter=2
     )
 
 
-def QPFunction(eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20, check_Q_spd=True, safe_step=False):
-    """Differentiable dense QP; safe_step ignores zero Newton directions."""
+def QPFunction(eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20, check_Q_spd=True, safe_step=False, return_duals=False):
+    """Differentiable dense QP; optional dual/slack outputs are diagnostics only."""
 
     @jax.custom_vjp
     def _solve(Q, p, G, h, A, b):
-        return solve_qp(
+        result = solve_qp(
             Q,
             p,
             G,
@@ -67,7 +110,8 @@ def QPFunction(eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20, check_Q_spd=T
             maxIter=maxIter,
             safe_step=safe_step,
             check_Q_spd=check_Q_spd,
-        )[0]
+        )
+        return result if return_duals else result[0]
 
     def _solve_fwd(Q, p, G, h, A, b):
         expanded = expand_qp_params(Q, p, G, h, A, b)
@@ -109,9 +153,12 @@ def QPFunction(eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20, check_Q_spd=T
             slacks,
             nus,
         )
-        return zhats, residual
+        result = (zhats, nus, lams, slacks) if return_duals else zhats
+        return result, residual
 
     def _solve_bwd(residual, dl_dzhat):
+        if return_duals:
+            dl_dzhat = dl_dzhat[0]
         (
             Q_orig,
             p_orig,

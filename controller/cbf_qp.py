@@ -14,7 +14,8 @@ from scipy import sparse
 from env.robots.base import Obstacles, check_obstacle_shapes
 from env.robots import (DoubleIntegratorRobot, HumanoidRobot, QuadrotorRobot,
                         SingleIntegratorRobot)
-from solver.jax_qpth.qp import solve_qp as solve_jax_qp
+from solver.jax_qpth.qp import (solve_qp as solve_jax_qp, qp_residuals,
+                               check_qp_residuals)
 
 
 class _TrackingQP(NamedTuple):
@@ -184,15 +185,13 @@ def _solve_osqp(nominal, data, scale, domain, solver):
                  else np.asarray(result.x, dtype=np.float64) * scale)
     residual = A @ candidate + b
     kkt = np.full(3, np.inf)
-    if result.x is not None and result.y is not None:
-        z, dual = np.asarray(result.x), np.asarray(result.y)
-        slack = C @ z - lower
-        kkt = np.array([max(0., float(np.max(-slack))),
-                        np.max(np.abs(P@z + q + C.T@dual)),
-                        max(float(np.max(np.abs(slack*dual))), float(np.max(dual)), 0.)])
-    valid = bool(status == "solved" and np.isfinite(candidate).all()
-                 and np.isfinite(residual).all() and np.all(residual >= -tolerance)
-                 and np.isfinite(kkt).all() and np.all(kkt <= tolerance))
+    if status == "solved":
+        # OSQP lower-bound multipliers have the opposite sign to G*x <= h.
+        errors = qp_residuals(data.q, data.p, data.g, data.h, candidate,
+                              -np.asarray(result.y)/row_scale, xp=np)
+        kkt = np.array([errors[0], errors[1], max(errors[2], errors[3])])
+    valid = bool(status == "solved" and np.isfinite(kkt).all()
+                 and np.all(kkt <= tolerance))
     if status == "solved" and not valid:
         raise RuntimeError(
             f"OSQP solution failed feasibility/KKT checks after {result.info.iter} iterations: "
@@ -322,7 +321,8 @@ def _prepare_jax_data(robot, state, nominal, obstacles, dt, *, qp_obs_top_k=None
     scaled_g = g @ transform
     scale = jnp.maximum(jnp.linalg.norm(scaled_g, axis=-1), 1.)
     return dict(q=scaled_q, p=scaled_p, g=scaled_g/scale[..., None], h=h/scale,
-                transform=transform, raw_g=g, raw_h=h, constraints=constraints,
+                transform=transform, row_scale=scale, raw_q=q, raw_p=p,
+                raw_g=g, raw_h=h, constraints=constraints,
                 ids=ids, mask=obstacles.mask)
 
 
@@ -410,7 +410,7 @@ def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
     empty = jnp.empty((0,), jnp.float64)
     # Match BarrierNet's first-order versus high-order solver settings.
     high_order = constraint_mode == "physical" or isinstance(robot, (DoubleIntegratorRobot, HumanoidRobot, QuadrotorRobot))
-    solution, _, dual, _ = solve_jax_qp(
+    solution, _, dual, solver_slack = solve_jax_qp(
         data['q'], data['p'], data['g'], data['h'], empty, empty,
         eps=eps, verbose=-1, notImprovedLim=max_iter if high_order else 3,
         maxIter=max_iter, check_Q_spd=False, safe_step=high_order)
@@ -420,29 +420,17 @@ def generate_action(robot, state, nominal, obstacles, dt, *, backend="osqp",
     slack = jnp.maximum(physical[:, dim:], 0.)
     if slack_weight == 0:
         slack = jnp.zeros_like(data['mask'])
-    applied_solution = jnp.concatenate([action.astype(jnp.float64), physical[:, dim:]], axis=1)
-    primal = jnp.maximum(jnp.max(
-        (data['raw_g'] @ applied_solution[..., None]).squeeze(-1)-data['raw_h'], axis=1), 0.)
-    dual_residual = jnp.max(jnp.abs(
-        (data['q'] @ solution[..., None]).squeeze(-1)+data['p']+
-        (jnp.swapaxes(data['g'], 1, 2) @ dual[..., None]).squeeze(-1)), axis=1)
-    distance = data['h']-(data['g'] @ solution[..., None]).squeeze(-1)
-    complementarity = jnp.max(jnp.abs(distance*dual), axis=1)
-    dual_feasibility = jnp.maximum(jnp.max(-dual, axis=1), 0.)
-    errors = jnp.stack([primal, dual_residual, complementarity, dual_feasibility], axis=1)
+    errors = qp_residuals(data['raw_q'], data['raw_p'], data['raw_g'], data['raw_h'],
+                          physical, dual/data['row_scale'],
+                          slack=solver_slack*data['row_scale'])
+    finite_inputs = jnp.all(jnp.isfinite(state), axis=1) & jnp.all(jnp.isfinite(nominal), axis=1)
+    errors = jnp.where(finite_inputs[:, None], errors, jnp.inf)
+    check_qp_residuals(errors, tolerance=solver.feasibility_tolerance,
+                       label="Physical CBF-QP" if constraint_mode == "physical" else "SF-PPO CBF-QP")
+    primal = errors[:, 0]
     residual = (data['constraints'].A @ action.astype(jnp.float64)[..., None]).squeeze(-1)+data['constraints'].b
     correction = jnp.linalg.norm(action-nominal, axis=1)
     if constraint_mode == "physical":
-        valid = (jnp.all(jnp.isfinite(state), axis=1) & jnp.all(jnp.isfinite(nominal), axis=1)
-                 & jnp.all(jnp.isfinite(errors), axis=1) & (jnp.max(errors, axis=1) <= 1e-6))
-        def fail(_):
-            def raise_failure(ok, residuals):
-                failed = np.flatnonzero(~np.asarray(ok)).tolist()
-                raise RuntimeError(f"Physical CBF-QP failed for batch rows {failed}; "
-                                   f"KKT residuals={np.asarray(residuals).tolist()}")
-            jax.debug.callback(raise_failure, valid, errors, ordered=True)
-            return 0
-        jax.lax.cond(jnp.all(valid), lambda _: 0, fail, None)
         diagnostics = {
             'qp_ids': data['ids'],
             'filter/correction': correction,

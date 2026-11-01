@@ -80,8 +80,8 @@ export PYTHONUNBUFFERED=1
 export TMPDIR="/scratch/users/xinyiwang/tmp/${SLURM_JOB_ID}"
 mkdir -p "$TMPDIR"
 
-# Run only ppo ppo_filter; the other methods use the separate launcher.
-for method in ppo ppo_filter; do
+# Ordinary PPO methods; BarrierNet uses the separate launcher.
+for method in ppo ppo_filter cbf_rl; do
     bash scripts/run_gpu.sh "$method" all trainer.num_envs=32 trainer.timesteps_per_batch=4096 trainer.total_timesteps=12000000 trainer.num_minibatches=32 trainer.n_updates_per_iteration=4 robot.v_max=1.2
 done
 SLURM

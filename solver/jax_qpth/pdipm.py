@@ -166,6 +166,7 @@ def forward(Q, p, G, h, A, b, eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20
     z0 = jnp.where(min_z <= 0.0, z0 - min_z + 1.0, z0)
 
     initial_carry = (
+        jnp.asarray(0, dtype=jnp.int32),
         x0,
         s0,
         z0,
@@ -179,8 +180,9 @@ def forward(Q, p, G, h, A, b, eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20
         jnp.asarray(True),
     )
 
-    def iteration(_iteration, carry):
+    def iteration(carry):
         (
+            iteration_count,
             x,
             s,
             z,
@@ -242,6 +244,7 @@ def forward(Q, p, G, h, A, b, eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20
         y_candidate = y + alpha * dy
 
         return (
+            iteration_count + 1,
             jnp.where(should_step, x_candidate, x),
             jnp.where(should_step, s_candidate, s),
             jnp.where(should_step, z_candidate, z),
@@ -256,6 +259,7 @@ def forward(Q, p, G, h, A, b, eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20
         )
 
     (
+        _iteration_count,
         _x,
         _s,
         _z,
@@ -267,7 +271,9 @@ def forward(Q, p, G, h, A, b, eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20
         best_resids,
         _n_not_improved,
         _active,
-    ) = jax.lax.fori_loop(0, maxIter, iteration, initial_carry, unroll=False)
+    ) = jax.lax.while_loop(
+        lambda carry: (carry[0] < maxIter) & carry[-1], iteration, initial_carry
+    )
 
     if verbose >= 0:
         inaccurate = jnp.max(best_resids) > 1.0
