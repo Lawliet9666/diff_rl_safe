@@ -73,6 +73,10 @@ def configure_jax_platform_for_device(device) -> str:
         os.environ["JAX_PLATFORMS"] = requested
 
     if requested == "cuda":
+        # Host callbacks need a CPU device even when CUDA runs the training.
+        platforms = os.environ["JAX_PLATFORMS"].split(",")
+        if "cpu" not in {platform.strip().lower() for platform in platforms}:
+            os.environ["JAX_PLATFORMS"] += ",cpu"
         _set_default_env("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
         _append_xla_flag_if_missing("--xla_gpu_autotune_level=0")
     return requested

@@ -112,11 +112,13 @@ def solve_kkt_factored(kkt_factors, d, G, A, S_LU, rx, rs, rz, ry):
 
 
 def get_step(v, dv, safe_step=False):
+    # Keep the keyword compatible; zero directions never restrict positivity.
+    del safe_step
     a = -v / dv
     global_max = jnp.max(a)
     step_cap = jnp.where(global_max > 1.0, global_max, 1.0)
     # Zero directions impose no positivity restriction.
-    nondecreasing = dv >= 0.0 if safe_step else dv > 0.0
+    nondecreasing = dv >= 0.0
     a = jnp.where(nondecreasing, step_cap, a)
     return jnp.min(a, axis=1)
 
@@ -238,6 +240,55 @@ def forward(Q, p, G, h, A, b, eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20
             jnp.ones((n_batch,), dtype=dtype),
         )
         alpha = alpha[:, None]
+
+        # Positivity alone can accept corrector steps that cycle between bounds.
+        # Backtrack each batch row until the existing KKT merit decreases.
+        def acceptable_step(step):
+            trial_resids = residuals(
+                Q, p, G, h, A, b, x + step * dx, s + step * ds,
+                z + step * dz, y + step * dy,
+            )[-1]
+            return (resids < eps) | (jnp.isfinite(trial_resids) & (
+                trial_resids <= (1.0 - 1e-4 * step[:, 0]) * resids
+            ))
+
+        # A corrector need not be a descent direction. If its full step fails,
+        # use the centering Newton direction (target gap = 0.1 * current gap).
+        # Its linearized primal/dual residuals and complementarity all decrease.
+        use_newton = ~acceptable_step(alpha)
+
+        def centering_direction(_):
+            return solve_kkt_factored(
+                kkt_factors, d, G, A, S_LU, rx,
+                z - 0.1 * mu[:, None] / s, rz, ry,
+            )
+
+        newton = jax.lax.cond(
+            should_step & jnp.any(use_newton), centering_direction,
+            lambda _: (dx, ds, dz, dy), None,
+        )
+        dx, ds, dz, dy = (
+            jnp.where(use_newton[:, None], new, old)
+            for new, old in zip(newton, (dx, ds, dz, dy))
+        )
+        alpha = jnp.minimum(
+            0.999 * jnp.minimum(get_step(z, dz), get_step(s, ds)), 1.0,
+        )[:, None]
+
+        def backtrack(state):
+            count, step, accepted = state
+            step = jnp.where(accepted[:, None], step, 0.5 * step)
+            return count + 1, step, acceptable_step(step)
+
+        _, alpha, accepted = jax.lax.while_loop(
+            lambda state: should_step & (state[0] < 30) & jnp.any(~state[2]),
+            backtrack,
+            (jnp.asarray(0), alpha, acceptable_step(alpha)),
+        )
+        # An unsuccessful line search stops the solve; callers still validate
+        # the best iterate against the original, unchanged KKT tolerance.
+        should_step = should_step & jnp.all(accepted)
+        row_step = should_step & (resids >= eps)
         x_candidate = x + alpha * dx
         s_candidate = s + alpha * ds
         z_candidate = z + alpha * dz
@@ -245,10 +296,10 @@ def forward(Q, p, G, h, A, b, eps=1e-12, verbose=0, notImprovedLim=3, maxIter=20
 
         return (
             iteration_count + 1,
-            jnp.where(should_step, x_candidate, x),
-            jnp.where(should_step, s_candidate, s),
-            jnp.where(should_step, z_candidate, z),
-            jnp.where(should_step, y_candidate, y),
+            jnp.where(row_step[:, None], x_candidate, x),
+            jnp.where(row_step[:, None], s_candidate, s),
+            jnp.where(row_step[:, None], z_candidate, z),
+            jnp.where(row_step[:, None], y_candidate, y),
             jnp.where(active, next_best_x, best_x),
             jnp.where(active, next_best_s, best_s),
             jnp.where(active, next_best_z, best_z),
