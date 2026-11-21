@@ -2,7 +2,7 @@
 
 ![Recorded unicycle navigation](docs/demo.gif)
 
-A JAX testbed for robot navigation through moving crowds
+A JAX testbed for robot navigation through moving crowds, building on [DiffCVaR](https://arxiv.org/abs/2605.21257). Try the [interactive CrowdNav Playground](https://anonymousroboticsfan123.github.io/crowdnav-playground/) for a browser-based demonstration.
 
 ## Prerequisites
 
