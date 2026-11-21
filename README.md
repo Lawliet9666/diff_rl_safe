@@ -80,6 +80,42 @@ bash scripts/run_local.sh eval "$RUN_DIR" --device cpu \
   --checkpoint "$RUN_DIR/ckpt_<step>.pkl" --seeds 100,200 --episodes 50 --visualize
 ```
 
+## Parameters
+
+Defaults below are for `scripts/run_local.sh`. Append Hydra overrides as `key=value`; set `CPU_THREADS` before the command. Evaluation uses the saved run configuration and the `--...` options below.
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `--device` | `cpu` | Select `cpu` or `cuda`. |
+| `CPU_THREADS` | CPU: `4`; CUDA: `8` | CPU thread limit. |
+| `seed` | `0` | Training/controller random seed. |
+| `trainer.total_timesteps` | `15000000` | Target training steps per run. |
+| `trainer.num_envs` | CPU: `4`; CUDA: `16` | Parallel simulation environments. |
+| `trainer.timesteps_per_batch` | CPU: `1024`; CUDA: `4096` | Total transitions collected per PPO iteration. |
+| `trainer.lr` | `0.0001` | PPO learning rate. |
+| `env.humans.num_humans` | `30` | Number of moving obstacles. |
+| `env.max_steps` | `400` | Maximum control steps per episode. |
+| `env.safety_margin` | `0.05` | Extra obstacle clearance. |
+| `controller.qp_obs_top_k` | `5` | Obstacles considered by the CBF controller. |
+| `controller.slack_weight` | `10.0` | Controller obstacle slack penalty; `0` selects hard constraints. |
+| `trainer.safety_filter.qp_obs_top_k` | `5` | PPO + filter obstacle count; CBF-RL instead uses one minimum-clearance obstacle. |
+| `trainer.safety_filter.slack_weight` | `10.0` | PPO + filter / CBF-RL obstacle slack penalty. |
+| `model.actor.qp_obs_top_k` | `5` | BarrierNet obstacle count. |
+| `model.actor.qp_slack_weight` | `10.0` | BarrierNet obstacle slack penalty. |
+| `--seeds` | RL: `100,200,...,1000`; CBF: `seed` | Evaluation base seeds, separated by commas. |
+| `--episodes` | RL: `50`; CBF: `1` | Episodes per base seed. |
+| `--checkpoint` | All saved checkpoints | Evaluate one specified RL checkpoint. |
+| `--visualize` | Off | Save evaluation videos. |
+
+For example, change the crowd size and training budget:
+
+```bash
+bash scripts/run_local.sh ppo_filter unicycle --device cpu \
+  env.humans.num_humans=20 trainer.total_timesteps=1000000
+```
+
+Robot-specific limits and CBF/nominal gains are in `config/robot/` and `config/controller/cbf_qp.yaml`.
+
 ## Project Structure
 
 ```text
