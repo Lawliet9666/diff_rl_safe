@@ -114,7 +114,20 @@ bash scripts/run_local.sh ppo_filter unicycle --device cpu \
   env.humans.num_humans=20 trainer.total_timesteps=1000000
 ```
 
-Robot-specific limits and CBF/nominal gains are in `config/robot/` and `config/controller/cbf_qp.yaml`.
+## Config
+
+YAML files under `config/` are grouped by purpose:
+
+| Config | Location | What it controls |
+| --- | --- | --- |
+| Robot | [config/robot/](config/robot/) | Robot size, input/state limits, goal settings, and robot-specific reward scales. |
+| Policy | [config/model/](config/model/) | GNN/MLP architecture, observation history, exploration, and BarrierNet QP settings. |
+| Environment | [config/env/](config/env/) | Crowd motion, workspace, time step, episode length, and shared rewards. |
+| Controller | [config/controller/cbf_qp.yaml](config/controller/cbf_qp.yaml) | Nominal-control gains, CBF gains, and controller QP settings. |
+| PPO trainer | [config/trainer/ppo.yaml](config/trainer/ppo.yaml) | Training budget, PPO updates, learning rate, and fixed safety-filter settings. |
+| Shared | [config/base.yaml](config/base.yaml) | Random seed, device, W&B, and output settings. |
+| RL entry | [config/config.yaml](config/config.yaml) | Combines robot, environment, controller, policy, and trainer configs. |
+| Controller entry | [config/config_controller.yaml](config/config_controller.yaml) | Combines robot, environment, and controller configs for runs without RL. |
 
 ## Project Structure
 
