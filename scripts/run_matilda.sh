@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'HELP'
-Usage: bash scripts/run_matilda.sh GROUP [ROBOT] [--dry-run] [Hydra overrides]
+Usage: bash scripts/run_matilda.sh GROUP [ROBOT] [Hydra overrides]
 
 GROUP: all, ppo_both, ppo, ppo_filter, cbf_rl, barriernet, barriernet_sim.
 ROBOT defaults to all five models; a single robot may also be selected.
@@ -13,7 +13,6 @@ and BarrierNet+simulation. Methods/robots run sequentially within each job.
 Each job: 1 GPU, 8 CPUs, 64 GB RAM, normal QoS, three-day time limit.
 All RL runs: GNN, 32 environments, batch 4096, 15M steps, 30 humans, W&B online.
 Extra Hydra overrides take precedence. Authenticate W&B before submission.
---dry-run prints submission commands and batch scripts without submitting jobs.
 HELP
 }
 
@@ -23,11 +22,9 @@ selection="$1"
 shift
 target=all
 if [[ $# -gt 0 && "$1" != -* && "$1" != *=* ]]; then target="$1"; shift; fi
-dry_run=false
 overrides=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dry-run) dry_run=true; shift ;;
     --help|-h) usage; exit 0 ;;
     --gpu|--gpu=*|--device|--device=*) printf 'Slurm selects the GPU; remove %s.\n' "$1" >&2; exit 2 ;;
     --) shift; overrides+=("$@"); break ;;
@@ -74,7 +71,6 @@ if os.path.realpath(sys.prefix) != expected:
 CHECK_PYTHON
 
 export WANDB_MODE="${WANDB_MODE:-online}"
-export WANDB_ENTITY="${WANDB_ENTITY:-xinywa_umich}"
 export WANDB_PROJECT="${WANDB_PROJECT:-diff_rl_safe}"
 export RUN_NAME="${RUN_NAME:-matilda}_${SLURM_JOB_ID}"
 export CPU_THREADS="$SLURM_CPUS_PER_TASK"
@@ -89,20 +85,13 @@ SLURM
   printf '\n'
 }
 
-if ! "$dry_run"; then
-  command -v sbatch >/dev/null || { printf 'sbatch is required on Matilda.\n' >&2; exit 2; }
-  mkdir -p "$root/outputs/log"
-fi
+command -v sbatch >/dev/null || { printf 'sbatch is required on Matilda.\n' >&2; exit 2; }
+mkdir -p "$root/outputs/log"
 for group in "${groups[@]}"; do
   submit=(sbatch --parsable "--job-name=diffrl-$group" --account=scale-lab
     --partition=gpu6000 --qos=normal --nodes=1 --ntasks=1 --cpus-per-task=8
     --mem=64G --gres=gpu:6000:1 --time=3-00:00:00 --export=ALL
     "--chdir=$root" "--output=$root/outputs/log/slurm-%j.out")
   printf '\n[%s] 1 GPU, 8 CPUs\n' "$group"
-  if "$dry_run"; then
-    printf '%q ' "${submit[@]}"; printf '\n'
-    job_script "$@"
-  else
-    job_script "$@" | "${submit[@]}"
-  fi
+  job_script "$@" | "${submit[@]}"
 done

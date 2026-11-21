@@ -3,8 +3,8 @@ set -euo pipefail
 
 usage() {
   cat <<'HELP'
-Usage: bash scripts/run_local.sh METHOD ROBOT [--device cpu|cuda] [--gpu ID] [--dry-run] [overrides]
-       bash scripts/run_local.sh eval RUN_DIR [--device cpu|cuda] [--dry-run] [evaluation flags]
+Usage: bash scripts/run_local.sh METHOD ROBOT [--device cpu|cuda] [--gpu ID] [overrides]
+       bash scripts/run_local.sh eval RUN_DIR [--device cpu|cuda] [evaluation flags]
 
 Methods: ppo, ppo_filter, ppo_both, cbf_rl, barriernet, barriernet_sim, cbf, all.
 Robots: single_integrator, unicycle, double_integrator, humanoid, quadrotor, all.
@@ -13,6 +13,7 @@ Methods and robots run sequentially on this machine; Matilda submits separate jo
 
 Defaults: CPU, 4 threads, 4 environments, batch 1024; CUDA uses 8 threads,
 16 environments and batch 4096. RL targets 15M steps, 30 humans and W&B online.
+An active diffrl environment is respected; otherwise the installed Micromamba diffrl is selected.
 CPU_THREADS sets thread limits, not CPU affinity. --gpu sets visibility only;
 omit it under Slurm to preserve the allocated GPU. Extra overrides take precedence.
 RUN_NAME is a prefix; each run appends method, robot and a timestamp.
@@ -29,7 +30,6 @@ shift 2
 if [[ "$target" == --help || "$target" == -h ]]; then usage; exit 0; fi
 device=cpu
 gpu=""
-dry_run=false
 overrides=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,7 +37,6 @@ while [[ $# -gt 0 ]]; do
       if [[ $# -lt 2 || "$2" == -* ]]; then printf '%s requires a value.\n' "$1" >&2; exit 2; fi
       if [[ "$1" == --device ]]; then device="$2"; else gpu="$2"; fi
       shift 2 ;;
-    --dry-run) dry_run=true; shift ;;
     --help|-h) usage; exit 0 ;;
     --) shift; overrides+=("$@"); break ;;
     *) overrides+=("$1"); shift ;;
@@ -83,6 +82,15 @@ else
   threads="${CPU_THREADS:-8}"; num_envs=16; batch=4096
 fi
 if [[ ! "$threads" =~ ^[1-9][0-9]*$ ]]; then printf 'CPU_THREADS must be a positive integer.\n' >&2; exit 2; fi
+python_command=(python)
+prefix="${MAMBA_ROOT_PREFIX:-$HOME/micromamba}/envs/diffrl"
+active_env="${CONDA_PREFIX:-}"
+if [[ "${active_env##*/}" != diffrl && "${CONDA_DEFAULT_ENV:-}" != diffrl && -f "$prefix/conda-meta/history" ]]; then
+  mamba="${MAMBA_EXE:-$(command -v micromamba || true)}"
+  mamba="${mamba:-$HOME/.local/bin/micromamba}"
+  [[ -x "$mamba" ]] || { printf 'Micromamba not found; run bash scripts/setup.sh --device %s\n' "$device" >&2; exit 2; }
+  python_command=("$mamba" run --prefix "$prefix" python)
+fi
 runtime=(env "JAX_PLATFORMS=$device" JAX_ENABLE_X64=1 XLA_PYTHON_CLIENT_PREALLOCATE=false
   "OMP_NUM_THREADS=$threads" "OPENBLAS_NUM_THREADS=$threads" "MKL_NUM_THREADS=$threads"
   "VECLIB_MAXIMUM_THREADS=$threads" "TF_NUM_INTRAOP_THREADS=$threads" TF_NUM_INTEROP_THREADS=1)
@@ -91,8 +99,8 @@ if [[ "$device" == cpu ]]; then
 elif [[ -n "$gpu" ]]; then
   runtime+=("CUDA_VISIBLE_DEVICES=$gpu")
 fi
-if [[ "$device" == cuda ]] && ! "$dry_run"; then
-  "${runtime[@]}" python - <<'PY'
+if [[ "$device" == cuda ]]; then
+  "${runtime[@]}" "${python_command[@]}" - <<'PY'
 from utils import configure_jax_platform_for_device, validate_jax_backend_for_device
 configure_jax_platform_for_device("cuda")
 import jax
@@ -120,13 +128,13 @@ for method in "${methods[@]}"; do
     run_environment=("${runtime[@]}")
     case "$method" in
       cbf)
-        command=(python scripts/run_controller.py "robot=$robot" "device=$device")
+        command=("${python_command[@]}" scripts/run_controller.py "robot=$robot" "device=$device")
         if [[ "$selection" != all ]]; then command+=("$@"); fi ;;
       eval)
-        command=(python scripts/eval.py --save-dir "$target" --device "$device" "$@") ;;
+        command=("${python_command[@]}" scripts/eval.py --save-dir "$target" --device "$device" "$@") ;;
       *)
         run_environment+=("WANDB_MODE=${WANDB_MODE:-online}")
-        command=(python scripts/run_ppo_base.py
+        command=("${python_command[@]}" scripts/run_ppo_base.py
           "run_name=${RUN_NAME:-$device}_${method}_${robot}_${stamp}"
           "wandb_entity=${WANDB_ENTITY:-}" "wandb_project=${WANDB_PROJECT:-diff_rl_safe}"
           "device=$device" env=crowd_dyn_var_num_env "robot=$robot"
@@ -138,10 +146,6 @@ for method in "${methods[@]}"; do
         command+=("$@") ;;
     esac
     printf '\n[%s] %s\n' "$method" "$robot"
-    if "$dry_run"; then
-      printf '%q ' "${run_environment[@]}" "${command[@]}"; printf '\n'
-    else
-      "${run_environment[@]}" "${command[@]}"
-    fi
+    "${run_environment[@]}" "${command[@]}"
   done
 done
